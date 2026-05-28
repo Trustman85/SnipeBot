@@ -1,0 +1,128 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  width: 420px;
+  font-family: "Helvetica Neue", Arial, sans-serif;
+  font-size: 13px;
+  background: #f4f6f9;
+  color: #1a1a1a;
+}
+
+/* HEADER */
+.header {
+  background: linear-gradient(135deg, #003087, #0067A0);
+  color: white;
+  padding: 14px 16px 10px;
+}
+.logo { font-size: 18px; font-weight: 800; letter-spacing: -.3px; }
+.subtitle { font-size: 11px; opacity: .75; margin-top: 2px; }
+
+/* STATUS BAR */
+.status-bar {
+  display: flex; align-items: center; gap: 8px;
+  background: white; padding: 9px 14px;
+  border-bottom: 1px solid #e0e0e0;
+  font-size: 12px; font-weight: 600; color: #555;
+}
+.status-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #999; flex-shrink: 0;
+}
+.status-dot.idle    { background: #999; }
+.status-dot.running { background: #2a7d2e; animation: pulse 1s infinite; }
+.status-dot.done    { background: #0067A0; }
+.status-dot.error   { background: #c00; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+/* TABS */
+.tabs { display: flex; background: white; border-bottom: 2px solid #e0e0e0; }
+.tab {
+  flex: 1; padding: 10px 4px; background: none; border: none;
+  font-size: 12px; font-weight: 600; color: #888; cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -2px;
+}
+.tab.active { color: #0067A0; border-bottom-color: #0067A0; }
+.tab:hover  { color: #0067A0; background: #f0f7ff; }
+
+/* TAB PANELS */
+.tab-panel { display: none; padding: 14px 16px; background: white; }
+.tab-panel.active { display: block; }
+
+/* FORM */
+.form-group { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.form-group label {
+  font-size: 11px; font-weight: 700; color: #555;
+  text-transform: uppercase; letter-spacing: .3px;
+}
+.form-group input, .form-group select {
+  padding: 8px 10px; border: 1px solid #ddd; border-radius: 4px;
+  font-size: 13px; width: 100%; transition: border-color .15s;
+}
+.form-group input:focus { outline: none; border-color: #0067A0; }
+
+/* Two-column row for city/state/zip and expiry/cvv */
+.form-row { display: flex; gap: 10px; }
+.form-row .form-group       { flex: 1; min-width: 0; }
+.form-row .form-group.small { flex: 0 0 80px; }
+
+.checkbox-row {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 4px; font-size: 12px;
+}
+.checkbox-row input { width: 14px; height: 14px; cursor: pointer; }
+
+.demo-note { font-size: 11px; color: #f5a623; margin-top: 10px; font-weight: 600; }
+
+/* Search type toggle */
+.search-type-row {
+  display: flex; gap: 0; margin-bottom: 12px;
+  border: 1.5px solid #0067A0; border-radius: 4px; overflow: hidden;
+}
+.search-type-btn {
+  flex: 1; padding: 7px; background: white; border: none;
+  font-size: 12px; font-weight: 700; color: #0067A0; cursor: pointer;
+}
+.search-type-btn:first-child { border-right: 1.5px solid #0067A0; }
+.search-type-btn.active { background: #0067A0; color: white; }
+.search-type-btn:hover:not(.active) { background: #e6f2f9; }
+
+.field-hint { font-size: 10px; color: #999; margin-top: 2px; }
+
+/* ACTIVITY LOG */
+.log-section { background: #1a1a2e; }
+.log-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 14px; font-size: 11px; font-weight: 700; color: #aaa;
+  border-top: 1px solid #333;
+}
+.clear-btn { background: none; border: none; color: #666; font-size: 11px; cursor: pointer; }
+.clear-btn:hover { color: #aaa; }
+.log {
+  height: 110px; overflow-y: auto; padding: 8px 14px;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.log-entry { font-size: 11px; font-family: "Courier New", monospace; line-height: 1.5; word-break: break-all; }
+.log-entry.info    { color: #7ec8e3; }
+.log-entry.success { color: #6fcf97; }
+.log-entry.warning { color: #f5a623; }
+.log-entry.error   { color: #ff6b6b; }
+
+/* CONTROLS */
+.controls {
+  display: flex; gap: 10px; padding: 12px 14px;
+  background: #f4f6f9; border-top: 1px solid #e0e0e0;
+}
+.btn-save {
+  flex: 1; padding: 10px; border: 1.5px solid #0067A0;
+  background: white; color: #0067A0; border-radius: 4px;
+  font-weight: 700; cursor: pointer; font-size: 13px;
+}
+.btn-save:hover { background: #e6f2f9; }
+.btn-start {
+  flex: 2; padding: 10px; background: #0067A0;
+  color: white; border: none; border-radius: 4px;
+  font-weight: 700; cursor: pointer; font-size: 13px;
+}
+.btn-start:hover         { background: #005a8e; }
+.btn-start.running       { background: #c00; }
+.btn-start.running:hover { background: #a00; }
