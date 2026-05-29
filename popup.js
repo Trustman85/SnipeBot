@@ -3,7 +3,57 @@ const FIELDS = ['siteUrl','useCurrentTab','itemName','itemSku','searchType','max
                 'firstName','lastName','email','address','city','state','zip',
                 'cardNumber','cardName','expiry','cvv','stopOnSuccess'];
 
-// ── Tab switching ──────────────────────────────────────────────────────────────
+// Tracks which profile is active — each profile has its own saved config
+let activeProfile = 'default';
+
+// ── Profile switcher (top tabs) ────────────────────────────────────────────────
+// Switching profiles saves the current form and loads the selected profile's config
+document.querySelectorAll('.profile-tab').forEach(tab => {
+  tab.addEventListener('click', async () => {
+    if (tab.dataset.profile === activeProfile) return;
+    // Save current profile before switching
+    await saveProfileConfig(activeProfile);
+    // Switch profile
+    activeProfile = tab.dataset.profile;
+    document.querySelectorAll('.profile-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    // Load new profile's config into the form
+    await loadProfileConfig(activeProfile);
+    updateStartLabel();
+    addLog('info', 'Switched to ' + (activeProfile === 'sams' ? "Sam's Bot" : 'Bot'));
+  });
+});
+
+// Save form values under a profile-specific storage key
+async function saveProfileConfig(profile) {
+  const cfg = {};
+  FIELDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    cfg[id] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  await chrome.storage.local.set({ ['botConfig_' + profile]: cfg });
+}
+
+// Load a profile's config into the form
+async function loadProfileConfig(profile) {
+  const key  = 'botConfig_' + profile;
+  const data = await chrome.storage.local.get(key);
+  const cfg  = data[key];
+  if (!cfg) return;
+  FIELDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.type === 'checkbox' ? el.checked = cfg[id] ?? true : el.value = cfg[id] || '';
+  });
+  // Restore search type toggle
+  const type = cfg.searchType || 'name';
+  document.querySelectorAll('.search-type-btn').forEach(b => b.classList.toggle('active', b.dataset.type === type));
+  document.getElementById('nameGroup').style.display = type === 'name' ? '' : 'none';
+  document.getElementById('skuGroup').style.display  = type === 'sku'  ? '' : 'none';
+}
+
+// ── Sub-tab switching (Item / Address / Payment) ───────────────────────────────
 // Highlight the active tab and show its panel when clicked
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -13,6 +63,14 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
   });
 });
+
+// Update the bottom start button label to show which profile is active
+function updateStartLabel() {
+  const btn     = document.getElementById('startBtn');
+  const label   = activeProfile === 'sams' ? "Sam's Bot" : 'Bot';
+  const running = btn.classList.contains('running');
+  btn.textContent = running ? ('⏹ Stop ' + label) : ('▶ Start ' + label);
+}
 
 // ── Search type toggle (By Name / By SKU) ─────────────────────────────────────
 // Show the relevant input group based on which search type is selected
@@ -32,28 +90,70 @@ document.querySelectorAll('.search-type-btn').forEach(btn => {
 document.getElementById('startBtn').addEventListener('click', toggleBot);
 document.getElementById('saveBtn').addEventListener('click', saveConfig);
 document.getElementById('clearBtn').addEventListener('click', clearLog);
+document.getElementById('closeBtn').addEventListener('click', () => window.close());
+
+// Stop the bot when the sidebar is closed
+window.addEventListener('unload', () => {
+  chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+  chrome.runtime.sendMessage({ type: 'STOP_BOT' }).catch(() => {});
+});
+
+// ── Auto-detect item name/SKU from current tab ───────────────────────────────
+// When "Use current tab" is checked, read the item identifier from the active page.
+// Checks URL params first (id = SKU, search = name), then falls back to h1/title.
+document.getElementById('useCurrentTab').addEventListener('change', async function () {
+  if (!this.checked) return;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const params = new URLSearchParams(window.location.search);
+        // SKU present in URL — use it directly
+        if (params.get('id')) return { type: 'sku', value: params.get('id') };
+        // Name search present in URL — use it directly
+        if (params.get('search')) return { type: 'name', value: params.get('search') };
+        // Fall back to reading the product title from the DOM
+        const name = (
+          document.querySelector('h1')?.textContent?.trim() ||
+          document.querySelector('[class*="product-title"]')?.textContent?.trim() ||
+          document.querySelector('[class*="product-name"]')?.textContent?.trim() ||
+          document.title.split('–')[0].split('|')[0].split('-')[0].trim()
+        );
+        return { type: 'name', value: name };
+      }
+    });
+
+    const { type, value } = result?.result || {};
+    if (!value) { addLog('warning', 'Could not detect item on this page'); return; }
+
+    if (type === 'sku') {
+      document.getElementById('itemSku').value = value;
+      document.getElementById('searchType').value = 'sku';
+      document.querySelectorAll('.search-type-btn').forEach(b => b.classList.toggle('active', b.dataset.type === 'sku'));
+      document.getElementById('nameGroup').style.display = 'none';
+      document.getElementById('skuGroup').style.display  = '';
+    } else {
+      document.getElementById('itemName').value = value;
+      document.getElementById('searchType').value = 'name';
+      document.querySelectorAll('.search-type-btn').forEach(b => b.classList.toggle('active', b.dataset.type === 'name'));
+      document.getElementById('nameGroup').style.display = '';
+      document.getElementById('skuGroup').style.display  = 'none';
+    }
+    addLog('info', 'Detected ' + type.toUpperCase() + ': "' + value + '"');
+  } catch (e) {
+    addLog('warning', 'Could not auto-detect item');
+  }
+});
 
 // ── Restore saved config on popup open ────────────────────────────────────────
-// Load previously saved config from storage and re-populate the form
-chrome.storage.local.get(['botConfig', 'botRunning'], data => {
-  if (data.botConfig) {
-    const cfg = data.botConfig;
-    FIELDS.forEach(id => {
-      const el = document.getElementById(id);
-      if (!el) return;
-      el.type === 'checkbox' ? el.checked = cfg[id] ?? true : el.value = cfg[id] || '';
-    });
-    // Restore the search type toggle UI to match saved config
-    const type = cfg.searchType || 'name';
-    document.querySelectorAll('.search-type-btn').forEach(b => {
-      b.classList.toggle('active', b.dataset.type === type);
-    });
-    document.getElementById('nameGroup').style.display = type === 'name' ? '' : 'none';
-    document.getElementById('skuGroup').style.display  = type === 'sku'  ? '' : 'none';
-  }
-  // If the bot is already running, update the UI to reflect that
-  if (data.botRunning) setRunningUI(true);
-});
+// Load the active profile's config and restore running state
+(async () => {
+  await loadProfileConfig(activeProfile);
+  const { botRunning } = await chrome.storage.local.get('botRunning');
+  if (botRunning) setRunningUI(true);
+  updateStartLabel();
+})();
 
 // ── Listen for messages from content script (relayed via background) ───────────
 chrome.runtime.onMessage.addListener(msg => {
@@ -63,7 +163,7 @@ chrome.runtime.onMessage.addListener(msg => {
 });
 
 // ── Save config ────────────────────────────────────────────────────────────────
-// Read all form values and persist them to chrome.storage.local
+// Persist the current form values under the active profile's storage key
 function saveConfig() {
   const cfg = {};
   FIELDS.forEach(id => {
@@ -71,7 +171,8 @@ function saveConfig() {
     if (!el) return;
     cfg[id] = el.type === 'checkbox' ? el.checked : el.value;
   });
-  chrome.storage.local.set({ botConfig: cfg }, () => addLog('success', 'Configuration saved ✓'));
+  const label = activeProfile === 'sams' ? "Sam's Bot" : 'Bot';
+  chrome.storage.local.set({ ['botConfig_' + activeProfile]: cfg }, () => addLog('success', label + ' config saved ✓'));
 }
 
 // ── Start / Stop bot ───────────────────────────────────────────────────────────
@@ -100,16 +201,16 @@ async function toggleBot() {
     const searchType = cfg.searchType || 'name';
     const identifier = searchType === 'sku' ? cfg.itemSku : cfg.itemName;
 
-    // Require an item name or SKU before starting
-    if (!identifier) {
+    // Only require an item name/SKU when navigating to a site — not needed for current tab
+    if (!cfg.useCurrentTab && !identifier) {
       addLog('error', searchType === 'sku' ? 'Enter a SKU first!' : 'Enter an item name first!');
       return;
     }
 
-    addLog('info', 'Search type: ' + searchType + ' | Value: "' + identifier + '"');
+    addLog('info', cfg.useCurrentTab ? 'Using current tab' : 'Search type: ' + searchType + ' | Value: "' + identifier + '"');
 
-    // Save state and update UI
-    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg });
+    // Save state and update UI — store config and active profile so content.js knows which bot is running
+    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, ['botConfig_' + activeProfile]: cfg });
     setRunningUI(true);
 
     const siteUrl = (cfg.siteUrl || 'http://localhost:3000').replace(/\/$/, '');
@@ -118,7 +219,6 @@ async function toggleBot() {
       // Inject content.js into whatever tab the user is currently on
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       await chrome.storage.local.set({ currentTabId: tab.id });
-      // Reset the guard so content.js can run again on an already-loaded page
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { window.__checkoutBotInit = false; } });
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
       addLog('success', 'Bot injected into current tab');
@@ -151,13 +251,14 @@ async function toggleBot() {
 
 // Update the start button and status bar to reflect running or idle state
 function setRunningUI(running) {
-  const btn = document.getElementById('startBtn');
+  const btn   = document.getElementById('startBtn');
+  const label = activeProfile === 'sams' ? "Sam's Bot" : 'Bot';
   if (running) {
-    btn.textContent = '⏹ Stop Bot';
+    btn.textContent = '⏹ Stop ' + label;
     btn.classList.add('running');
-    setStatus('running', 'Bot is running...');
+    setStatus('running', label + ' is running...');
   } else {
-    btn.textContent = '▶ Start Bot';
+    btn.textContent = '▶ Start ' + label;
     btn.classList.remove('running');
     setStatus('idle', 'Idle – press Start to begin');
   }

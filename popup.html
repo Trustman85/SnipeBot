@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"><title>Checkout Bot</title>
@@ -6,18 +6,30 @@
 </head>
 <body>
   <div class="header">
-    <div class="logo">🤖 Checkout Bot</div>
-    <div class="subtitle">Sam's Mock Club – Demo</div>
+    <div class="header-text">
+      <div class="logo">🤖 Checkout Bot</div>
+      <div class="subtitle">Automated checkout assistant</div>
+    </div>
+    <button id="closeBtn" class="close-btn" title="Close">✕</button>
   </div>
+
+  <!-- Top-level profile switcher — two independent bot configs -->
+  <div class="profile-tabs">
+    <button class="profile-tab active" data-profile="default">🤖 Bot</button>
+    <button class="profile-tab" data-profile="sams">🏪 Sam's</button>
+  </div>
+
   <div class="status-bar" id="statusBar">
     <span class="status-dot idle" id="statusDot"></span>
     <span id="statusText">Idle – configure and press Start</span>
   </div>
+
   <div class="tabs">
     <button class="tab active" data-tab="item">🔍 Item</button>
     <button class="tab" data-tab="address">📦 Address</button>
     <button class="tab" data-tab="payment">💳 Payment</button>
   </div>
+
   <div class="tab-panel active" id="tab-item">
     <div class="form-group">
       <label>Site URL</label>
@@ -45,6 +57,7 @@
     <div class="form-group"><label>Auto-refresh interval (seconds)</label><input type="number" id="refreshInterval" placeholder="2" value="2" min="1" max="60"></div>
     <div class="checkbox-row"><input type="checkbox" id="stopOnSuccess" checked><label for="stopOnSuccess">Stop bot after successful order</label></div>
   </div>
+
   <div class="tab-panel" id="tab-address">
     <div class="form-group"><label>First Name</label><input type="text" id="firstName" placeholder="John"></div>
     <div class="form-group"><label>Last Name</label><input type="text" id="lastName" placeholder="Doe"></div>
@@ -56,6 +69,7 @@
       <div class="form-group small"><label>ZIP</label><input type="text" id="zip" placeholder="62701" maxlength="5"></div>
     </div>
   </div>
+
   <div class="tab-panel" id="tab-payment">
     <div class="form-group"><label>Card Number</label><input type="text" id="cardNumber" placeholder="1234 5678 9012 3456" maxlength="19"></div>
     <div class="form-group"><label>Name on Card</label><input type="text" id="cardName" placeholder="John Doe"></div>
@@ -65,14 +79,17 @@
     </div>
     <p class="demo-note">⚠️ Demo only – data never leaves your browser</p>
   </div>
+
   <div class="log-section">
     <div class="log-header"><span>📋 Activity Log</span><button id="clearBtn" class="clear-btn">Clear</button></div>
     <div class="log" id="log"><div class="log-entry info">Bot ready. Configure and press Start.</div></div>
   </div>
+
   <div class="controls">
     <button class="btn-save" id="saveBtn">💾 Save</button>
     <button class="btn-start" id="startBtn">▶ Start Bot</button>
   </div>
+
   <script src="popup.js"></script>
 </body>
 </html>

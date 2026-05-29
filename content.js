@@ -1,147 +1,246 @@
-// Runs on every localhost:3000 page load — checks current phase and acts accordingly
+// Runs on every page load — checks current bot phase and acts accordingly
 (async () => {
-  // Guard against the script running twice on the same page
   if (window.__checkoutBotInit) return;
   window.__checkoutBotInit = true;
 
-  // Read bot state from storage
-  const { botRunning, botPhase, botConfig } = await chrome.storage.local.get(['botRunning', 'botPhase', 'botConfig']);
-  if (!botRunning || !botConfig) return;
+  try {
+    const { botRunning, botPhase, botConfig, activeProfile } = await chrome.storage.local.get(['botRunning', 'botPhase', 'botConfig', 'activeProfile']);
+    if (!botRunning || !botConfig) return;
+    const isSams = activeProfile === 'sams';
 
-  const page = window.location.pathname;
-  log('info', 'Page: ' + page + ' | Phase: ' + botPhase);
+    const page = window.location.pathname;
+    log('info', '── Phase: ' + botPhase + ' | Page: ' + page + ' ──');
 
   // ── PHASE: SEARCH ──────────────────────────────────────────────
-  // Wait for the stock element, check availability and price, then add to cart
   if (botPhase === 'SEARCH') {
-    setStatus('running', 'Checking product page...');
-    const stockEl = await waitFor('stock-status');
-    const isOOS   = stockEl.classList.contains('out-stock');
-    const price   = parseFloat(document.querySelector('.price')?.textContent?.replace('$', '') || '0');
+    setStatus('running', 'Looking for item...');
+    const interval = parseInt(botConfig.refreshInterval || '2');
 
-    // Item is out of stock — wait the configured interval then reload to re-check
-    if (isOOS) {
-      const interval = parseInt(botConfig.refreshInterval || '2');
-      log('warning', 'Out of stock. Refreshing in ' + interval + 's...');
-      setStatus('running', 'Out of stock – refreshing in ' + interval + 's');
+    if (isSams) {
+      log('info', 'Checking shipping selection...');
+      await selectShipping();
+    }
+
+    log('info', 'Looking for Add to Cart button...');
+    const addBtn = isSams
+      ? await waitForSamsBtn('[data-automation-id="atc"], [data-dca-event="addToCart"]', interval * 1000)
+      : await findBtn(['addtocart', 'addtobag', 'addtobasket', 'atc', 'buynow', 'buyitnow', 'purchase'], interval * 1000);
+
+    if (!addBtn) {
+      log('warning', 'Add to Cart not found — item unavailable. Refreshing in ' + interval + 's...');
+      setStatus('running', 'Not available – refreshing in ' + interval + 's');
       await sleep(interval * 1000);
       location.reload();
       return;
     }
 
-    // Price exceeds the configured max — stop the bot
-    if (price > parseFloat(botConfig.maxPrice || '999')) {
-      log('warning', 'Price $' + price + ' exceeds max $' + botConfig.maxPrice);
+    log('info', 'Found Add to Cart: "' + addBtn.textContent.trim().substring(0, 40) + '"');
+
+    const priceEl = document.querySelector('.price,[class*="price"],[data-price],[itemprop="price"]');
+    const price   = parseFloat(priceEl?.textContent?.replace(/[^0-9.]/g, '') || '0');
+
+    if (price > 0 && price > parseFloat(botConfig.maxPrice || '999')) {
+      log('warning', 'Price $' + price + ' exceeds max $' + botConfig.maxPrice + ' — stopping');
       setStatus('error', 'Price too high – bot stopped');
       await chrome.storage.local.set({ botRunning: false });
-      chrome.runtime.sendMessage({ type: 'BOT_DONE' });
+      chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
       return;
     }
 
-    // In stock and within price — find and click the add-to-cart button
-    const addBtn = await findBtn(['add to cart', 'add-to-cart', 'buy now', 'buy']);
-    if (!addBtn) { log('error', 'Add to cart button not found.'); return; }
-    log('success', 'In stock at $' + price + '! Adding to cart...');
+    log('success', (price > 0 ? 'In stock at $' + price : 'Item available') + ' — clicking Add to Cart...');
     setStatus('running', 'Adding to cart...');
-    await chrome.storage.local.set({ botPhase: 'CART' });
     addBtn.click();
+    log('info', 'Add to Cart clicked — waiting for confirmation...');
+
+    if (isSams) {
+      await chrome.storage.local.set({ botPhase: 'ADDED' });
+      await waitForViewCart(botConfig, isSams);
+    } else {
+      await chrome.storage.local.set({ botPhase: 'CART' });
+    }
+  }
+
+  // ── PHASE: ADDED (Sam's only) ──────────────────────────────────
+  else if (botPhase === 'ADDED' && isSams) {
+    log('info', 'Item already added — waiting for View Cart button...');
+    await waitForViewCart(botConfig, isSams);
   }
 
   // ── PHASE: CART ────────────────────────────────────────────────
-  // Wait for the checkout button to be enabled (cart API must finish loading first)
   else if (botPhase === 'CART') {
-    setStatus('running', 'Cart page – proceeding to checkout...');
-    log('info', 'Cart reached. Clicking checkout...');
-    const btn = await findBtn(['checkout', 'proceed', 'continue', 'next']);
+    setStatus('running', 'Looking for checkout button...');
+    log('info', 'On cart page — looking for checkout button...');
+    const btn = isSams
+      ? await waitForSamsBtn('[data-automation-id="checkout"]', 5000)
+      : await findBtn(['checkout', 'checkoutbtn', 'proceedtocheckout', 'gotocheckout', 'paynow']);
     if (!btn) {
-      log('error', 'Checkout button not available.');
-      setStatus('error', 'Cart empty');
+      log('error', 'Checkout button not found — is cart empty?');
+      setStatus('error', 'Checkout button not found');
       await chrome.storage.local.set({ botRunning: false });
       return;
     }
+    log('success', 'Found checkout button: "' + btn.textContent.trim().substring(0, 40) + '"');
+    log('info', 'Clicking checkout...');
     await chrome.storage.local.set({ botPhase: 'CHECKOUT' });
-    log('success', 'Clicking: "' + btn.textContent.trim() + '"');
     btn.click();
   }
 
   // ── PHASE: CHECKOUT ────────────────────────────────────────────
-  // Wait for the form, fill all fields, then submit the order
   else if (botPhase === 'CHECKOUT') {
     setStatus('running', 'Filling checkout form...');
-    log('info', 'Checkout reached. Filling details...');
-    await waitFor('email'); // Wait for the form to be in the DOM
+    log('info', 'On checkout page — waiting for form fields...');
+    await new Promise(resolve => {
+      const check = () => document.querySelector('#email, input[type="email"], input[name*="email"], input[type="text"]');
+      if (check()) return resolve();
+      const obs = new MutationObserver(() => { if (check()) { obs.disconnect(); resolve(); } });
+      obs.observe(document.body, { childList: true, subtree: true });
+      setTimeout(() => { obs.disconnect(); resolve(); }, 5000);
+    });
+    log('info', 'Form ready — filling fields...');
     const cfg = botConfig;
 
-    // Fill a text input and fire all events so framework validation picks up the change
     function fill(id, val) {
       const el = document.getElementById(id);
-      if (!el || !val) return;
+      if (!el || !val) return false;
       el.focus();
-      // Native setter bypasses React/Vue value tracking
       Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set.call(el, val);
       el.dispatchEvent(new Event('input',  { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
       el.dispatchEvent(new Event('blur',   { bubbles: true }));
+      return true;
     }
-
-    // Set a <select> value and fire change event
     function sel(id, val) {
       const el = document.getElementById(id);
-      if (!el) return;
+      if (!el) return false;
       el.value = val;
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
     }
 
-    // Fill shipping info
-    fill('email',     cfg.email);
-    fill('firstName', cfg.firstName);
-    fill('lastName',  cfg.lastName);
-    fill('address',   cfg.address);
-    fill('city',      cfg.city);
-    sel('state',      (cfg.state || '').toUpperCase());
-    fill('zip',       cfg.zip);
+    const filled = [];
+    if (fill('email',     cfg.email))     filled.push('email');
+    if (fill('firstName', cfg.firstName)) filled.push('firstName');
+    if (fill('lastName',  cfg.lastName))  filled.push('lastName');
+    if (fill('address',   cfg.address))   filled.push('address');
+    if (fill('city',      cfg.city))      filled.push('city');
+    if (sel('state',      (cfg.state || '').toUpperCase())) filled.push('state');
+    if (fill('zip',       cfg.zip))       filled.push('zip');
 
-    // Fill payment info — format card number as groups of 4
     const cardFmt = (cfg.cardNumber || '').replace(/\D/g, '').replace(/(.{4})/g, '$1 ').trim();
-    fill('cardNumber', cardFmt);
-    fill('cardName',   cfg.cardName || (cfg.firstName + ' ' + cfg.lastName));
-    fill('expiry',     cfg.expiry);
-    fill('cvv',        cfg.cvv);
+    if (fill('cardNumber', cardFmt))                                        filled.push('cardNumber');
+    if (fill('cardName', cfg.cardName || (cfg.firstName + ' ' + cfg.lastName))) filled.push('cardName');
+    if (fill('expiry',   cfg.expiry))  filled.push('expiry');
+    if (fill('cvv',      cfg.cvv))     filled.push('cvv');
 
-    log('success', 'All fields filled. Submitting...');
+    log('info', 'Fields filled: ' + (filled.length ? filled.join(', ') : 'none found'));
+    if (filled.length === 0) log('warning', 'No fields matched — checkout form may use different field IDs');
+
+    log('info', 'Looking for Place Order button...');
     setStatus('running', 'Submitting order...');
-
-    // Find and click the place order button
-    const submitBtn = await findBtn(['place order', 'submit order', 'pay now', 'complete order', 'buy now', 'order now', 'place my order']);
-    if (!submitBtn) { log('error', 'Submit button not found!'); return; }
-    log('success', 'Clicking: "' + submitBtn.textContent.trim() + '"');
+    const submitBtn = await findBtn(['place', 'order', 'pay', 'confirm', 'submit', 'buy']);
+    if (!submitBtn) { log('error', 'Place Order button not found!'); return; }
+    log('success', 'Found Place Order: "' + submitBtn.textContent.trim().substring(0, 40) + '"');
+    log('info', 'Clicking Place Order...');
     await chrome.storage.local.set({ botPhase: 'CONFIRM' });
     submitBtn.click();
   }
 
   // ── PHASE: CONFIRM ─────────────────────────────────────────────
-  // Read the order ID from the confirmation page and optionally stop the bot
   else if (botPhase === 'CONFIRM') {
+    log('info', 'On confirmation page — reading order ID...');
     const orderEl = await waitFor('orderId');
     const orderId = orderEl.textContent;
-    log('success', 'Order placed! ID: ' + orderId);
+    log('success', '🎉 Order placed! ID: ' + orderId);
     setStatus('done', 'Order complete! ID: ' + orderId);
     if (botConfig.stopOnSuccess) {
       await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
-      chrome.runtime.sendMessage({ type: 'BOT_DONE' });
+      chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
       log('info', 'Bot stopped (stop-on-success)');
     }
   }
+
+  } catch (err) {
+    log('error', 'Bot error: ' + err.message + ' (phase: ' + (await chrome.storage.local.get('botPhase')).botPhase + ')');
+  }
 })();
 
-// Finds the first enabled button whose text matches any of the given keywords.
-// Uses MutationObserver so it reacts instantly when a button appears or becomes enabled.
+// Sam's Club — finds a button by exact CSS selector
+function waitForSamsBtn(selector, timeout = 5000) {
+  return new Promise(resolve => {
+    const find = () => {
+      const el = document.querySelector(selector);
+      return (el && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ? el : null;
+    };
+    const el = find(); if (el) return resolve(el);
+    const observer = new MutationObserver(() => {
+      const el = find(); if (el) { observer.disconnect(); resolve(el); }
+    });
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled', 'aria-disabled'] });
+    setTimeout(() => { observer.disconnect(); resolve(null); }, timeout);
+  });
+}
+
+// Sam's Club — checks if Shipping is already selected, clicks it if not
+async function selectShipping() {
+  const radio = document.getElementById('fulfillment-Shipping');
+  if (!radio) { log('info', 'No fulfillment selector on this page'); return; }
+  if (radio.getAttribute('data-selected') === 'true' || radio.checked) {
+    log('info', 'Shipping already selected');
+    return;
+  }
+  const tile = radio.closest('[class*="flex"]') || radio.parentElement;
+  if (tile) {
+    tile.click();
+    log('success', 'Shipping selected');
+    await sleep(300);
+  }
+}
+
+// Waits for View Cart button after adding to cart — reloads if not found
+async function waitForViewCart(botConfig, isSams) {
+  log('info', 'Waiting for View Cart button...');
+  const viewCartBtn = await findBtn(['viewcart', 'viewbag', 'gotocart', 'viewmycart'], 8000);
+  if (viewCartBtn) {
+    log('success', 'Found View Cart: "' + viewCartBtn.textContent.trim().split('\n')[0].substring(0, 40) + '"');
+    log('info', 'Clicking View Cart...');
+    viewCartBtn.click();
+    await chrome.storage.local.set({ botPhase: 'CART' });
+  } else {
+    log('warning', 'View Cart not found after 8s — reloading to retry...');
+    location.reload();
+  }
+}
+
+// Finds the first enabled button matching any keyword across all attributes
 function findBtn(keywords, timeout = 5000) {
   return new Promise((resolve) => {
+    const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
     const find = () => {
-      for (const el of document.querySelectorAll('button:not([disabled]), input[type="submit"]:not([disabled])')) {
-        const text = (el.textContent || el.value || '').toLowerCase().replace(/[^a-z0-9 ]/g, '');
-        if (keywords.some(k => text.includes(k))) return el;
+      for (const el of document.querySelectorAll('button, input[type="submit"], a[role="button"]')) {
+        if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+        const visibleText = (el.textContent || '').trim().toLowerCase();
+        if (visibleText.startsWith('skip')) continue;
+        if (visibleText.includes('shopping')) continue;
+        if (visibleText.includes('keep browsing')) continue;
+        const raw = [
+          el.textContent,
+          el.getAttribute('aria-label')         || '',
+          el.getAttribute('value')              || '',
+          el.getAttribute('title')              || '',
+          el.getAttribute('name')               || '',
+          el.getAttribute('id')                 || '',
+          el.getAttribute('class')              || '',
+          el.getAttribute('data-automation-id') || '',
+          el.getAttribute('data-test')          || '',
+          el.getAttribute('data-testid')        || '',
+          el.getAttribute('data-action')        || '',
+          el.getAttribute('data-tl-id')         || '',
+          el.getAttribute('data-btn-id')        || '',
+          el.getAttribute('data-dca-event')     || '',
+          el.getAttribute('data-dca-intent')    || '',
+        ].join(' ').toLowerCase();
+        const text = norm(raw);
+        if (keywords.some(k => text.includes(norm(k)))) return el;
       }
       return null;
     };
@@ -154,7 +253,6 @@ function findBtn(keywords, timeout = 5000) {
   });
 }
 
-// Waits for an element with the given ID to appear in the DOM
 function waitFor(id, timeout = 5000) {
   return new Promise((resolve, reject) => {
     const el = document.getElementById(id);
@@ -168,16 +266,13 @@ function waitFor(id, timeout = 5000) {
   });
 }
 
-// Pauses execution for the given number of milliseconds
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Sends a log entry to the popup activity log
 function log(level, text) {
   console.log('[CheckoutBot][' + level + '] ' + text);
   chrome.runtime.sendMessage({ type: 'BOT_LOG', level, text }).catch(() => {});
 }
 
-// Sends a status update to the popup status bar
 function setStatus(state, text) {
   chrome.runtime.sendMessage({ type: 'BOT_STATUS', status: state, text }).catch(() => {});
 }

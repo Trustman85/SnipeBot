@@ -1,11 +1,12 @@
-﻿{
+{
   "manifest_version": 3,
   "name": "Checkout Bot – School Demo",
   "version": "1.0",
   "description": "Educational checkout automation demo for localhost mock store.",
-  "permissions": ["storage", "activeTab", "scripting", "tabs"],
+  "permissions": ["storage", "activeTab", "scripting", "tabs", "sidePanel", "alarms"],
   "host_permissions": ["http://*/*", "https://*/*"],
-  "action": { "default_popup": "popup.html", "default_title": "Checkout Bot" },
+  "side_panel": { "default_path": "popup.html" },
+  "action": { "default_title": "Checkout Bot" },
   "content_scripts": [{ "matches": ["http://localhost:3000/*"], "js": ["content.js"], "run_at": "document_end" }],
   "background": { "service_worker": "background.js" }
 }

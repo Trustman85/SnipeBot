@@ -1,8 +1,20 @@
+// Open the side panel when the extension icon is clicked
+chrome.action.onClicked.addListener((tab) => {
+  chrome.sidePanel.open({ windowId: tab.windowId });
+});
+
+// Keep the service worker alive while bot is running so it can re-inject content.js on page reloads.
+// Chrome kills idle service workers after ~30s — this alarm fires every 25s to prevent that.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== 'keepalive') return;
+  const { botRunning } = await chrome.storage.local.get('botRunning');
+  if (!botRunning) chrome.alarms.clear('keepalive');
+});
+
 // Holds the reference to the OOS retry timer so we can cancel it if the user stops the bot
 let botInterval = null;
 
 // When using current tab mode, re-inject content.js every time the tab finishes loading
-// This keeps OOS polling working even after a page reload
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status !== 'complete') return;
   const { botRunning, botConfig, currentTabId } = await chrome.storage.local.get(['botRunning', 'botConfig', 'currentTabId']);
@@ -29,6 +41,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // Initializes bot state in storage and opens (or reuses) a localhost tab on the product page
 async function startBot(config) {
 
+  // Start keepalive alarm so the service worker stays alive during bot operation
+  chrome.alarms.create('keepalive', { periodInMinutes: 0.4 });
+
   // Log to the popup that the background script received the start signal
   log('info', 'Background: bot started');
 
@@ -54,6 +69,9 @@ async function startBot(config) {
 
 // Stops the bot by clearing any pending retry timer and resetting storage state
 function stopBot() {
+
+  // Stop the keepalive alarm
+  chrome.alarms.clear('keepalive');
 
   // Cancel the OOS retry timer if it's currently counting down
   if (botInterval) {
