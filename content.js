@@ -1,7 +1,10 @@
 // Runs on every page load — checks current bot phase and acts accordingly
 (async () => {
-  if (window.__checkoutBotInit) return;
-  window.__checkoutBotInit = true;
+  // Guard by URL: window persists across injections into the SAME document, so a
+  // second injection of the same page exits here. A real navigation or location.reload()
+  // creates a fresh document (window reset), so the bot runs again as intended.
+  if (window.__botLastUrl === location.href) return;
+  window.__botLastUrl = location.href;
 
   try {
     const { botRunning, botPhase, botConfig, activeProfile } = await chrome.storage.local.get(['botRunning', 'botPhase', 'botConfig', 'activeProfile']);
@@ -135,9 +138,17 @@
     log('info', 'Fields filled: ' + (filled.length ? filled.join(', ') : 'none found'));
     if (filled.length === 0) log('warning', 'No fields matched — checkout form may use different field IDs');
 
+    // Sam's Club — handle payment modal (click Add, fill card, save)
+    if (isSams) {
+      const done = await fillSamsPayment(cfg);
+      if (!done) return; // Not ready to place order yet
+    }
+
     log('info', 'Looking for Place Order button...');
     setStatus('running', 'Submitting order...');
-    const submitBtn = await findBtn(['place', 'order', 'pay', 'confirm', 'submit', 'buy']);
+    const submitBtn = isSams
+      ? await waitForSamsBtn('[data-automation-id="place-order-button"], [data-testid="place-order-button"]', 5000)
+      : await findBtn(['place', 'order', 'pay', 'confirm', 'submit', 'buy']);
     if (!submitBtn) { log('error', 'Place Order button not found!'); return; }
     log('success', 'Found Place Order: "' + submitBtn.textContent.trim().substring(0, 40) + '"');
     log('info', 'Clicking Place Order...');
@@ -148,10 +159,28 @@
   // ── PHASE: CONFIRM ─────────────────────────────────────────────
   else if (botPhase === 'CONFIRM') {
     log('info', 'On confirmation page — reading order ID...');
-    const orderEl = await waitFor('orderId');
-    const orderId = orderEl.textContent;
-    log('success', '🎉 Order placed! ID: ' + orderId);
-    setStatus('done', 'Order complete! ID: ' + orderId);
+    if (isSams) {
+      // Sam's Club confirmation — look for order number in page text or URL
+      const confirmEl = await new Promise(resolve => {
+        const check = () =>
+          document.querySelector('[class*="order-number"], [class*="orderNumber"], [data-testid*="order"]') ||
+          [...document.querySelectorAll('h1,h2,h3,p,span')].find(el =>
+            /order\s*(number|#|confirmed|placed)/i.test(el.textContent)
+          );
+        const found = check(); if (found) return resolve(found);
+        const obs = new MutationObserver(() => { const el = check(); if (el) { obs.disconnect(); resolve(el); } });
+        obs.observe(document.body, { childList: true, subtree: true });
+        setTimeout(() => { obs.disconnect(); resolve(null); }, 8000);
+      });
+      const orderId = confirmEl?.textContent?.trim() || 'confirmed';
+      log('success', '🎉 Order placed! ' + orderId.substring(0, 60));
+      setStatus('done', 'Order complete!');
+    } else {
+      const orderEl = await waitFor('orderId');
+      const orderId = orderEl.textContent;
+      log('success', '🎉 Order placed! ID: ' + orderId);
+      setStatus('done', 'Order complete! ID: ' + orderId);
+    }
     if (botConfig.stopOnSuccess) {
       await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
       chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
@@ -164,52 +193,9 @@
   }
 })();
 
-// Sam's Club — finds a button by exact CSS selector
-function waitForSamsBtn(selector, timeout = 5000) {
-  return new Promise(resolve => {
-    const find = () => {
-      const el = document.querySelector(selector);
-      return (el && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ? el : null;
-    };
-    const el = find(); if (el) return resolve(el);
-    const observer = new MutationObserver(() => {
-      const el = find(); if (el) { observer.disconnect(); resolve(el); }
-    });
-    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled', 'aria-disabled'] });
-    setTimeout(() => { observer.disconnect(); resolve(null); }, timeout);
-  });
-}
-
-// Sam's Club — checks if Shipping is already selected, clicks it if not
-async function selectShipping() {
-  const radio = document.getElementById('fulfillment-Shipping');
-  if (!radio) { log('info', 'No fulfillment selector on this page'); return; }
-  if (radio.getAttribute('data-selected') === 'true' || radio.checked) {
-    log('info', 'Shipping already selected');
-    return;
-  }
-  const tile = radio.closest('[class*="flex"]') || radio.parentElement;
-  if (tile) {
-    tile.click();
-    log('success', 'Shipping selected');
-    await sleep(300);
-  }
-}
-
-// Waits for View Cart button after adding to cart — reloads if not found
-async function waitForViewCart(botConfig, isSams) {
-  log('info', 'Waiting for View Cart button...');
-  const viewCartBtn = await findBtn(['viewcart', 'viewbag', 'gotocart', 'viewmycart'], 8000);
-  if (viewCartBtn) {
-    log('success', 'Found View Cart: "' + viewCartBtn.textContent.trim().split('\n')[0].substring(0, 40) + '"');
-    log('info', 'Clicking View Cart...');
-    viewCartBtn.click();
-    await chrome.storage.local.set({ botPhase: 'CART' });
-  } else {
-    log('warning', 'View Cart not found after 8s — reloading to retry...');
-    location.reload();
-  }
-}
+// NOTE: Sam's Club specific functions (selectShipping, waitForSamsBtn,
+// fillSamsPayment, waitForViewCart) live in sams.js, which is injected before
+// this file. They share this isolated-world scope, so they're callable here.
 
 // Finds the first enabled button matching any keyword across all attributes
 function findBtn(keywords, timeout = 5000) {

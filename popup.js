@@ -219,8 +219,8 @@ async function toggleBot() {
       // Inject content.js into whatever tab the user is currently on
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       await chrome.storage.local.set({ currentTabId: tab.id });
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { window.__checkoutBotInit = false; } });
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      // Route injection through background.js so it shares one dedup gate with onUpdated
+      chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
       addLog('success', 'Bot injected into current tab');
     } else {
       // Build URL and navigate to the configured site

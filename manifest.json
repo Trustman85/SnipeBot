@@ -7,6 +7,6 @@
   "host_permissions": ["http://*/*", "https://*/*"],
   "side_panel": { "default_path": "popup.html" },
   "action": { "default_title": "Checkout Bot" },
-  "content_scripts": [{ "matches": ["http://localhost:3000/*"], "js": ["content.js"], "run_at": "document_end" }],
+  "content_scripts": [{ "matches": ["http://localhost:3000/*"], "js": ["sams.js", "content.js"], "run_at": "document_end" }],
   "background": { "service_worker": "background.js" }
 }
