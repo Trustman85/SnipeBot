@@ -3,6 +3,11 @@ chrome.action.onClicked.addListener((tab) => {
   chrome.sidePanel.open({ windowId: tab.windowId });
 });
 
+// Stop the bot whenever the extension is reloaded/updated or Chrome restarts,
+// so a refresh of the extension always leaves it in a clean stopped state.
+chrome.runtime.onInstalled.addListener(() => stopBot());
+chrome.runtime.onStartup.addListener(() => stopBot());
+
 // Keep the service worker alive while bot is running so it can re-inject content.js on page reloads.
 // Chrome kills idle service workers after ~30s — this alarm fires every 25s to prevent that.
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -50,8 +55,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Popup sent STOP_BOT — cancel any timers and reset state
   if (msg.type === 'STOP_BOT') stopBot();
 
-  // Popup requested initial injection into the current tab — routed through the same dedup gate
-  if (msg.type === 'INJECT_BOT') injectBot(msg.tabId, msg.url);
+  // Popup requested initial injection into the current tab — routed through the same dedup gate.
+  // Clear any stale debugger attachment first so it can't block page clicks this run.
+  if (msg.type === 'INJECT_BOT') detachAllDebuggers().then(() => injectBot(msg.tabId, msg.url));
 
   // Sam's CVV + Place Order — must run in the page's MAIN world to reach React's state
   if (msg.type === 'SAMS_CHECKOUT') samsCheckout(sender.tab?.id, msg.cvv);
@@ -60,60 +66,70 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // receives them directly from content.js. Relaying caused every log to appear twice.
 });
 
-// Runs in the page's MAIN world to fill the CVV the way React expects, then click Place Order.
-// In the main world we can reach el._valueTracker, which the isolated content-script world cannot.
+// Fills the CVV and clicks Place Order using the Chrome DevTools Protocol (chrome.debugger).
+// CDP dispatches REAL, trusted browser-level input — indistinguishable from a human — so
+// React Aria commits the value to its state every time (synthetic DOM events did not).
 async function samsCheckout(tabId, cvv) {
   if (!tabId) { log('error', 'SAMS_CHECKOUT: no tab id'); return; }
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: 'MAIN',
-    args: [cvv],
-    func: async (cvv) => {
-      const el = document.getElementById('cvv-field') ||
-                 document.querySelector('[id*="cvv-field"], [name="cvv"][type="password"]');
-      if (!el) return { ok: false, reason: 'CVV field not found' };
 
-      // Sam's uses React Aria — it commits state from real beforeinput/input events.
-      // execCommand('insertText') simulates genuine typing, which React Aria accepts;
-      // a plain value-set + synthetic event does NOT update its internal state.
-      el.focus();
-      el.click();
-      // Clear any existing content via selection
-      el.setSelectionRange?.(0, el.value.length);
-      document.execCommand('selectAll', false, null);
-      document.execCommand('delete', false, null);
-      // Type each digit so React Aria registers every keystroke
-      let typed = '';
-      for (const ch of String(cvv)) {
-        document.execCommand('insertText', false, ch);
-        typed += ch;
-      }
+  const dbg = { tabId };
+  try {
+    await chrome.debugger.attach(dbg, '1.3');
 
-      // Fallback: if typing didn't land, set value + reset tracker + input event
-      if (el.value !== String(cvv)) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        if (el._valueTracker) el._valueTracker.setValue('');
-        setter.call(el, String(cvv));
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, data: String(cvv), inputType: 'insertText' }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      }
+    // 1. Scroll the CVV field into view and get its center coordinates (CSS px, viewport-relative)
+    const cvvPt = await elementPoint(tabId, 'document.getElementById("cvv-field") || document.querySelector(\'[id*="cvv-field"],[name="cvv"][type="password"]\')');
+    if (!cvvPt) { log('error', 'CVV field not found'); return; }
 
-      // STOP after CVV is entered — do not click Place Order (verifying value)
-      await new Promise(r => setTimeout(r, 600));
-      const valueNow = el.value;
-      const cvvOk = valueNow === String(cvv);
-      let clicked = false;
-      return { ok: true, value: valueNow, method: cvvOk ? 'typed' : 'setter', clicked };
+    // 2. Real mouse click into the CVV field to focus it
+    await cdpClick(dbg, cvvPt.x, cvvPt.y);
+    await sleep(150);
+
+    // 3. Type the CVV as genuine keystrokes — React Aria commits this to its state
+    await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: String(cvv) });
+    log('success', 'CVV typed via CDP: "' + cvv + '"');
+    await sleep(400);
+
+    // 4. Scroll the Place Order button into view, get fresh coordinates, and real-click it
+    const btnPt = await elementPoint(tabId, 'document.querySelector(\'[data-automation-id="place-order-button"],[data-testid="place-order-button"]\')');
+    if (!btnPt) { log('error', 'Place Order button not found'); return; }
+    await cdpClick(dbg, btnPt.x, btnPt.y);
+    log('info', 'Place Order clicked via CDP');
+    await sleep(1500);
+  } catch (e) {
+    log('error', 'CDP checkout error: ' + e.message);
+  } finally {
+    try { await chrome.debugger.detach(dbg); } catch (_) {}
+  }
+}
+
+// Scrolls an element into view (via main-world eval of `expr`) and returns its viewport-center point
+async function elementPoint(tabId, expr) {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN', args: [expr],
+    func: (expr) => {
+      const el = eval(expr);
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
     }
   });
+  return result;
+}
 
-  const r = result?.result || {};
-  if (!r.ok) { log('error', 'CVV fill failed: ' + (r.reason || 'unknown')); return; }
-  log('success', 'CVV typed in page: "' + r.value + '" (method: ' + r.method + ') — stopped, Place Order NOT clicked');
+// Dispatches a real left-click (press + release) at viewport coordinates via CDP
+async function cdpClick(dbg, x, y) {
+  const base = { x, y, button: 'left', clickCount: 1 };
+  await chrome.debugger.sendCommand(dbg, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+  await chrome.debugger.sendCommand(dbg, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...base });
+  await chrome.debugger.sendCommand(dbg, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...base });
 }
 
 // Initializes bot state in storage and opens (or reuses) a localhost tab on the product page
 async function startBot(config) {
+
+  // Clear any stale debugger attachment so it can't block page interactions this run
+  await detachAllDebuggers();
 
   // Start keepalive alarm so the service worker stays alive during bot operation
   chrome.alarms.create('keepalive', { periodInMinutes: 0.4 });
@@ -141,8 +157,24 @@ async function startBot(config) {
   else await chrome.tabs.create({ url });
 }
 
+// Detaches the debugger from every tab it's attached to, so a stale attachment
+// from a failed CDP run can't interfere with the next run's page interactions.
+async function detachAllDebuggers() {
+  try {
+    const targets = await chrome.debugger.getTargets();
+    for (const t of targets) {
+      if (t.attached && t.tabId != null) {
+        try { await chrome.debugger.detach({ tabId: t.tabId }); } catch (_) {}
+      }
+    }
+  } catch (_) {}
+}
+
 // Stops the bot by clearing any pending retry timer and resetting storage state
 function stopBot() {
+
+  // Clear any stale debugger attachment so it doesn't block page clicks next run
+  detachAllDebuggers();
 
   // Stop the keepalive alarm
   chrome.alarms.clear('keepalive');
@@ -162,6 +194,9 @@ function stopBot() {
   // Notify the popup so it can update the UI
   log('warning', 'Background: bot stopped');
 }
+
+// Pauses execution for the given number of milliseconds
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // Helper — sends a log message to the popup's activity log
 // level controls the color: 'info' (blue), 'success' (green), 'warning' (yellow), 'error' (red)

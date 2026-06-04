@@ -160,21 +160,47 @@
   else if (botPhase === 'CONFIRM') {
     log('info', 'On confirmation page — reading order ID...');
     if (isSams) {
-      // Sam's Club confirmation — look for order number in page text or URL
-      const confirmEl = await new Promise(resolve => {
-        const check = () =>
-          document.querySelector('[class*="order-number"], [class*="orderNumber"], [data-testid*="order"]') ||
-          [...document.querySelectorAll('h1,h2,h3,p,span')].find(el =>
-            /order\s*(number|#|confirmed|placed)/i.test(el.textContent)
-          );
+      // Distinguish a REAL order confirmation from a failed submit (error banner still on
+      // the review-order page). Success = navigated to a confirmation page OR a genuine
+      // "thank you / order number" appears. Failure = the validation error banner is shown.
+      const outcome = await new Promise(resolve => {
+        const check = () => {
+          // Failure: still on review-order with the error banner
+          const errEl = [...document.querySelectorAll('[role="alert"], h1, h2, p, span, div')]
+            .find(el => /please correct the errors|enter the 3 digit/i.test(el.textContent || ''));
+          if (errEl) return { ok: false, text: errEl.textContent.trim() };
+          // Success: confirmation page URL, or a real thank-you / order-number element
+          const url = location.pathname.toLowerCase();
+          if (/confirmation|thank|order-confirm|order-placed|order-details|\/orders\//.test(url)) {
+            return { ok: true, text: 'confirmation page' };
+          }
+          const okEl = [...document.querySelectorAll('h1, h2, h3, p, span')]
+            .find(el => /thank you for your order|your order is confirmed|order\s*(number|#)\s*[:#]?\s*[A-Z0-9]{5,}/i.test(el.textContent || ''));
+          if (okEl) return { ok: true, text: okEl.textContent.trim().substring(0, 80) };
+          return null; // not determined yet
+        };
         const found = check(); if (found) return resolve(found);
-        const obs = new MutationObserver(() => { const el = check(); if (el) { obs.disconnect(); resolve(el); } });
+        const obs = new MutationObserver(() => { const r = check(); if (r) { obs.disconnect(); resolve(r); } });
         obs.observe(document.body, { childList: true, subtree: true });
         setTimeout(() => { obs.disconnect(); resolve(null); }, 8000);
       });
-      const orderId = confirmEl?.textContent?.trim() || 'confirmed';
-      log('success', '🎉 Order placed! ' + orderId.substring(0, 60));
-      setStatus('done', 'Order complete!');
+
+      if (outcome && outcome.ok) {
+        log('success', '🎉 Order placed! ' + outcome.text);
+        setStatus('done', 'Order complete!');
+      } else if (outcome && !outcome.ok) {
+        log('error', '❌ Order NOT placed — ' + outcome.text);
+        setStatus('error', 'Order failed: ' + outcome.text.substring(0, 40));
+        await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+        chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+        return;
+      } else {
+        log('warning', '⚠️ Order status unknown — no confirmation or error detected within 8s');
+        setStatus('error', 'Order status unknown');
+        await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+        chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+        return;
+      }
     } else {
       const orderEl = await waitFor('orderId');
       const orderId = orderEl.textContent;
