@@ -72,25 +72,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 async function samsCheckout(tabId, cvv) {
   if (!tabId) { log('error', 'SAMS_CHECKOUT: no tab id'); return; }
 
+  const cvvExpr = 'document.getElementById("cvv-field") || document.querySelector(\'[id*="cvv-field"],[name="cvv"][type="password"]\')';
+  const btnExpr = 'document.querySelector(\'[data-automation-id="place-order-button"],[data-testid="place-order-button"]\')';
+
   const dbg = { tabId };
   try {
     await chrome.debugger.attach(dbg, '1.3');
 
-    // 1. Scroll the CVV field into view and get its center coordinates (CSS px, viewport-relative)
-    const cvvPt = await elementPoint(tabId, 'document.getElementById("cvv-field") || document.querySelector(\'[id*="cvv-field"],[name="cvv"][type="password"]\')');
-    if (!cvvPt) { log('error', 'CVV field not found'); return; }
+    // 1. Fill the CVV ONLY if the saved card requires it. Poll briefly — the field may
+    //    render a moment after the button. If it never appears, the card needs no CVV.
+    const cvvPt = await waitPoint(tabId, cvvExpr, 2500);
+    if (cvvPt) {
+      await cdpClick(dbg, cvvPt.x, cvvPt.y);          // real click to focus
+      await sleep(150);
+      await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: String(cvv) }); // real keystrokes
+      log('success', 'CVV required — typed via CDP');
+      await sleep(400);
+    } else {
+      log('info', 'No CVV field — saved card needs no CVV, placing order directly');
+    }
 
-    // 2. Real mouse click into the CVV field to focus it
-    await cdpClick(dbg, cvvPt.x, cvvPt.y);
-    await sleep(150);
-
-    // 3. Type the CVV as genuine keystrokes — React Aria commits this to its state
-    await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: String(cvv) });
-    log('success', 'CVV typed via CDP: "' + cvv + '"');
-    await sleep(400);
-
-    // 4. Scroll the Place Order button into view, get fresh coordinates, and real-click it
-    const btnPt = await elementPoint(tabId, 'document.querySelector(\'[data-automation-id="place-order-button"],[data-testid="place-order-button"]\')');
+    // 2. Click Place Order (real CDP click) — works whether or not a CVV was needed
+    const btnPt = await waitPoint(tabId, btnExpr, 5000);
     if (!btnPt) { log('error', 'Place Order button not found'); return; }
     await cdpClick(dbg, btnPt.x, btnPt.y);
     log('info', 'Place Order clicked via CDP');
@@ -100,6 +103,17 @@ async function samsCheckout(tabId, cvv) {
   } finally {
     try { await chrome.debugger.detach(dbg); } catch (_) {}
   }
+}
+
+// Polls elementPoint until the element appears or the timeout elapses (returns null if never)
+async function waitPoint(tabId, expr, timeout = 3000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const p = await elementPoint(tabId, expr);
+    if (p) return p;
+    await sleep(200);
+  }
+  return null;
 }
 
 // Scrolls an element into view (via main-world eval of `expr`) and returns its viewport-center point
@@ -185,11 +199,13 @@ function stopBot() {
     botInterval = null;         // Clear the reference so it can be garbage collected
   }
 
-  // Update storage so the content script won't act on the next page load
+  // Update storage so the content script won't act on the next page load,
+  // and wipe the temporary plaintext config (only the encrypted copy remains at rest)
   chrome.storage.local.set({
     botRunning: false,    // Tells content script to do nothing
     botPhase: 'IDLE'      // Reset phase back to idle
   });
+  chrome.storage.local.remove('botConfig');
 
   // Notify the popup so it can update the UI
   log('warning', 'Background: bot stopped');

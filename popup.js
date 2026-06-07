@@ -1,60 +1,154 @@
-// All config field IDs — used to save/restore form values from storage
+// All config field IDs — used to save/restore form values
 const FIELDS = ['siteUrl','useCurrentTab','itemName','itemSku','searchType','maxPrice','refreshInterval',
                 'firstName','lastName','email','address','city','state','zip',
                 'cardNumber','cardName','expiry','cvv','stopOnSuccess'];
 
-// Tracks which profile is active — each profile has its own saved config
 let activeProfile = 'default';
+let cryptoKey = null;     // AES-GCM key derived from the PIN (in memory only, never stored)
+let lockMode  = 'unlock'; // 'unlock' (PIN exists) or 'create' (first-time PIN setup)
 
-// ── Profile switcher (top tabs) ────────────────────────────────────────────────
-// Switching profiles saves the current form and loads the selected profile's config
-document.querySelectorAll('.profile-tab').forEach(tab => {
-  tab.addEventListener('click', async () => {
-    if (tab.dataset.profile === activeProfile) return;
-    // Save current profile before switching
-    await saveProfileConfig(activeProfile);
-    // Switch profile
-    activeProfile = tab.dataset.profile;
-    document.querySelectorAll('.profile-tab').forEach(t => t.classList.remove('active'));
-    tab.classList.add('active');
-    // Load new profile's config into the form
-    await loadProfileConfig(activeProfile);
-    updateStartLabel();
-    addLog('info', 'Switched to ' + (activeProfile === 'sams' ? "Sam's Bot" : 'Bot'));
-  });
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// Crypto helpers — AES-256-GCM with a PBKDF2 key derived from the 6-digit PIN.
+// The PIN and key are never written to disk; only encrypted blobs + a salt are.
+// ─────────────────────────────────────────────────────────────────────────────
+const b64  = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes)));
+const ub64 = (str)   => Uint8Array.from(atob(str), c => c.charCodeAt(0));
 
-// Save form values under a profile-specific storage key
-async function saveProfileConfig(profile) {
+async function deriveKey(pin, saltBytes) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: saltBytes, iterations: 250000, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function encryptObj(key, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj)));
+  return { iv: b64(iv), ct: b64(ct) };
+}
+async function decryptObj(key, blob) {
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(blob.iv) }, key, ub64(blob.ct));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+// ── Form <-> object helpers ────────────────────────────────────────────────────
+function readForm() {
   const cfg = {};
   FIELDS.forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
     cfg[id] = el.type === 'checkbox' ? el.checked : el.value;
   });
-  await chrome.storage.local.set({ ['botConfig_' + profile]: cfg });
+  return cfg;
 }
-
-// Load a profile's config into the form
-async function loadProfileConfig(profile) {
-  const key  = 'botConfig_' + profile;
-  const data = await chrome.storage.local.get(key);
-  const cfg  = data[key];
-  if (!cfg) return;
+function writeForm(cfg) {
   FIELDS.forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
-    el.type === 'checkbox' ? el.checked = cfg[id] ?? true : el.value = cfg[id] || '';
+    if (el.type === 'checkbox') el.checked = cfg[id] ?? (id === 'stopOnSuccess');
+    else el.value = cfg[id] ?? '';
   });
-  // Restore search type toggle
   const type = cfg.searchType || 'name';
   document.querySelectorAll('.search-type-btn').forEach(b => b.classList.toggle('active', b.dataset.type === type));
   document.getElementById('nameGroup').style.display = type === 'name' ? '' : 'none';
   document.getElementById('skuGroup').style.display  = type === 'sku'  ? '' : 'none';
 }
+function clearForm() {
+  writeForm({ siteUrl: 'http://localhost:3000', maxPrice: '999', refreshInterval: '2',
+              stopOnSuccess: true, useCurrentTab: false, searchType: 'name' });
+}
+
+// ── PIN lock overlay ───────────────────────────────────────────────────────────
+function showLock(mode) {
+  lockMode = mode;
+  document.getElementById('lockOverlay').style.display = 'flex';
+  document.getElementById('lockError').textContent = '';
+  document.getElementById('pinInput').value = '';
+  document.getElementById('pinConfirm').value = '';
+  const confirmEl = document.getElementById('pinConfirm');
+  if (mode === 'create') {
+    document.getElementById('lockTitle').textContent = 'Create a PIN';
+    document.getElementById('lockSub').textContent = 'Choose a 6-digit PIN to encrypt your saved data';
+    confirmEl.style.display = '';
+    document.getElementById('unlockBtn').textContent = 'Set PIN';
+  } else {
+    document.getElementById('lockTitle').textContent = 'Enter PIN';
+    document.getElementById('lockSub').textContent = 'Enter your 6-digit PIN to unlock saved data';
+    confirmEl.style.display = 'none';
+    document.getElementById('unlockBtn').textContent = 'Unlock';
+  }
+  setTimeout(() => document.getElementById('pinInput').focus(), 50);
+}
+function hideLock() { document.getElementById('lockOverlay').style.display = 'none'; }
+
+document.getElementById('unlockBtn').addEventListener('click', handlePin);
+document.getElementById('pinInput').addEventListener('keydown', e => { if (e.key === 'Enter') handlePin(); });
+document.getElementById('pinConfirm').addEventListener('keydown', e => { if (e.key === 'Enter') handlePin(); });
+
+async function handlePin() {
+  const pin = document.getElementById('pinInput').value;
+  const err = document.getElementById('lockError');
+  if (!/^\d{6}$/.test(pin)) { err.textContent = 'PIN must be exactly 6 digits'; return; }
+
+  if (lockMode === 'create') {
+    const confirm = document.getElementById('pinConfirm').value;
+    if (pin !== confirm) { err.textContent = 'PINs do not match'; return; }
+    // Generate salt, derive key, store a check token + clear any old plaintext configs
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    cryptoKey = await deriveKey(pin, salt);
+    const check = await encryptObj(cryptoKey, { v: 'VALID' });
+    await chrome.storage.local.set({ pinSalt: b64(salt), pinCheck: check });
+    // Remove any legacy plaintext configs from before encryption existed
+    await chrome.storage.local.remove(['botConfig', 'botConfig_default', 'botConfig_sams']);
+    hideLock();
+    await saveProfileConfig(activeProfile); // persist current form encrypted
+    addLog('success', 'PIN set — saved data is now encrypted');
+  } else {
+    // Unlock: derive key from PIN + stored salt, verify against the check token
+    const { pinSalt, pinCheck } = await chrome.storage.local.get(['pinSalt', 'pinCheck']);
+    try {
+      const key = await deriveKey(pin, ub64(pinSalt));
+      const v = await decryptObj(key, pinCheck);
+      if (v.v !== 'VALID') throw new Error('bad');
+      cryptoKey = key;
+      hideLock();
+      await loadProfileConfig(activeProfile);
+      addLog('success', 'Unlocked');
+    } catch (_) {
+      err.textContent = 'Wrong PIN';
+    }
+  }
+}
+
+// ── Encrypted per-profile save/load ──────────────────────────────────────────
+async function saveProfileConfig(profile) {
+  if (!cryptoKey) return; // locked / no PIN yet
+  const blob = await encryptObj(cryptoKey, readForm());
+  await chrome.storage.local.set({ ['botConfigEnc_' + profile]: blob });
+}
+async function loadProfileConfig(profile) {
+  if (!cryptoKey) return;
+  const key = 'botConfigEnc_' + profile;
+  const data = await chrome.storage.local.get(key);
+  if (!data[key]) { clearForm(); return; }
+  try { writeForm(await decryptObj(cryptoKey, data[key])); }
+  catch (_) { clearForm(); addLog('warning', 'Could not decrypt ' + profile + ' config'); }
+}
+
+// ── Profile switcher (top tabs) ────────────────────────────────────────────────
+document.querySelectorAll('.profile-tab').forEach(tab => {
+  tab.addEventListener('click', async () => {
+    if (tab.dataset.profile === activeProfile) return;
+    await saveProfileConfig(activeProfile);
+    activeProfile = tab.dataset.profile;
+    document.querySelectorAll('.profile-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    await loadProfileConfig(activeProfile);
+    updateStartLabel();
+    addLog('info', 'Switched to ' + (activeProfile === 'sams' ? "Sam's Bot" : 'Bot'));
+  });
+});
 
 // ── Sub-tab switching (Item / Address / Payment) ───────────────────────────────
-// Highlight the active tab and show its panel when clicked
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -64,7 +158,6 @@ document.querySelectorAll('.tab').forEach(tab => {
   });
 });
 
-// Update the bottom start button label to show which profile is active
 function updateStartLabel() {
   const btn     = document.getElementById('startBtn');
   const label   = activeProfile === 'sams' ? "Sam's Bot" : 'Bot';
@@ -73,7 +166,6 @@ function updateStartLabel() {
 }
 
 // ── Search type toggle (By Name / By SKU) ─────────────────────────────────────
-// Show the relevant input group based on which search type is selected
 document.querySelectorAll('.search-type-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.search-type-btn').forEach(b => b.classList.remove('active'));
@@ -86,21 +178,19 @@ document.querySelectorAll('.search-type-btn').forEach(btn => {
 });
 
 // ── Wire up buttons ────────────────────────────────────────────────────────────
-// MV3 CSP blocks inline onclick handlers, so event listeners are attached here
 document.getElementById('startBtn').addEventListener('click', toggleBot);
 document.getElementById('saveBtn').addEventListener('click', saveConfig);
 document.getElementById('clearBtn').addEventListener('click', clearLog);
 document.getElementById('closeBtn').addEventListener('click', () => window.close());
 
-// Stop the bot when the sidebar is closed
+// Stop the bot + wipe the temporary plaintext config when the sidebar is closed
 window.addEventListener('unload', () => {
   chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+  chrome.storage.local.remove('botConfig');
   chrome.runtime.sendMessage({ type: 'STOP_BOT' }).catch(() => {});
 });
 
 // ── Auto-detect item name/SKU from current tab ───────────────────────────────
-// When "Use current tab" is checked, read the item identifier from the active page.
-// Checks URL params first (id = SKU, search = name), then falls back to h1/title.
 document.getElementById('useCurrentTab').addEventListener('change', async function () {
   if (!this.checked) return;
   try {
@@ -109,11 +199,8 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
       target: { tabId: tab.id },
       func: () => {
         const params = new URLSearchParams(window.location.search);
-        // SKU present in URL — use it directly
         if (params.get('id')) return { type: 'sku', value: params.get('id') };
-        // Name search present in URL — use it directly
         if (params.get('search')) return { type: 'name', value: params.get('search') };
-        // Fall back to reading the product title from the DOM
         const name = (
           document.querySelector('h1')?.textContent?.trim() ||
           document.querySelector('[class*="product-title"]')?.textContent?.trim() ||
@@ -123,10 +210,8 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
         return { type: 'name', value: name };
       }
     });
-
     const { type, value } = result?.result || {};
     if (!value) { addLog('warning', 'Could not detect item on this page'); return; }
-
     if (type === 'sku') {
       document.getElementById('itemSku').value = value;
       document.getElementById('searchType').value = 'sku';
@@ -146,62 +231,59 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
   }
 });
 
-// ── Restore saved config on popup open ────────────────────────────────────────
-// Load the active profile's config and restore running state
+// ── On popup open: lock if a PIN exists, else first-time (no lock yet) ──────────
 (async () => {
-  await loadProfileConfig(activeProfile);
-  const { botRunning } = await chrome.storage.local.get('botRunning');
+  const { pinSalt, botRunning } = await chrome.storage.local.get(['pinSalt', 'botRunning']);
+  if (pinSalt) {
+    showLock('unlock');           // PIN exists — require unlock before anything
+  } else {
+    // No PIN yet — migrate any legacy plaintext config into the form so the user's
+    // existing address/card carry over and get encrypted when they set a PIN.
+    const legacy = await chrome.storage.local.get('botConfig_' + activeProfile);
+    const cfg = legacy['botConfig_' + activeProfile];
+    if (cfg) writeForm(cfg); else clearForm();
+  }
   if (botRunning) setRunningUI(true);
   updateStartLabel();
 })();
 
-// ── Listen for messages from content script (relayed via background) ───────────
+// ── Messages from content script ───────────────────────────────────────────────
 chrome.runtime.onMessage.addListener(msg => {
-  if (msg.type === 'BOT_LOG')    addLog(msg.level, msg.text);    // Add entry to activity log
-  if (msg.type === 'BOT_STATUS') setStatus(msg.status, msg.text); // Update status bar
-  if (msg.type === 'BOT_DONE')   setRunningUI(false);             // Reset start button
+  if (msg.type === 'BOT_LOG')    addLog(msg.level, msg.text);
+  if (msg.type === 'BOT_STATUS') setStatus(msg.status, msg.text);
+  if (msg.type === 'BOT_DONE') {
+    setRunningUI(false);
+    chrome.storage.local.remove('botConfig'); // wipe temp plaintext once the run ends
+  }
 });
 
-// ── Save config ────────────────────────────────────────────────────────────────
-// Persist the current form values under the active profile's storage key
-function saveConfig() {
-  const cfg = {};
-  FIELDS.forEach(id => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    cfg[id] = el.type === 'checkbox' ? el.checked : el.value;
-  });
+// ── Save config (encrypted) ──────────────────────────────────────────────────
+async function saveConfig() {
+  if (!cryptoKey) { showLock('create'); return; } // first save sets the PIN
+  await saveProfileConfig(activeProfile);
   const label = activeProfile === 'sams' ? "Sam's Bot" : 'Bot';
-  chrome.storage.local.set({ ['botConfig_' + activeProfile]: cfg }, () => addLog('success', label + ' config saved ✓'));
+  addLog('success', label + ' config saved ✓ (encrypted)');
 }
 
 // ── Start / Stop bot ───────────────────────────────────────────────────────────
-// Toggles the bot on or off depending on current running state
 async function toggleBot() {
   addLog('info', 'Button clicked...');
   try {
     const data = await chrome.storage.local.get('botRunning');
-
-    // If already running, stop it
     if (data.botRunning) {
       chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+      chrome.storage.local.remove('botConfig'); // wipe temp plaintext on stop
       setRunningUI(false);
       addLog('warning', 'Bot stopped by user');
       return;
     }
 
-    // Collect all config values from the form
-    const cfg = {};
-    FIELDS.forEach(id => {
-      const el = document.getElementById(id);
-      if (!el) return;
-      cfg[id] = el.type === 'checkbox' ? el.checked : el.value;
-    });
+    // Must have a PIN/key before running (so config is encrypted at rest)
+    if (!cryptoKey) { showLock('create'); return; }
 
+    const cfg = readForm();
     const searchType = cfg.searchType || 'name';
     const identifier = searchType === 'sku' ? cfg.itemSku : cfg.itemName;
-
-    // Only require an item name/SKU when navigating to a site — not needed for current tab
     if (!cfg.useCurrentTab && !identifier) {
       addLog('error', searchType === 'sku' ? 'Enter a SKU first!' : 'Enter an item name first!');
       return;
@@ -209,29 +291,24 @@ async function toggleBot() {
 
     addLog('info', cfg.useCurrentTab ? 'Using current tab' : 'Search type: ' + searchType + ' | Value: "' + identifier + '"');
 
-    // Save state and update UI — store config and active profile so content.js knows which bot is running
-    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, ['botConfig_' + activeProfile]: cfg });
+    // Persist the encrypted copy, and a TEMPORARY plaintext copy the bot reads during the run.
+    // The temp copy is removed on stop / done / sidebar-close.
+    await saveProfileConfig(activeProfile);
+    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile });
     setRunningUI(true);
 
     const siteUrl = (cfg.siteUrl || 'http://localhost:3000').replace(/\/$/, '');
-
     if (cfg.useCurrentTab) {
-      // Inject content.js into whatever tab the user is currently on
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       await chrome.storage.local.set({ currentTabId: tab.id });
-      // Route injection through background.js so it shares one dedup gate with onUpdated
       chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
       addLog('success', 'Bot injected into current tab');
     } else {
-      // Build URL and navigate to the configured site
       const url = searchType === 'sku'
         ? siteUrl + '/product.html?id='     + encodeURIComponent(cfg.itemSku)
         : siteUrl + '/product.html?search=' + encodeURIComponent(cfg.itemName);
-
       addLog('info', 'Navigating to: ' + url);
       const tabs = await chrome.tabs.query({ url: siteUrl + '/*' });
-
-      // Reuse an existing tab on the configured site if available
       if (tabs.length > 0) {
         await chrome.tabs.update(tabs[0].id, { url, active: true });
         addLog('success', 'Tab navigated!');
@@ -240,7 +317,6 @@ async function toggleBot() {
         addLog('success', 'New tab opened!');
       }
     }
-
   } catch (err) {
     addLog('error', 'ERROR: ' + err.message);
     console.error(err);
@@ -248,8 +324,6 @@ async function toggleBot() {
 }
 
 // ── UI helpers ─────────────────────────────────────────────────────────────────
-
-// Update the start button and status bar to reflect running or idle state
 function setRunningUI(running) {
   const btn   = document.getElementById('startBtn');
   const label = activeProfile === 'sams' ? "Sam's Bot" : 'Bot';
@@ -263,14 +337,10 @@ function setRunningUI(running) {
     setStatus('idle', 'Idle – press Start to begin');
   }
 }
-
-// Update the status dot color and text
 function setStatus(state, text) {
   document.getElementById('statusDot').className = 'status-dot ' + state;
   document.getElementById('statusText').textContent = text;
 }
-
-// Prepend a timestamped log entry and cap the log at 50 entries
 function addLog(level, text) {
   const log = document.getElementById('log');
   const e   = document.createElement('div');
@@ -280,6 +350,4 @@ function addLog(level, text) {
   log.prepend(e);
   while (log.children.length > 50) log.removeChild(log.lastChild);
 }
-
-// Clear all entries from the activity log
 function clearLog() { document.getElementById('log').innerHTML = ''; }

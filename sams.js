@@ -76,18 +76,21 @@ async function fillSamsPayment(cfg) {
     if (!skipBlur) el.dispatchEvent(new Event('blur', { bubbles: true }));
   }
 
-  // Check if there's already a saved card with a CVV field on the page
-  const existingCvv = document.getElementById('cvv-field') ||
-                      document.querySelector('[id*="cvv-field"], [name="cvv"][type="password"]');
-  if (existingCvv) {
-    // Content scripts can't see React's _valueTracker (it lives in the page's MAIN world),
-    // so setting the value here doesn't update React's state and Sam's rejects it on submit.
-    // Delegate to background.js, which injects into the MAIN world where React state is reachable.
-    log('info', 'Filling CVV + Place Order via page (main world)...');
+  // A saved card may or may not require re-entering the CVV. Rather than gate on the
+  // CVV field (which isn't always present), wait for the Place Order button — its
+  // presence means there's a usable payment method. Background then fills the CVV
+  // ONLY if a CVV field exists, and clicks Place Order either way.
+  const placeOrderReady = await waitForSamsBtn(
+    '[data-automation-id="place-order-button"], [data-testid="place-order-button"]', 6000);
+
+  if (placeOrderReady) {
+    log('success', 'Payment ready — submitting (CVV filled only if required)...');
     chrome.runtime.sendMessage({ type: 'SAMS_CHECKOUT', cvv: String(cfg.cvv) });
     await chrome.storage.local.set({ botPhase: 'CONFIRM' });
-    return false; // background handles the rest
+    return false; // background handles CVV (if needed) + Place Order
   }
+
+  log('info', 'No Place Order button — no saved card, will add a payment method');
 
   // No saved card — open the Add payment modal
   if (!document.getElementById('cc-number')) {

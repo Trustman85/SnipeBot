@@ -5,6 +5,21 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
+  <!-- PIN lock overlay — shown until the 6-digit PIN unlocks the saved data -->
+  <div id="lockOverlay" class="lock-overlay" style="display:none">
+    <div class="lock-box">
+      <div class="lock-icon">🔒</div>
+      <div class="lock-title" id="lockTitle">Enter PIN</div>
+      <div class="lock-sub" id="lockSub">Enter your 6-digit PIN to unlock saved data</div>
+      <input type="password" id="pinInput" class="pin-input" inputmode="numeric"
+             pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="••••••">
+      <input type="password" id="pinConfirm" class="pin-input" inputmode="numeric"
+             pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="confirm" style="display:none">
+      <div class="lock-error" id="lockError"></div>
+      <button id="unlockBtn" class="lock-btn">Unlock</button>
+    </div>
+  </div>
+
   <div class="header">
     <div class="header-text">
       <div class="logo">🤖 Checkout Bot</div>

@@ -1,5 +1,31 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* PIN LOCK OVERLAY */
+.lock-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: linear-gradient(135deg, #001f5a, #003087);
+  display: flex; align-items: center; justify-content: center;
+}
+.lock-box {
+  background: white; border-radius: 10px; padding: 28px 24px;
+  width: 280px; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,.3);
+}
+.lock-icon { font-size: 36px; margin-bottom: 8px; }
+.lock-title { font-size: 17px; font-weight: 800; color: #003087; margin-bottom: 4px; }
+.lock-sub { font-size: 12px; color: #777; margin-bottom: 16px; line-height: 1.4; }
+.pin-input {
+  width: 100%; padding: 12px; font-size: 22px; letter-spacing: 8px;
+  text-align: center; border: 2px solid #ddd; border-radius: 6px;
+  margin-bottom: 10px;
+}
+.pin-input:focus { outline: none; border-color: #0067A0; }
+.lock-error { color: #c00; font-size: 12px; min-height: 16px; margin-bottom: 8px; font-weight: 600; }
+.lock-btn {
+  width: 100%; padding: 11px; background: #0067A0; color: white;
+  border: none; border-radius: 6px; font-weight: 700; font-size: 14px; cursor: pointer;
+}
+.lock-btn:hover { background: #005a8e; }
+
 body {
   width: 100%;
   height: 100vh;
