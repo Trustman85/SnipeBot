@@ -365,13 +365,16 @@ async function toggleBot() {
       return;
     }
 
+    // Sam's "search & navigate" mode: Sam's profile with "use current tab" UNCHECKED.
+    const samsSearchMode = activeProfile === 'sams' && !cfg.useCurrentTab;
+    if (samsSearchMode) cfg.samsSearch = true; // background uses this to inject on navigation
+
     addLog('info', cfg.useCurrentTab ? 'Using current tab' : 'Search type: ' + searchType + ' | Value: "' + identifier + '"');
 
     // Persist the encrypted copy, and a TEMPORARY plaintext copy the bot reads during the run.
-    // The temp copy is removed on stop / done / sidebar-close.
     await saveProfileConfig(activeProfile);
-    // qtyDone:false — fresh order, so the quantity gets set once this run
-    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false });
+    // qtyDone:false — fresh order; samsFellBack:false — SKU search fallback not used yet
+    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false });
     setRunningUI(true);
 
     const siteUrl = (cfg.siteUrl || 'http://localhost:3000').replace(/\/$/, '');
@@ -380,6 +383,16 @@ async function toggleBot() {
       await chrome.storage.local.set({ currentTabId: tab.id });
       chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
       addLog('success', 'Bot injected into current tab');
+    } else if (samsSearchMode) {
+      // By Item #/SKU → direct product URL; By Name → Sam's search results
+      const url = searchType === 'sku'
+        ? 'https://www.samsclub.com/ip/' + encodeURIComponent(cfg.itemSku)
+        : 'https://www.samsclub.com/s/'  + encodeURIComponent(cfg.itemName);
+      addLog('info', 'Opening Sam\'s: ' + url);
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      await chrome.storage.local.set({ currentTabId: tab.id });
+      await chrome.tabs.update(tab.id, { url, active: true });
+      addLog('success', searchType === 'sku' ? 'Going to item…' : 'Searching Sam\'s…');
     } else {
       const url = searchType === 'sku'
         ? siteUrl + '/product.html?id='     + encodeURIComponent(cfg.itemSku)

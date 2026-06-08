@@ -29,6 +29,10 @@ function detectSamsPhase() {
   // "View Cart" link on a product page can't be mistaken for this step)
   if (/\/pac\b/.test(url)) return 'ADDED';
 
+  // Search results page (By Name) — MUST be checked before SEARCH, because result
+  // tiles have their own "Add" buttons that would otherwise look like a product page.
+  if (/^\/s\//.test(url) || /\/search\b/.test(url)) return 'RESULTS';
+
   // Product page — has an Add to Cart button
   if (document.querySelector('[data-automation-id="atc"],[data-dca-event="addToCart"]') || /\/ip\//.test(url))
     return 'SEARCH';

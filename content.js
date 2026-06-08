@@ -24,6 +24,7 @@
 
     // Named steps so the bot (and the log/status bar) always show where it is.
     const STEPS = {
+      RESULTS:  { n: 1, label: 'Search — open item' },
       SEARCH:   { n: 1, label: 'Find & add item' },
       ADDED:    { n: 2, label: 'Item added — open cart' },
       CART:     { n: 3, label: 'Cart — proceed to checkout' },
@@ -34,6 +35,51 @@
     const stepText = 'Step ' + step.n + '/5: ' + step.label;
     log('info', '── ' + stepText + (autoDetected ? ' (auto-detected)' : '') + ' | Page: ' + page + ' ──');
     setStatus('running', stepText);
+
+  // ── PHASE: RESULTS (Sam's By Name search) ──────────────────────
+  // On the Sam's search-results page — pick the product whose title best matches what
+  // was searched (not just the first link, which can be a sponsored / "you might also
+  // like" tile), then open it so the normal flow runs.
+  if (phase === 'RESULTS' && isSams) {
+    setStatus('running', 'Opening best match...');
+    log('info', 'Search results — matching "' + (botConfig.itemName || '') + '"...');
+
+    // Words from the searched name (ignore short/filler words)
+    const want = (botConfig.itemName || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2);
+
+    const tileOf = (a) => a.closest('[data-testid*="product"], [data-testid*="result"], li, [class*="tile"], [class*="card"]') || a.parentElement || a;
+
+    // Wait for product links, then score each by how many search words its tile contains
+    const link = await new Promise(resolve => {
+      const pickBest = () => {
+        const links = [...document.querySelectorAll('a[href*="/ip/"]')];
+        if (!links.length) return null;
+        let best = null, bestScore = -1;
+        for (const a of links) {
+          const text = (a.textContent + ' ' + (tileOf(a).textContent || '')).toLowerCase();
+          const score = want.length ? want.filter(w => text.includes(w)).length : 1;
+          if (score > bestScore) { bestScore = score; best = a; }
+        }
+        // Require at least half the search words to match before committing
+        return (want.length === 0 || bestScore >= Math.ceil(want.length / 2)) ? best : null;
+      };
+      const el = pickBest(); if (el) return resolve(el);
+      const obs = new MutationObserver(() => { const el = pickBest(); if (el) { obs.disconnect(); resolve(el); } });
+      obs.observe(document.body, { childList: true, subtree: true });
+      setTimeout(() => { obs.disconnect(); resolve(pickBest() || document.querySelector('a[href*="/ip/"]')); }, 8000);
+    });
+
+    if (!link) {
+      log('error', 'No matching product found in search results.');
+      setStatus('error', 'No results found');
+      await chrome.storage.local.set({ botRunning: false });
+      chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+      return;
+    }
+    log('success', 'Opening: "' + (tileOf(link).textContent.trim().substring(0, 50) || link.href) + '"');
+    location.href = link.href; // navigate to the product page → SEARCH phase takes over
+    return;
+  }
 
   // ── PHASE: SEARCH ──────────────────────────────────────────────
   if (phase === 'SEARCH') {
@@ -51,6 +97,18 @@
       : await findBtn(['addtocart', 'addtobag', 'addtobasket', 'atc', 'buynow', 'buyitnow', 'purchase'], interval * 1000);
 
     if (!addBtn) {
+      // SKU direct-URL fallback: if the item-number page has no real product (bad number),
+      // search for the number instead. Only once, and only in Sam's SKU search mode.
+      if (isSams && botConfig.samsSearch && botConfig.searchType === 'sku') {
+        const hasProduct = document.querySelector('h1, [class*="product-title"], [data-automation-id="productName"], .price, [itemprop="price"]');
+        const { samsFellBack } = await chrome.storage.local.get('samsFellBack');
+        if (!hasProduct && !samsFellBack) {
+          log('warning', 'Item number page not found — falling back to search...');
+          await chrome.storage.local.set({ samsFellBack: true });
+          location.href = 'https://www.samsclub.com/s/' + encodeURIComponent(botConfig.itemSku);
+          return;
+        }
+      }
       log('warning', 'Add to Cart not found — item unavailable. Refreshing in ' + interval + 's...');
       setStatus('running', 'Not available – refreshing in ' + interval + 's');
       await sleep(interval * 1000);
