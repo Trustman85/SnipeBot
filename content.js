@@ -13,6 +13,24 @@
 
     const page = window.location.pathname;
 
+    // ── High-demand QUEUE / waiting room ───────────────────────────
+    // If the site put us in a waiting line, WAIT it out — do NOT reload (that can lose
+    // your place) and do NOT treat it as a step. Poll until it clears, then continue.
+    if (isSams && detectQueue()) {
+      log('warning', '⏳ In high-demand queue — waiting in line (will not reload)...');
+      setStatus('running', 'Waiting in queue (high demand)...');
+      let waited = 0;
+      while (detectQueue()) {
+        await sleep(3000); waited += 3;
+        if (waited % 15 === 0) log('info', 'Still in queue... (' + waited + 's in line)');
+        const st = await chrome.storage.local.get('botRunning');
+        if (!st.botRunning) return; // user stopped
+      }
+      log('success', 'Queue cleared after ' + waited + 's — continuing');
+      // If the queue cleared by full-page redirect, this doc is gone and a fresh inject
+      // takes over. If it cleared in-place (SPA), fall through and re-detect the step.
+    }
+
     // Smart step detection (Sam's): figure out which step the PAGE is actually on and
     // act on that, self-correcting if the stored phase is stale or steps were skipped.
     let phase = botPhase;
@@ -70,10 +88,11 @@
     });
 
     if (!link) {
-      log('error', 'No matching product found in search results.');
-      setStatus('error', 'No results found');
-      await chrome.storage.local.set({ botRunning: false });
-      chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+      // Keep pushing — results may be slow to render under load; reload and retry
+      log('warning', 'No product in results yet — reloading search and retrying...');
+      setStatus('running', 'Waiting for results...');
+      await sleep(1500);
+      location.reload();
       return;
     }
     log('success', 'Opening: "' + (tileOf(link).textContent.trim().substring(0, 50) || link.href) + '"');
@@ -89,11 +108,15 @@
     if (isSams) {
       log('info', 'Checking shipping selection...');
       await selectShipping();
+      await selectVariant(); // pick a Style if the item has variants and none is chosen
     }
 
     log('info', 'Looking for Add to Cart button...');
+    // Patient wait so a slow/overloaded page has time to render the button before we
+    // treat the item as unavailable (in-stock pages still resolve instantly).
+    const addWait = isSams ? patientTimeout(8000) : (interval * 1000);
     const addBtn = isSams
-      ? await waitForSamsBtn('[data-automation-id="atc"], [data-dca-event="addToCart"]', interval * 1000)
+      ? await waitForSamsBtn('[data-automation-id="atc"], [data-dca-event="addToCart"]', addWait)
       : await findBtn(['addtocart', 'addtobag', 'addtobasket', 'atc', 'buynow', 'buyitnow', 'purchase'], interval * 1000);
 
     if (!addBtn) {
@@ -159,12 +182,14 @@
 
     log('info', 'Looking for checkout button...');
     const btn = isSams
-      ? await waitForSamsBtn('[data-automation-id="checkout"]', 5000)
+      ? await waitForSamsBtn('[data-automation-id="checkout"]', patientTimeout(12000))
       : await findBtn(['checkout', 'checkoutbtn', 'proceedtocheckout', 'gotocheckout', 'paynow']);
     if (!btn) {
-      log('error', 'Checkout button not found — is cart empty?');
-      setStatus('error', 'Checkout button not found');
-      await chrome.storage.local.set({ botRunning: false });
+      // Keep pushing — reload the cart and retry until checkout appears
+      log('warning', 'Checkout button not ready — reloading cart and retrying...');
+      setStatus('running', 'Waiting for checkout...');
+      await sleep(1500);
+      location.reload();
       return;
     }
     log('success', 'Found checkout button: "' + btn.textContent.trim().substring(0, 40) + '"');
@@ -274,17 +299,21 @@
       if (outcome && outcome.ok) {
         log('success', '🎉 Order placed! ' + outcome.text);
         setStatus('done', 'Order complete!');
+        // (falls through to stop-on-success below)
       } else if (outcome && !outcome.ok) {
-        log('error', '❌ Order NOT placed — ' + outcome.text);
-        setStatus('error', 'Order failed: ' + outcome.text.substring(0, 40));
-        await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
-        chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+        // Error banner = order was NOT placed (no charge happened) → safe to retry checkout.
+        log('warning', '❌ Order not placed (' + outcome.text.substring(0, 40) + ') — retrying checkout...');
+        setStatus('running', 'Retrying checkout...');
+        await chrome.storage.local.set({ botPhase: 'CHECKOUT' });
+        await sleep(1500);
+        location.reload();
         return;
       } else {
-        log('warning', '⚠️ Order status unknown — no confirmation or error detected within 8s');
-        setStatus('error', 'Order status unknown');
-        await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
-        chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+        // Couldn't confirm yet — keep pushing: reload and re-check (don't give up)
+        log('warning', '⚠️ No confirmation yet — reloading to re-check...');
+        setStatus('running', 'Confirming order...');
+        await sleep(2000);
+        location.reload();
         return;
       }
     } else {

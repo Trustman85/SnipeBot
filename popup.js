@@ -371,10 +371,15 @@ async function toggleBot() {
 
     addLog('info', cfg.useCurrentTab ? 'Using current tab' : 'Search type: ' + searchType + ' | Value: "' + identifier + '"');
 
+    // HARD RESET: wipe any leftover state from a previous (possibly stuck) run so a new
+    // run never inherits stale pointers/flags. Background detaches any stale debugger.
+    await chrome.storage.local.remove(['currentTabId']);
+    chrome.runtime.sendMessage({ type: 'RESET_BOT' }).catch(() => {});
+
     // Persist the encrypted copy, and a TEMPORARY plaintext copy the bot reads during the run.
     await saveProfileConfig(activeProfile);
-    // qtyDone:false — fresh order; samsFellBack:false — SKU search fallback not used yet
-    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false });
+    // Fresh run flags: qtyDone (quantity), samsFellBack (SKU fallback), addAttempts (stuck guard)
+    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0 });
     setRunningUI(true);
 
     const siteUrl = (cfg.siteUrl || 'http://localhost:3000').replace(/\/$/, '');

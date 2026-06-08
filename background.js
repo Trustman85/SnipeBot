@@ -79,6 +79,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Clear any stale debugger attachment first so it can't block page clicks this run.
   if (msg.type === 'INJECT_BOT') detachAllDebuggers().then(() => injectBot(msg.tabId, msg.url));
 
+  // Popup is starting a fresh run — detach any stale debugger so it can't block this run
+  if (msg.type === 'RESET_BOT') detachAllDebuggers();
+
   // Sam's CVV + Place Order — must run in the page's MAIN world to reach React's state
   if (msg.type === 'SAMS_CHECKOUT') samsCheckout(sender.tab?.id, msg.cvv);
 
@@ -102,7 +105,7 @@ async function samsCheckout(tabId, cvv) {
     // 1. Fill the CVV ONLY if the saved card requires it. We only arrive here once the
     //    Place Order button exists, so a required CVV field is already rendered — a short
     //    poll is enough. If it's absent, the card needs no CVV.
-    const cvvPt = await waitPoint(tabId, cvvExpr, 800);
+    const cvvPt = await waitPoint(tabId, cvvExpr, 1800);
     if (cvvPt) {
       await cdpClick(dbg, cvvPt.x, cvvPt.y);          // real click to focus
       await sleep(50);
@@ -113,12 +116,32 @@ async function samsCheckout(tabId, cvv) {
       log('info', 'No CVV field — saved card needs no CVV, placing order directly');
     }
 
-    // 2. Click Place Order (real CDP click) — works whether or not a CVV was needed
-    const btnPt = await waitPoint(tabId, btnExpr, 5000);
-    if (!btnPt) { log('error', 'Place Order button not found'); return; }
+    // 2. Click Place Order (real CDP click) — works whether or not a CVV was needed.
+    //    If the button isn't there yet, reload and retry (keep pushing).
+    const btnPt = await waitPoint(tabId, btnExpr, 12000);
+    if (!btnPt) {
+      log('warning', 'Place Order button not found — reloading to retry...');
+      try { await chrome.debugger.detach(dbg); } catch (_) {}
+      chrome.tabs.reload(tabId);
+      return;
+    }
     await cdpClick(dbg, btnPt.x, btnPt.y);
     log('info', 'Place Order clicked via CDP');
-    await sleep(500);                                  // let the submit fire before detaching
+
+    // 3. Check the outcome. If a validation/error banner appears, the order did NOT go
+    //    through (no charge) — reload and retry. If it navigated away, it succeeded.
+    await sleep(2500);
+    const [{ result: failed }] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN',
+      func: () => /checkout|review-order/.test(location.pathname) &&
+                  /please correct the errors|enter the 3 digit|something went wrong|try again/i.test(document.body.innerText || '')
+    });
+    if (failed) {
+      log('warning', 'Order not placed (page shows an error) — reloading to retry...');
+      try { await chrome.debugger.detach(dbg); } catch (_) {}
+      chrome.tabs.reload(tabId);
+      return;
+    }
   } catch (e) {
     log('error', 'CDP checkout error: ' + e.message);
   } finally {

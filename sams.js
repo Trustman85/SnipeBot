@@ -8,6 +8,22 @@
 // content.js calls these only when the active profile is "sams".
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Detects a high-demand "waiting room" / queue / throttle page. On these the bot must
+// WAIT (not reload — reloading can lose your place in line) until it clears.
+function detectQueue() {
+  const url = (location.href || '').toLowerCase();
+  if (/queue|waitingroom|waiting-room|\/qit\/|queue-it|holding|throttle/.test(url)) return true;
+  const t = (document.body && document.body.innerText || '').toLowerCase();
+  return /waiting room|you are (now )?in line|you're in line|in the queue|your (place|spot|turn) in line|high demand|estimated wait|please wait while|number in line|currently in line|hold tight|you are in the queue/.test(t);
+}
+
+// Returns a more patient timeout when the page looks slow/still-loading (overloaded site),
+// so the bot doesn't give up before a laggy element finally renders.
+function patientTimeout(base) {
+  const slow = document.readyState !== 'complete' || (document.querySelectorAll('*').length < 400);
+  return slow ? Math.round(base * 2.5) : base;
+}
+
 // Inspects the CURRENT page (URL + key elements) and returns which checkout step
 // we're actually on — so the bot self-corrects instead of blindly trusting the
 // stored phase. Returns one of: CONFIRM, CHECKOUT, CART, ADDED, SEARCH, or null.
@@ -72,17 +88,47 @@ async function selectShipping() {
   }
 }
 
-// Waits for View Cart button after adding to cart — reloads if not found
+// Sam's — if the item has a variant/style selector and none is chosen, pick the first
+// option (so "Add to Cart" works on variant items reached via search). Best-effort.
+async function selectVariant() {
+  // Look for a variant option group
+  const groups = [...document.querySelectorAll(
+    '[data-testid*="variant"], [data-testid*="variation"], [data-testid*="ariation"], [class*="variant"], [aria-label*="tyle"]'
+  )];
+  let options = [];
+  for (const g of groups) {
+    const btns = [...g.querySelectorAll('button, [role="radio"], [role="button"]')].filter(b => (b.textContent || '').trim());
+    if (btns.length) { options = btns; break; }
+  }
+  if (!options.length) return false; // no variants on this item
+
+  // Already selected? (aria-checked/pressed, or a selected/active class)
+  const isSel = (b) => b.getAttribute('aria-checked') === 'true' || b.getAttribute('aria-pressed') === 'true' ||
+                       /selected|active|chosen/i.test(b.className || '');
+  if (options.some(isSel)) { log('info', 'Variant already selected'); return true; }
+
+  options[0].click();
+  log('success', 'Selected variant: "' + options[0].textContent.trim().substring(0, 30) + '"');
+  await sleep(300);
+  return true;
+}
+
+// Waits for View Cart button after adding to cart — reloads if not found, but gives up
+// after a few tries so a non-addable item (e.g. unselected variant) can't loop forever.
 async function waitForViewCart(botConfig, isSams) {
   log('info', 'Waiting for View Cart button...');
-  const viewCartBtn = await findBtn(['viewcart', 'viewbag', 'gotocart', 'viewmycart'], 8000);
+  const viewCartBtn = await findBtn(['viewcart', 'viewbag', 'gotocart', 'viewmycart'], patientTimeout(12000));
   if (viewCartBtn) {
     log('success', 'Found View Cart: "' + viewCartBtn.textContent.trim().split('\n')[0].substring(0, 40) + '"');
     log('info', 'Clicking View Cart...');
     viewCartBtn.click();
-    await chrome.storage.local.set({ botPhase: 'CART' });
+    await chrome.storage.local.set({ botPhase: 'CART', addAttempts: 0 }); // reset on success
   } else {
-    log('warning', 'View Cart not found after 8s — reloading to retry...');
+    // Keep trying indefinitely — under a heavy drop the confirmation can be slow, and you'd
+    // rather keep pushing than give up. (Press Stop to end it; it checks botRunning first.)
+    const { addAttempts = 0 } = await chrome.storage.local.get('addAttempts');
+    await chrome.storage.local.set({ addAttempts: addAttempts + 1 });
+    log('warning', 'View Cart not found (try ' + (addAttempts + 1) + ') — reloading and retrying...');
     location.reload();
   }
 }
@@ -113,7 +159,7 @@ async function fillSamsPayment(cfg) {
   // presence means there's a usable payment method. Background then fills the CVV
   // ONLY if a CVV field exists, and clicks Place Order either way.
   const placeOrderReady = await waitForSamsBtn(
-    '[data-automation-id="place-order-button"], [data-testid="place-order-button"]', 6000);
+    '[data-automation-id="place-order-button"], [data-testid="place-order-button"]', patientTimeout(12000));
 
   if (placeOrderReady) {
     log('success', 'Payment ready — submitting (CVV filled only if required)...');
