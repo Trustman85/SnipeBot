@@ -89,6 +89,49 @@ body {
 .status-dot.error   { background: #c00; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
+/* LIVE CLOCK BAR */
+.clock-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  background: #0d1b2a; color: #6fcf97; padding: 5px 14px;
+  border-bottom: 1px solid #1b2a3a; flex-shrink: 0;
+}
+.clock-time { font-family: "Courier New", monospace; font-size: 15px; font-weight: 700; letter-spacing: .5px; }
+.tz-select {
+  background: #1b2a3a; color: #cfe8ff; border: 1px solid #2a3f55;
+  border-radius: 4px; font-size: 11px; font-weight: 700; padding: 2px 4px; cursor: pointer;
+}
+
+/* QUEUE / WAITING-ROOM TIMERS */
+.queue-bar {
+  display: flex; background: #2a1f3a; border-bottom: 1px solid #3a2f4a; flex-shrink: 0;
+}
+.q-cell {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  padding: 5px 4px; border-right: 1px solid #3a2f4a;
+}
+.q-cell:last-child { border-right: none; }
+.q-label { font-size: 9px; font-weight: 700; color: #b89cd6; letter-spacing: .2px; }
+.q-val   { font-family: "Courier New", monospace; font-size: 14px; font-weight: 700; color: #e0c8ff; }
+.q-val.active { color: #ffd166; }
+.q-val.warn   { color: #ff6b6b; }
+
+/* DROP-TIME SCHEDULER */
+.drop-row { display: flex; gap: 8px; }
+.drop-row input[type="time"] {
+  flex: 1; padding: 6px 9px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px;
+}
+.lead-input {
+  flex: 0 0 52px; padding: 6px 6px; border: 1px solid #ddd; border-radius: 4px;
+  font-size: 13px; text-align: center;
+}
+.arm-btn {
+  flex: 0 0 70px; border: none; border-radius: 4px; font-weight: 700; font-size: 12px;
+  background: #f5a623; color: #1a1a1a; cursor: pointer;
+}
+.arm-btn:hover { background: #e0941a; }
+.arm-btn.armed { background: #c00; color: white; }
+.arm-btn.armed:hover { background: #a00; }
+
 /* TABS */
 .tabs { display: flex; background: white; border-bottom: 2px solid #e0e0e0; }
 .tab {

@@ -7,28 +7,42 @@
   window.__botLastUrl = location.href;
 
   try {
-    const { botRunning, botPhase, botConfig, activeProfile } = await chrome.storage.local.get(['botRunning', 'botPhase', 'botConfig', 'activeProfile']);
+    const { botRunning, botPhase, botConfig, activeProfile, burstUntil } = await chrome.storage.local.get(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'burstUntil']);
     if (!botRunning || !botConfig) return;
     const isSams = activeProfile === 'sams';
+    // Burst mode (around a drop): reload as fast as possible to catch the item going live
+    const burst = burstUntil && Date.now() < burstUntil;
 
     const page = window.location.pathname;
 
     // ── High-demand QUEUE / waiting room ───────────────────────────
     // If the site put us in a waiting line, WAIT it out — do NOT reload (that can lose
-    // your place) and do NOT treat it as a step. Poll until it clears, then continue.
+    // your place). Track elapsed time, the queue's est-wait/position, and report to the panel.
     if (isSams && detectQueue()) {
+      // Persist the queue start time so "time in line" survives queue-page reloads
+      let qs = (await chrome.storage.local.get('queueSince')).queueSince;
+      if (!qs) { qs = Date.now(); await chrome.storage.local.set({ queueSince: qs }); }
       log('warning', '⏳ In high-demand queue — waiting in line (will not reload)...');
       setStatus('running', 'Waiting in queue (high demand)...');
+      chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'in', since: qs, info: readQueueInfo() }).catch(() => {});
+
       let waited = 0;
       while (detectQueue()) {
+        chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'in', since: qs, info: readQueueInfo() }).catch(() => {});
         await sleep(3000); waited += 3;
-        if (waited % 15 === 0) log('info', 'Still in queue... (' + waited + 's in line)');
+        if (waited % 15 === 0) log('info', 'Still in queue... (' + Math.round((Date.now() - qs) / 1000) + 's in line)');
         const st = await chrome.storage.local.get('botRunning');
         if (!st.botRunning) return; // user stopped
       }
-      log('success', 'Queue cleared after ' + waited + 's — continuing');
-      // If the queue cleared by full-page redirect, this doc is gone and a fresh inject
-      // takes over. If it cleared in-place (SPA), fall through and re-detect the step.
+      await chrome.storage.local.remove('queueSince');
+      chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'out' }).catch(() => {});
+      log('success', 'Queue cleared after ' + Math.round((Date.now() - qs) / 1000) + 's — continuing');
+    }
+
+    // Report any post-queue "complete checkout within MM:SS" window to the panel
+    if (isSams) {
+      const ct = readCheckoutTimer();
+      if (ct) chrome.runtime.sendMessage({ type: 'BOT_CHECKOUT_TIMER', remaining: ct }).catch(() => {});
     }
 
     // Smart step detection (Sam's): figure out which step the PAGE is actually on and
@@ -111,13 +125,13 @@
       await selectVariant(); // pick a Style if the item has variants and none is chosen
     }
 
-    log('info', 'Looking for Add to Cart button...');
-    // Patient wait so a slow/overloaded page has time to render the button before we
-    // treat the item as unavailable (in-stock pages still resolve instantly).
-    const addWait = isSams ? patientTimeout(8000) : (interval * 1000);
+    log('info', burst ? '⚡ Burst: checking if live...' : 'Looking for Add to Cart button...');
+    // In burst mode use a SHORT check so we can reload fast and catch the moment it goes
+    // live. Otherwise be patient so a slow page has time to render before giving up.
+    const addWait = burst ? 700 : (isSams ? patientTimeout(8000) : (interval * 1000));
     const addBtn = isSams
       ? await waitForSamsBtn('[data-automation-id="atc"], [data-dca-event="addToCart"]', addWait)
-      : await findBtn(['addtocart', 'addtobag', 'addtobasket', 'atc', 'buynow', 'buyitnow', 'purchase'], interval * 1000);
+      : await findBtn(['addtocart', 'addtobag', 'addtobasket', 'atc', 'buynow', 'buyitnow', 'purchase'], addWait);
 
     if (!addBtn) {
       // SKU direct-URL fallback: if the item-number page has no real product (bad number),
@@ -132,9 +146,16 @@
           return;
         }
       }
-      log('warning', 'Add to Cart not found — item unavailable. Refreshing in ' + interval + 's...');
-      setStatus('running', 'Not available – refreshing in ' + interval + 's');
-      await sleep(interval * 1000);
+      // Burst: reload almost immediately to catch the live moment. Normal: wait the interval.
+      const reloadDelay = burst ? 150 : (interval * 1000);
+      if (burst) {
+        log('warning', '⚡ Not live yet — burst reloading...');
+        setStatus('running', '⚡ Burst polling for drop...');
+      } else {
+        log('warning', 'Add to Cart not found — refreshing in ' + interval + 's...');
+        setStatus('running', 'Not available – refreshing in ' + interval + 's');
+      }
+      await sleep(reloadDelay);
       location.reload();
       return;
     }

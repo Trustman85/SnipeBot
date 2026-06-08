@@ -17,6 +17,24 @@ function detectQueue() {
   return /waiting room|you are (now )?in line|you're in line|in the queue|your (place|spot|turn) in line|high demand|estimated wait|please wait while|number in line|currently in line|hold tight|you are in the queue/.test(t);
 }
 
+// Reads the queue page's own "estimated wait" and "position in line" if shown.
+function readQueueInfo() {
+  const t = (document.body && document.body.innerText) || '';
+  const est = (t.match(/estimated wait[^0-9]*([0-9]+\s*(?:min|minute|sec|second|hour)[a-z]*)/i) ||
+               t.match(/wait(?:ing)? time[^0-9]*([0-9]+\s*(?:min|minute|sec|second)[a-z]*)/i) ||
+               t.match(/about\s*([0-9]+\s*(?:min|minute|sec|second)[a-z]*)/i))?.[1];
+  const pos = (t.match(/(?:position|number)\s*(?:in line)?[^0-9]*([0-9][0-9,]{2,})/i) ||
+               t.match(/you are[^0-9]*([0-9][0-9,]{2,})(?:st|nd|rd|th)?\s*in line/i))?.[1];
+  return { est: est ? est.replace(/\s+/g, '') : null, pos: pos || null };
+}
+
+// Reads a post-queue "complete your purchase within MM:SS" / "time remaining" countdown.
+function readCheckoutTimer() {
+  const t = (document.body && document.body.innerText) || '';
+  const m = t.match(/(?:complete (?:your )?(?:purchase|order|checkout)|time remaining|expires? in|reserved for(?: you)?|hold(?:ing)? your (?:cart|spot))[^0-9]*([0-9]{1,2}:[0-9]{2})/i);
+  return m ? m[1] : null;
+}
+
 // Returns a more patient timeout when the page looks slow/still-loading (overloaded site),
 // so the bot doesn't give up before a laggy element finally renders.
 function patientTimeout(base) {

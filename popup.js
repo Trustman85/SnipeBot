@@ -260,8 +260,95 @@ document.getElementById('closeBtn').addEventListener('click', () => window.close
 // Stop the bot + wipe the temporary plaintext config when the sidebar is closed
 window.addEventListener('unload', () => {
   chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
-  chrome.storage.local.remove('botConfig');
+  chrome.storage.local.remove(['botConfig', 'burstUntil']);
   chrome.runtime.sendMessage({ type: 'STOP_BOT' }).catch(() => {});
+});
+
+// ── Live clock + timezone ──────────────────────────────────────────────────────
+const TZ_ABBR = {
+  'America/Chicago': 'CT', 'America/New_York': 'ET', 'America/Denver': 'MT',
+  'America/Los_Angeles': 'PT', 'America/Phoenix': 'AZ', 'America/Anchorage': 'AK',
+  'Pacific/Honolulu': 'HI', 'UTC': 'UTC'
+};
+const tzSelect  = document.getElementById('tzSelect');
+const liveClock = document.getElementById('liveClock');
+
+chrome.storage.local.get('clockTz', d => { if (d.clockTz && TZ_ABBR[d.clockTz]) tzSelect.value = d.clockTz; });
+tzSelect.addEventListener('change', () => chrome.storage.local.set({ clockTz: tzSelect.value }));
+
+function renderClock() {
+  const tz = tzSelect.value;
+  const now = new Date();
+  let hms;
+  try {
+    hms = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(now);
+  } catch (_) { hms = now.toTimeString().slice(0, 8); }
+  liveClock.textContent = hms + '.' + String(now.getMilliseconds()).padStart(3, '0') + ' ' + (TZ_ABBR[tz] || '');
+}
+setInterval(renderClock, 47);
+renderClock();
+
+// ── Drop-time scheduler (auto-start at the drop) ───────────────────────────────
+// Returns the timezone's UTC offset (ms) at a given moment
+function tzOffsetMs(tz, date) {
+  const dtf = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const p = {}; for (const x of dtf.formatToParts(date)) p[x.type] = x.value;
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - date.getTime();
+}
+// Timestamp for today's HH:MM:SS in `tz` (rolls to tomorrow if already well past)
+function dropTimestamp(tz, hh, mm, ss) {
+  const now = new Date();
+  const dtf = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const p = {}; for (const x of dtf.formatToParts(now)) p[x.type] = x.value;
+  let guess = Date.UTC(+p.year, +p.month - 1, +p.day, hh, mm, ss);
+  guess -= tzOffsetMs(tz, new Date(guess));
+  if (guess - Date.now() < -60000) guess += 86400000; // already passed >1min ago → next day's drop
+  return guess;
+}
+
+let dropInterval = null;
+const armBtn       = document.getElementById('armBtn');
+const dropStatusEl = document.getElementById('dropStatus');
+
+armBtn.addEventListener('click', () => {
+  if (dropInterval) { // Disarm
+    clearInterval(dropInterval); dropInterval = null;
+    armBtn.textContent = 'Arm'; armBtn.classList.remove('armed');
+    dropStatusEl.textContent = 'Disarmed.';
+    return;
+  }
+  const v = document.getElementById('dropTime').value; // "HH:MM:SS" or "HH:MM"
+  if (!v) { dropStatusEl.textContent = 'Set a drop time first.'; return; }
+  const [hh, mm, ss = 0] = v.split(':').map(Number);
+  const tz = tzSelect.value;
+  const target = dropTimestamp(tz, hh, mm, ss);
+  const leadMs = Math.max(0, parseInt(document.getElementById('leadSec').value || '3')) * 1000;
+  const fireAt = target - leadMs; // start early
+
+  armBtn.textContent = 'Disarm'; armBtn.classList.add('armed');
+  if (!cryptoKey) addLog('warning', '⚠️ Armed — but unlock your PIN before the drop or it can\'t auto-start');
+
+  dropInterval = setInterval(async () => {
+    const remFire = fireAt - Date.now();
+    if (remFire <= 0) {
+      clearInterval(dropInterval); dropInterval = null;
+      armBtn.textContent = 'Arm'; armBtn.classList.remove('armed');
+      dropStatusEl.textContent = '🚀 Starting early — burst-polling for the drop!';
+      const { botRunning } = await chrome.storage.local.get('botRunning');
+      if (botRunning) return;
+      if (!cryptoKey) { addLog('error', 'Drop fired but PIN is locked — unlock and Start manually'); return; }
+      // Burst window: from the drop moment until 90s after, the bot reloads as fast as it
+      // can to grab a spot the instant the item goes live; then it settles to normal pace.
+      await chrome.storage.local.set({ burstUntil: target + 90000 });
+      toggleBot(); // same as pressing Start
+      return;
+    }
+    const s = Math.ceil(remFire / 1000);
+    const h2 = String(Math.floor(s / 3600)).padStart(2, '0');
+    const m2 = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+    const s2 = String(s % 60).padStart(2, '0');
+    dropStatusEl.textContent = 'Starts in ' + h2 + ':' + m2 + ':' + s2 + ' (' + (leadMs / 1000) + 's early, ' + (TZ_ABBR[tz] || '') + ')';
+  }, 50);
 });
 
 // ── Auto-detect item name/SKU from current tab ───────────────────────────────
@@ -327,11 +414,56 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
 chrome.runtime.onMessage.addListener(msg => {
   if (msg.type === 'BOT_LOG')    addLog(msg.level, msg.text);
   if (msg.type === 'BOT_STATUS') setStatus(msg.status, msg.text);
+  if (msg.type === 'BOT_QUEUE') {
+    if (msg.state === 'in') startQueueTimer(msg.since, msg.info);
+    else stopQueueTimer();
+  }
+  if (msg.type === 'BOT_CHECKOUT_TIMER') startCheckoutTimer(msg.remaining);
   if (msg.type === 'BOT_DONE') {
     setRunningUI(false);
-    chrome.storage.local.remove('botConfig'); // wipe temp plaintext once the run ends
+    stopQueueTimer(); stopCheckoutTimer();
+    chrome.storage.local.remove(['botConfig', 'burstUntil', 'queueSince']); // wipe temp state
   }
 });
+
+// ── Queue / checkout timer displays ────────────────────────────────────────────
+let queueTick = null, checkoutTick = null;
+const mmss = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+
+function startQueueTimer(since, info) {
+  const elapsed = document.getElementById('qElapsed');
+  const est     = document.getElementById('qEst');
+  elapsed.classList.add('active');
+  est.textContent = (info && info.est) ? info.est : (info && info.pos) ? ('#' + info.pos) : 'in line';
+  if (queueTick) clearInterval(queueTick);
+  const tick = () => { elapsed.textContent = mmss(Math.max(0, Math.floor((Date.now() - since) / 1000))); };
+  tick(); queueTick = setInterval(tick, 1000);
+}
+function stopQueueTimer() {
+  if (queueTick) { clearInterval(queueTick); queueTick = null; }
+  const elapsed = document.getElementById('qElapsed');
+  elapsed.classList.remove('active'); elapsed.textContent = '—';
+  document.getElementById('qEst').textContent = '—';
+}
+function startCheckoutTimer(remaining) {
+  const parts = String(remaining).split(':').map(Number);
+  let secs = parts.length === 2 ? parts[0] * 60 + parts[1] : parseInt(remaining);
+  if (isNaN(secs)) return;
+  const el = document.getElementById('qCheckout');
+  if (checkoutTick) clearInterval(checkoutTick);
+  const tick = () => {
+    el.textContent = mmss(Math.max(0, secs));
+    el.classList.toggle('warn', secs <= 60);
+    if (secs <= 0) { clearInterval(checkoutTick); checkoutTick = null; return; }
+    secs--;
+  };
+  tick(); checkoutTick = setInterval(tick, 1000);
+}
+function stopCheckoutTimer() {
+  if (checkoutTick) { clearInterval(checkoutTick); checkoutTick = null; }
+  const el = document.getElementById('qCheckout');
+  el.classList.remove('warn'); el.textContent = '—';
+}
 
 // ── Save config (encrypted) ──────────────────────────────────────────────────
 async function saveConfig() {
@@ -348,7 +480,8 @@ async function toggleBot() {
     const data = await chrome.storage.local.get('botRunning');
     if (data.botRunning) {
       chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
-      chrome.storage.local.remove('botConfig'); // wipe temp plaintext on stop
+      chrome.storage.local.remove(['botConfig', 'burstUntil', 'queueSince']); // wipe temp state on stop
+      stopQueueTimer(); stopCheckoutTimer();
       setRunningUI(false);
       addLog('warning', 'Bot stopped by user');
       return;
@@ -373,7 +506,8 @@ async function toggleBot() {
 
     // HARD RESET: wipe any leftover state from a previous (possibly stuck) run so a new
     // run never inherits stale pointers/flags. Background detaches any stale debugger.
-    await chrome.storage.local.remove(['currentTabId']);
+    await chrome.storage.local.remove(['currentTabId', 'queueSince']);
+    stopQueueTimer(); stopCheckoutTimer();
     chrome.runtime.sendMessage({ type: 'RESET_BOT' }).catch(() => {});
 
     // Persist the encrypted copy, and a TEMPORARY plaintext copy the bot reads during the run.

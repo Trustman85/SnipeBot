@@ -249,7 +249,7 @@ function stopBot() {
     botRunning: false,    // Tells content script to do nothing
     botPhase: 'IDLE'      // Reset phase back to idle
   });
-  chrome.storage.local.remove('botConfig');
+  chrome.storage.local.remove(['botConfig', 'burstUntil', 'queueSince']);
 
   // Notify the popup so it can update the UI
   log('warning', 'Background: bot stopped');

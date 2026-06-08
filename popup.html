@@ -47,6 +47,15 @@
 
   <div class="tab-panel active" id="tab-item">
     <div class="form-group">
+      <label>Drop time — auto-start (in selected zone)</label>
+      <div class="drop-row">
+        <input type="time" id="dropTime" step="1">
+        <input type="number" id="leadSec" class="lead-input" min="0" max="60" value="3" title="Start this many seconds early">
+        <button id="armBtn" class="arm-btn">Arm</button>
+      </div>
+      <span class="field-hint" id="dropStatus">Set time + early-seconds, press Arm. Bot starts early and burst-polls to grab a spot.</span>
+    </div>
+    <div class="form-group">
       <label>Site URL</label>
       <input type="text" id="siteUrl" placeholder="http://localhost:3000" value="http://localhost:3000">
     </div>
@@ -94,6 +103,28 @@
       <div class="form-group small"><label>CVV</label><input type="text" id="cvv" placeholder="123" maxlength="4"></div>
     </div>
     <p class="demo-note">⚠️ Demo only – data never leaves your browser</p>
+  </div>
+
+  <!-- Live clock + timezone (for timing a drop) -->
+  <div class="clock-bar">
+    <span class="clock-time" id="liveClock">--:--:--.---</span>
+    <select id="tzSelect" class="tz-select">
+      <option value="America/Chicago">CT</option>
+      <option value="America/New_York">ET</option>
+      <option value="America/Denver">MT</option>
+      <option value="America/Los_Angeles">PT</option>
+      <option value="America/Phoenix">AZ</option>
+      <option value="America/Anchorage">AK</option>
+      <option value="Pacific/Honolulu">HI</option>
+      <option value="UTC">UTC</option>
+    </select>
+  </div>
+
+  <!-- Queue / waiting-room timers (between the clock and the log) -->
+  <div class="queue-bar" id="queueBar">
+    <div class="q-cell"><span class="q-label">⏱️ In line</span><span class="q-val" id="qElapsed">—</span></div>
+    <div class="q-cell"><span class="q-label">📍 Est / pos</span><span class="q-val" id="qEst">—</span></div>
+    <div class="q-cell"><span class="q-label">⏳ Checkout</span><span class="q-val" id="qCheckout">—</span></div>
   </div>
 
   <div class="log-section">
