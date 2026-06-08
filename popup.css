@@ -115,7 +115,12 @@ body {
 .q-val.active { color: #ffd166; }
 .q-val.warn   { color: #ff6b6b; }
 
-/* DROP-TIME SCHEDULER */
+/* DROP-TIME SCHEDULER (standalone bar above the clock) */
+.drop-bar {
+  background: #14223a; padding: 7px 14px; border-bottom: 1px solid #1b2a3a;
+  flex-shrink: 0; display: flex; flex-direction: column; gap: 4px;
+}
+.drop-hint { font-size: 10px; color: #8fb3d9; }
 .drop-row { display: flex; gap: 8px; }
 .drop-row input[type="time"] {
   flex: 1; padding: 6px 9px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px;
