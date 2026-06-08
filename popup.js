@@ -1,5 +1,5 @@
 // All config field IDs — used to save/restore form values
-const FIELDS = ['siteUrl','useCurrentTab','itemName','itemSku','searchType','maxPrice','refreshInterval',
+const FIELDS = ['siteUrl','useCurrentTab','itemName','itemSku','searchType','quantity','maxPrice','refreshInterval',
                 'firstName','lastName','email','address','city','state','zip',
                 'cardNumber','cardName','expiry','cvv','stopOnSuccess'];
 
@@ -53,17 +53,21 @@ function writeForm(cfg) {
   document.getElementById('skuGroup').style.display  = type === 'sku'  ? '' : 'none';
 }
 function clearForm() {
-  writeForm({ siteUrl: 'http://localhost:3000', maxPrice: '999', refreshInterval: '2',
+  writeForm({ siteUrl: 'http://localhost:3000', quantity: '1', maxPrice: '999', refreshInterval: '2',
               stopOnSuccess: true, useCurrentTab: false, searchType: 'name' });
 }
 
 // ── PIN lock overlay ───────────────────────────────────────────────────────────
+let lockTimer = null; // countdown interval while locked out
+
 function showLock(mode) {
   lockMode = mode;
   document.getElementById('lockOverlay').style.display = 'flex';
   document.getElementById('lockError').textContent = '';
   document.getElementById('pinInput').value = '';
   document.getElementById('pinConfirm').value = '';
+  document.getElementById('pinInput').disabled = false;   // re-enable in case a prior lockout disabled it
+  document.getElementById('unlockBtn').disabled = false;
   const confirmEl = document.getElementById('pinConfirm');
   if (mode === 'create') {
     document.getElementById('lockTitle').textContent = 'Create a PIN';
@@ -80,9 +84,55 @@ function showLock(mode) {
 }
 function hideLock() { document.getElementById('lockOverlay').style.display = 'none'; }
 
+// Format milliseconds as M:SS
+function fmtCountdown(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+// Disable PIN entry and show a live countdown until `until` (ms timestamp)
+function showLockedCountdown(until) {
+  const inp = document.getElementById('pinInput');
+  const btn = document.getElementById('unlockBtn');
+  const err = document.getElementById('lockError');
+  const sub = document.getElementById('lockSub');
+  inp.disabled = true; btn.disabled = true; inp.value = '';
+  document.getElementById('lockTitle').textContent = 'Locked';
+  sub.textContent = 'Too many wrong attempts';
+  if (lockTimer) clearInterval(lockTimer);
+  const tick = () => {
+    const rem = until - Date.now();
+    if (rem <= 0) {
+      clearInterval(lockTimer); lockTimer = null;
+      inp.disabled = false; btn.disabled = false;
+      document.getElementById('lockTitle').textContent = 'Enter PIN';
+      sub.textContent = 'Enter your 6-digit PIN to unlock saved data';
+      err.textContent = '';
+      inp.focus();
+      return;
+    }
+    err.textContent = 'Locked — try again in ' + fmtCountdown(rem);
+  };
+  tick();
+  lockTimer = setInterval(tick, 1000);
+}
+
 document.getElementById('unlockBtn').addEventListener('click', handlePin);
 document.getElementById('pinInput').addEventListener('keydown', e => { if (e.key === 'Enter') handlePin(); });
 document.getElementById('pinConfirm').addEventListener('keydown', e => { if (e.key === 'Enter') handlePin(); });
+
+// Auto-submit: digits-only, and act the moment the 6th digit is entered
+document.getElementById('pinInput').addEventListener('input', function () {
+  this.value = this.value.replace(/\D/g, '').slice(0, 6); // numbers only
+  if (this.value.length === 6) {
+    if (lockMode === 'create') document.getElementById('pinConfirm').focus(); // go confirm the PIN
+    else handlePin();                                                          // unlock immediately
+  }
+});
+document.getElementById('pinConfirm').addEventListener('input', function () {
+  this.value = this.value.replace(/\D/g, '').slice(0, 6);
+  if (this.value.length === 6) handlePin(); // both 6 digits — create the PIN
+});
 
 async function handlePin() {
   const pin = document.getElementById('pinInput').value;
@@ -103,18 +153,42 @@ async function handlePin() {
     await saveProfileConfig(activeProfile); // persist current form encrypted
     addLog('success', 'PIN set — saved data is now encrypted');
   } else {
-    // Unlock: derive key from PIN + stored salt, verify against the check token
-    const { pinSalt, pinCheck } = await chrome.storage.local.get(['pinSalt', 'pinCheck']);
+    // Unlock — enforce escalating lockout after repeated wrong PINs
+    const { pinSalt, pinCheck, pinFails = 0, pinLockUntil = 0 } =
+      await chrome.storage.local.get(['pinSalt', 'pinCheck', 'pinFails', 'pinLockUntil']);
+
+    // Currently locked out? Block and show the countdown.
+    if (pinLockUntil && Date.now() < pinLockUntil) { showLockedCountdown(pinLockUntil); return; }
+
     try {
       const key = await deriveKey(pin, ub64(pinSalt));
       const v = await decryptObj(key, pinCheck);
       if (v.v !== 'VALID') throw new Error('bad');
+      // Correct — clear the failure counter and unlock
       cryptoKey = key;
+      await chrome.storage.local.set({ pinFails: 0, pinLockUntil: 0 });
       hideLock();
       await loadProfileConfig(activeProfile);
       addLog('success', 'Unlocked');
     } catch (_) {
-      err.textContent = 'Wrong PIN';
+      // Wrong PIN — 3 free attempts, then lock 5 min and double each lockout after (5,10,20…)
+      const fails = pinFails + 1;
+      let lockUntil = 0;
+      if (fails >= 4) {
+        const mins = 5 * Math.pow(2, fails - 4); // fail 4→5, 5→10, 6→20, ...
+        lockUntil = Date.now() + mins * 60 * 1000;
+      }
+      await chrome.storage.local.set({ pinFails: fails, pinLockUntil: lockUntil });
+      const inp = document.getElementById('pinInput');
+      inp.value = ''; inp.focus();
+      if (lockUntil) {
+        showLockedCountdown(lockUntil);
+      } else {
+        const left = 3 - fails;
+        err.textContent = left > 0
+          ? 'Wrong PIN — ' + left + ' attempt' + (left > 1 ? 's' : '') + ' before lockout'
+          : 'Wrong PIN — next wrong attempt locks for 5 min';
+      }
     }
   }
 }
@@ -233,9 +307,11 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
 
 // ── On popup open: lock if a PIN exists, else first-time (no lock yet) ──────────
 (async () => {
-  const { pinSalt, botRunning } = await chrome.storage.local.get(['pinSalt', 'botRunning']);
+  const { pinSalt, botRunning, pinLockUntil = 0 } = await chrome.storage.local.get(['pinSalt', 'botRunning', 'pinLockUntil']);
   if (pinSalt) {
     showLock('unlock');           // PIN exists — require unlock before anything
+    // If a lockout is still active, show the countdown (can't bypass by reopening)
+    if (pinLockUntil && Date.now() < pinLockUntil) showLockedCountdown(pinLockUntil);
   } else {
     // No PIN yet — migrate any legacy plaintext config into the form so the user's
     // existing address/card carry over and get encrypted when they set a PIN.
@@ -294,7 +370,8 @@ async function toggleBot() {
     // Persist the encrypted copy, and a TEMPORARY plaintext copy the bot reads during the run.
     // The temp copy is removed on stop / done / sidebar-close.
     await saveProfileConfig(activeProfile);
-    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile });
+    // qtyDone:false — fresh order, so the quantity gets set once this run
+    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false });
     setRunningUI(true);
 
     const siteUrl = (cfg.siteUrl || 'http://localhost:3000').replace(/\/$/, '');

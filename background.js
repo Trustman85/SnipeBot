@@ -37,7 +37,27 @@ async function injectBot(tabId, url) {
   await chrome.scripting.executeScript({ target: { tabId }, files: ['sams.js', 'content.js'] });
 }
 
-// When using current tab mode, re-inject content.js every time the tab finishes loading
+// PRIMARY (fast): inject as soon as the DOM is parsed — well before the page finishes
+// loading images/trackers. The bot's MutationObservers then act the instant the
+// next-step element appears, so it never waits for a full page load.
+chrome.webNavigation.onDOMContentLoaded.addListener(async (d) => {
+  if (d.frameId !== 0) return; // main frame only
+  const { botRunning, botConfig, currentTabId } = await chrome.storage.local.get(['botRunning', 'botConfig', 'currentTabId']);
+  if (!botRunning || !botConfig?.useCurrentTab) return;
+  if (d.tabId !== currentTabId) return;
+  await injectBot(d.tabId, d.url);
+});
+
+// Client-side (SPA) navigations don't reload the document — catch those too
+chrome.webNavigation.onHistoryStateUpdated.addListener(async (d) => {
+  if (d.frameId !== 0) return;
+  const { botRunning, botConfig, currentTabId } = await chrome.storage.local.get(['botRunning', 'botConfig', 'currentTabId']);
+  if (!botRunning || !botConfig?.useCurrentTab) return;
+  if (d.tabId !== currentTabId) return;
+  await injectBot(d.tabId, d.url);
+});
+
+// FALLBACK: if DOMContentLoaded was missed, the full-load event still injects (deduped)
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
   const { botRunning, botConfig, currentTabId } = await chrome.storage.local.get(['botRunning', 'botConfig', 'currentTabId']);
@@ -79,15 +99,16 @@ async function samsCheckout(tabId, cvv) {
   try {
     await chrome.debugger.attach(dbg, '1.3');
 
-    // 1. Fill the CVV ONLY if the saved card requires it. Poll briefly — the field may
-    //    render a moment after the button. If it never appears, the card needs no CVV.
-    const cvvPt = await waitPoint(tabId, cvvExpr, 2500);
+    // 1. Fill the CVV ONLY if the saved card requires it. We only arrive here once the
+    //    Place Order button exists, so a required CVV field is already rendered — a short
+    //    poll is enough. If it's absent, the card needs no CVV.
+    const cvvPt = await waitPoint(tabId, cvvExpr, 800);
     if (cvvPt) {
       await cdpClick(dbg, cvvPt.x, cvvPt.y);          // real click to focus
-      await sleep(150);
+      await sleep(50);
       await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: String(cvv) }); // real keystrokes
       log('success', 'CVV required — typed via CDP');
-      await sleep(400);
+      await sleep(250);                                // brief margin for React Aria to commit
     } else {
       log('info', 'No CVV field — saved card needs no CVV, placing order directly');
     }
@@ -97,7 +118,7 @@ async function samsCheckout(tabId, cvv) {
     if (!btnPt) { log('error', 'Place Order button not found'); return; }
     await cdpClick(dbg, btnPt.x, btnPt.y);
     log('info', 'Place Order clicked via CDP');
-    await sleep(1500);
+    await sleep(500);                                  // let the submit fire before detaching
   } catch (e) {
     log('error', 'CDP checkout error: ' + e.message);
   } finally {
@@ -111,7 +132,7 @@ async function waitPoint(tabId, expr, timeout = 3000) {
   while (Date.now() - start < timeout) {
     const p = await elementPoint(tabId, expr);
     if (p) return p;
-    await sleep(200);
+    await sleep(80);
   }
   return null;
 }

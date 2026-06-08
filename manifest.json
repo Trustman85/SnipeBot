@@ -3,7 +3,7 @@
   "name": "Checkout Bot – School Demo",
   "version": "1.0",
   "description": "Educational checkout automation demo for localhost mock store.",
-  "permissions": ["storage", "activeTab", "scripting", "tabs", "sidePanel", "alarms", "debugger"],
+  "permissions": ["storage", "activeTab", "scripting", "tabs", "sidePanel", "alarms", "debugger", "webNavigation"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "side_panel": { "default_path": "popup.html" },
   "action": { "default_title": "Checkout Bot" },

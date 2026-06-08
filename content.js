@@ -12,10 +12,31 @@
     const isSams = activeProfile === 'sams';
 
     const page = window.location.pathname;
-    log('info', '── Phase: ' + botPhase + ' | Page: ' + page + ' ──');
+
+    // Smart step detection (Sam's): figure out which step the PAGE is actually on and
+    // act on that, self-correcting if the stored phase is stale or steps were skipped.
+    let phase = botPhase;
+    let autoDetected = false;
+    if (isSams) {
+      const detected = detectSamsPhase();
+      if (detected) { phase = detected; autoDetected = detected !== botPhase; }
+    }
+
+    // Named steps so the bot (and the log/status bar) always show where it is.
+    const STEPS = {
+      SEARCH:   { n: 1, label: 'Find & add item' },
+      ADDED:    { n: 2, label: 'Item added — open cart' },
+      CART:     { n: 3, label: 'Cart — proceed to checkout' },
+      CHECKOUT: { n: 4, label: 'Checkout — enter payment' },
+      CONFIRM:  { n: 5, label: 'Confirm order' },
+    };
+    const step = STEPS[phase] || { n: '?', label: phase };
+    const stepText = 'Step ' + step.n + '/5: ' + step.label;
+    log('info', '── ' + stepText + (autoDetected ? ' (auto-detected)' : '') + ' | Page: ' + page + ' ──');
+    setStatus('running', stepText);
 
   // ── PHASE: SEARCH ──────────────────────────────────────────────
-  if (botPhase === 'SEARCH') {
+  if (phase === 'SEARCH') {
     setStatus('running', 'Looking for item...');
     const interval = parseInt(botConfig.refreshInterval || '2');
 
@@ -64,15 +85,21 @@
   }
 
   // ── PHASE: ADDED (Sam's only) ──────────────────────────────────
-  else if (botPhase === 'ADDED' && isSams) {
-    log('info', 'Item already added — waiting for View Cart button...');
+  else if (phase === 'ADDED' && isSams) {
+    // The /pac interstitial has the quantity stepper — bump it here before viewing cart
+    await maybeSetQuantity(botConfig);
+    log('info', 'Item added — waiting for View Cart button...');
     await waitForViewCart(botConfig, isSams);
   }
 
   // ── PHASE: CART ────────────────────────────────────────────────
-  else if (botPhase === 'CART') {
-    setStatus('running', 'Looking for checkout button...');
-    log('info', 'On cart page — looking for checkout button...');
+  else if (phase === 'CART') {
+    setStatus('running', 'On cart page...');
+
+    // Bump quantity if it wasn't already done on /pac (the guard prevents double-counting)
+    await maybeSetQuantity(botConfig);
+
+    log('info', 'Looking for checkout button...');
     const btn = isSams
       ? await waitForSamsBtn('[data-automation-id="checkout"]', 5000)
       : await findBtn(['checkout', 'checkoutbtn', 'proceedtocheckout', 'gotocheckout', 'paynow']);
@@ -89,8 +116,19 @@
   }
 
   // ── PHASE: CHECKOUT ────────────────────────────────────────────
-  else if (botPhase === 'CHECKOUT') {
+  else if (phase === 'CHECKOUT') {
     setStatus('running', 'Filling checkout form...');
+    const cfg = botConfig;
+
+    // Sam's: saved card — skip the generic address/payment form entirely (it has none,
+    // so that wait was pure dead time) and go straight to CVV + Place Order via CDP.
+    if (isSams) {
+      const done = await fillSamsPayment(cfg);
+      if (!done) return; // background handles CVV (if needed) + Place Order
+      return;
+    }
+
+    // Non-Sam's (mock store / generic): wait for the form, fill it, then place the order.
     log('info', 'On checkout page — waiting for form fields...');
     await new Promise(resolve => {
       const check = () => document.querySelector('#email, input[type="email"], input[name*="email"], input[type="text"]');
@@ -100,7 +138,6 @@
       setTimeout(() => { obs.disconnect(); resolve(); }, 5000);
     });
     log('info', 'Form ready — filling fields...');
-    const cfg = botConfig;
 
     function fill(id, val) {
       const el = document.getElementById(id);
@@ -136,19 +173,10 @@
     if (fill('cvv',      cfg.cvv))     filled.push('cvv');
 
     log('info', 'Fields filled: ' + (filled.length ? filled.join(', ') : 'none found'));
-    if (filled.length === 0) log('warning', 'No fields matched — checkout form may use different field IDs');
-
-    // Sam's Club — handle payment modal (click Add, fill card, save)
-    if (isSams) {
-      const done = await fillSamsPayment(cfg);
-      if (!done) return; // Not ready to place order yet
-    }
 
     log('info', 'Looking for Place Order button...');
     setStatus('running', 'Submitting order...');
-    const submitBtn = isSams
-      ? await waitForSamsBtn('[data-automation-id="place-order-button"], [data-testid="place-order-button"]', 5000)
-      : await findBtn(['place', 'order', 'pay', 'confirm', 'submit', 'buy']);
+    const submitBtn = await findBtn(['place', 'order', 'pay', 'confirm', 'submit', 'buy']);
     if (!submitBtn) { log('error', 'Place Order button not found!'); return; }
     log('success', 'Found Place Order: "' + submitBtn.textContent.trim().substring(0, 40) + '"');
     log('info', 'Clicking Place Order...');
@@ -157,7 +185,7 @@
   }
 
   // ── PHASE: CONFIRM ─────────────────────────────────────────────
-  else if (botPhase === 'CONFIRM') {
+  else if (phase === 'CONFIRM') {
     log('info', 'On confirmation page — reading order ID...');
     if (isSams) {
       // Distinguish a REAL order confirmation from a failed submit (error banner still on
@@ -222,6 +250,114 @@
 // NOTE: Sam's Club specific functions (selectShipping, waitForSamsBtn,
 // fillSamsPayment, waitForViewCart) live in sams.js, which is injected before
 // this file. They share this isolated-world scope, so they're callable here.
+
+// Dispatches a realistic press on an element (React Aria steppers/buttons respond to
+// the pointer sequence, not a bare click)
+function pressEl(el) {
+  const r = el.getBoundingClientRect();
+  const o = { bubbles: true, cancelable: true, composed: true, view: window,
+              clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+              button: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+  el.dispatchEvent(new PointerEvent('pointerdown', { ...o, buttons: 1 }));
+  el.dispatchEvent(new MouseEvent('mousedown',     { ...o, buttons: 1 }));
+  el.dispatchEvent(new PointerEvent('pointerup',   { ...o, buttons: 0 }));
+  el.dispatchEvent(new MouseEvent('mouseup',       { ...o, buttons: 0 }));
+  el.dispatchEvent(new MouseEvent('click',         { ...o, buttons: 0 }));
+  el.click();
+}
+
+// Bumps the quantity ONCE per order. A storage flag (qtyDone) guarantees it runs on
+// whichever page has the stepper first (/pac or /cart) and never a second time.
+async function maybeSetQuantity(botConfig) {
+  const qty = parseInt(botConfig.quantity || '1');
+  if (qty <= 1) return;
+  const { qtyDone } = await chrome.storage.local.get('qtyDone');
+  if (qtyDone) return; // already set this order
+
+  // Wait briefly for the stepper to render
+  await new Promise(resolve => {
+    const sel = '[data-testid="quantity-stepper-inc-icon"], [data-testid*="stepper-inc"], [class*="ld-Plus"]';
+    if (document.querySelector(sel)) return resolve();
+    const obs = new MutationObserver(() => { if (document.querySelector(sel)) { obs.disconnect(); resolve(); } });
+    obs.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => { obs.disconnect(); resolve(); }, 4000);
+  });
+
+  if (!document.querySelector('[data-testid="quantity-stepper-inc-icon"], [data-testid*="stepper-inc"], [class*="ld-Plus"]')) {
+    log('warning', 'Quantity stepper not found on this page — will try the next page');
+    return; // don't mark done; let the next page (/cart) try
+  }
+
+  await setQuantity(qty);
+  await chrome.storage.local.set({ qtyDone: true }); // lock it so it can't run again
+  log('success', 'Quantity set to ' + qty);
+  await sleep(400);
+}
+
+// Reads the current quantity shown by the stepper (input value or number display)
+function readQty() {
+  const inp = document.querySelector(
+    '[data-testid*="stepper"] input, input[data-testid*="quantity"], input[name*="quant"], input[aria-label*="uantity"]'
+  );
+  if (inp && inp.value !== '') { const n = parseInt(inp.value); if (!isNaN(n)) return n; }
+  const val = document.querySelector(
+    '[data-testid*="stepper-input"], [data-testid*="stepper-value"], [data-testid*="quantity-stepper"] [aria-live]'
+  );
+  if (val) { const n = parseInt((val.textContent || '').replace(/\D/g, '')); if (!isNaN(n)) return n; }
+  return null;
+}
+
+// Sets the item quantity to `qty` by clicking the + stepper until it reaches the target.
+// Idempotent: if the quantity is already `qty`, it does nothing — safe to call on /pac AND /cart.
+async function setQuantity(qty) {
+  // 1) Sam's (and similar) quantity stepper — increment control by its test id / + icon
+  const incIcon = document.querySelector(
+    '[data-testid="quantity-stepper-inc-icon"], [data-testid*="stepper-inc"], [data-testid*="quantity-inc"], [class*="ld-Plus"]'
+  );
+  if (incIcon) {
+    const incBtn = incIcon.closest('button, [role="button"]') || incIcon.parentElement;
+    // Read the starting quantity ONCE (default 1), then click exactly (target - start)
+    // times. Re-reading after each click is unreliable — the display lags and caused
+    // an extra click (3 → 4). Deterministic counting avoids that.
+    let start = readQty();
+    if (start === null) start = 1;
+    const clicks = Math.max(0, qty - start);
+    log('info', 'Quantity: at ' + start + ', clicking + ' + clicks + ' time(s) to reach ' + qty);
+    for (let i = 0; i < clicks; i++) { pressEl(incBtn); await sleep(220); }
+    return true;
+  }
+
+  // 2) Dropdown <select> (e.g. "Qty: 1 ▼")
+  const sel = document.querySelector('select[id*="qty"], select[id*="quantity"], select[name*="quant"], select[aria-label*="uantity"]');
+  if (sel) {
+    sel.value = String(qty);
+    sel.dispatchEvent(new Event('input',  { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    if (parseInt(sel.value) === qty) return true;
+  }
+
+  // 3) Generic +/- stepper button (by text/label)
+  const plus = [...document.querySelectorAll('button, [role="button"]')].find(b => {
+    const t = ((b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+    return t.includes('increase') || t.includes('increment') || /(^|\s)\+(\s|$)/.test(b.textContent || '') ||
+           t.includes('add one') || t.includes('plus');
+  });
+  if (plus) {
+    for (let i = 1; i < qty; i++) { pressEl(plus); await sleep(180); }
+    return true;
+  }
+
+  // 4) Number input (last resort — may not stick on React-controlled inputs)
+  const input = document.querySelector('#qty, input[type="number"][id*="qty"], input[id*="quantity"], input[name*="quant"], input[aria-label*="uantity"]');
+  if (input) {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(input, String(qty));
+    input.dispatchEvent(new Event('input',  { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }
+  return false;
+}
 
 // Finds the first enabled button matching any keyword across all attributes
 function findBtn(keywords, timeout = 5000) {

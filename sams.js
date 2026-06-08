@@ -8,6 +8,34 @@
 // content.js calls these only when the active profile is "sams".
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Inspects the CURRENT page (URL + key elements) and returns which checkout step
+// we're actually on — so the bot self-corrects instead of blindly trusting the
+// stored phase. Returns one of: CONFIRM, CHECKOUT, CART, ADDED, SEARCH, or null.
+function detectSamsPhase() {
+  const url = location.pathname.toLowerCase();
+
+  // Order confirmation / thank-you page
+  if (/confirmation|thank|order-confirm|order-placed|order-details|\/orders\//.test(url)) return 'CONFIRM';
+
+  // Checkout / review-order page — has the Place Order button
+  if (/checkout|review-order/.test(url) || document.querySelector('[data-automation-id="place-order-button"],[data-testid="place-order-button"]'))
+    return 'CHECKOUT';
+
+  // Cart page — has the Check Out button
+  if (/\/cart\b/.test(url) || document.querySelector('[data-automation-id="checkout"]'))
+    return 'CART';
+
+  // "Added to cart" interstitial page (kept strict — URL only, so a mini-cart
+  // "View Cart" link on a product page can't be mistaken for this step)
+  if (/\/pac\b/.test(url)) return 'ADDED';
+
+  // Product page — has an Add to Cart button
+  if (document.querySelector('[data-automation-id="atc"],[data-dca-event="addToCart"]') || /\/ip\//.test(url))
+    return 'SEARCH';
+
+  return null; // couldn't tell
+}
+
 // Sam's Club — finds a button by exact CSS selector
 function waitForSamsBtn(selector, timeout = 5000) {
   return new Promise(resolve => {
@@ -36,7 +64,7 @@ async function selectShipping() {
   if (tile) {
     tile.click();
     log('success', 'Shipping selected');
-    await sleep(300);
+    await sleep(100);
   }
 }
 

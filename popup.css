@@ -99,18 +99,18 @@ body {
 .tab.active { color: #0067A0; border-bottom-color: #0067A0; }
 .tab:hover  { color: #0067A0; background: #f0f7ff; }
 
-/* TAB PANELS */
-.tab-panel { display: none; padding: 14px 16px; background: white; overflow-y: auto; max-height: 340px; }
+/* TAB PANELS — size to content, never scroll internally */
+.tab-panel { display: none; padding: 10px 14px; background: white; flex-shrink: 0; }
 .tab-panel.active { display: block; }
 
-/* FORM */
-.form-group { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+/* FORM — compact spacing so all options fit without scrolling */
+.form-group { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
 .form-group label {
-  font-size: 11px; font-weight: 700; color: #555;
+  font-size: 10px; font-weight: 700; color: #555;
   text-transform: uppercase; letter-spacing: .3px;
 }
 .form-group input, .form-group select {
-  padding: 8px 10px; border: 1px solid #ddd; border-radius: 4px;
+  padding: 6px 9px; border: 1px solid #ddd; border-radius: 4px;
   font-size: 13px; width: 100%; transition: border-color .15s;
 }
 .form-group input:focus { outline: none; border-color: #0067A0; }
@@ -122,19 +122,19 @@ body {
 
 .checkbox-row {
   display: flex; align-items: center; gap: 8px;
-  margin-top: 4px; font-size: 12px;
+  margin-top: 2px; margin-bottom: 6px; font-size: 12px;
 }
 .checkbox-row input { width: 14px; height: 14px; cursor: pointer; }
 
-.demo-note { font-size: 11px; color: #f5a623; margin-top: 10px; font-weight: 600; }
+.demo-note { font-size: 11px; color: #f5a623; margin-top: 6px; font-weight: 600; }
 
 /* Search type toggle */
 .search-type-row {
-  display: flex; gap: 0; margin-bottom: 12px;
+  display: flex; gap: 0; margin-bottom: 8px;
   border: 1.5px solid #0067A0; border-radius: 4px; overflow: hidden;
 }
 .search-type-btn {
-  flex: 1; padding: 7px; background: white; border: none;
+  flex: 1; padding: 6px; background: white; border: none;
   font-size: 12px; font-weight: 700; color: #0067A0; cursor: pointer;
 }
 .search-type-btn:first-child { border-right: 1.5px solid #0067A0; }
@@ -143,8 +143,9 @@ body {
 
 .field-hint { font-size: 10px; color: #999; margin-top: 2px; }
 
-/* ACTIVITY LOG */
-.log-section { background: #1a1a2e; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+/* ACTIVITY LOG — takes remaining space and scrolls internally; min-height:0 lets it
+   shrink so the form above and the buttons below always stay fully visible */
+.log-section { background: #1a1a2e; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .log-header {
   display: flex; justify-content: space-between; align-items: center;
   padding: 8px 14px; font-size: 11px; font-weight: 700; color: #aaa;
@@ -198,6 +199,7 @@ body {
 .controls {
   display: flex; gap: 10px; padding: 12px 14px;
   background: #f4f6f9; border-top: 1px solid #e0e0e0;
+  flex-shrink: 0;   /* always pinned at the bottom, never squished */
 }
 .btn-save {
   flex: 1; padding: 10px; border: 1.5px solid #0067A0;
