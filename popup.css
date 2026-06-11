@@ -59,15 +59,15 @@ body {
 }
 .close-btn:hover { background: rgba(255,255,255,.3); }
 
-/* PROFILE TABS (top-level bot switcher) */
+/* PROFILE TABS (top-level store switcher) — all fit, no scrollbar */
 .profile-tabs {
   display: flex; background: #001f5a; flex-shrink: 0;
 }
 .profile-tab {
-  flex: 1; padding: 9px 4px; background: none; border: none;
-  font-size: 12px; font-weight: 700; color: rgba(255,255,255,.5);
+  flex: 1 1 0; min-width: 0; padding: 8px 2px; background: none; border: none;
+  font-size: 10px; font-weight: 700; color: rgba(255,255,255,.5);
   cursor: pointer; border-bottom: 2px solid transparent;
-  letter-spacing: .2px;
+  letter-spacing: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .profile-tab:hover  { color: rgba(255,255,255,.8); background: rgba(255,255,255,.05); }
 .profile-tab.active { color: white; border-bottom-color: #f5a623; }

@@ -10,15 +10,34 @@
     const { botRunning, botPhase, botConfig, activeProfile, burstUntil } = await chrome.storage.local.get(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'burstUntil']);
     if (!botRunning || !botConfig) return;
     const isSams = activeProfile === 'sams';
+    const store  = (window.__STORES && window.__STORES[activeProfile]) || null; // non-Sam's store adapter
+    const isStore = isSams || !!store;
     // Burst mode (around a drop): reload as fast as possible to catch the item going live
     const burst = burstUntil && Date.now() < burstUntil;
 
     const page = window.location.pathname;
 
+    // ── CAPTCHA / bot challenge ────────────────────────────────────
+    // The bot can't solve these — alert the human (sound + notification) and WAIT for it
+    // to be cleared (don't reload, which can make it worse). Resume once it's gone.
+    if (isStore && detectCaptcha()) {
+      log('error', '🛑 CAPTCHA / verification detected — SOLVE IT in the page! (alerting you)');
+      setStatus('error', '🛑 CAPTCHA — solve it!');
+      chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'captcha', text: 'A CAPTCHA/verification is blocking the bot — solve it in the page.' }).catch(() => {});
+      let buzzed = 0;
+      while (detectCaptcha()) {
+        await sleep(2500);
+        if (++buzzed % 6 === 0) chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'captcha', text: 'Still waiting on the CAPTCHA…' }).catch(() => {});
+        const st = await chrome.storage.local.get('botRunning');
+        if (!st.botRunning) return;
+      }
+      log('success', 'CAPTCHA cleared — continuing');
+    }
+
     // ── High-demand QUEUE / waiting room ───────────────────────────
     // If the site put us in a waiting line, WAIT it out — do NOT reload (that can lose
     // your place). Track elapsed time, the queue's est-wait/position, and report to the panel.
-    if (isSams && detectQueue()) {
+    if (isStore && detectQueue()) {
       // Persist the queue start time so "time in line" survives queue-page reloads
       let qs = (await chrome.storage.local.get('queueSince')).queueSince;
       if (!qs) { qs = Date.now(); await chrome.storage.local.set({ queueSince: qs }); }
@@ -40,10 +59,13 @@
     }
 
     // Report any post-queue "complete checkout within MM:SS" window to the panel
-    if (isSams) {
+    if (isStore) {
       const ct = readCheckoutTimer();
       if (ct) chrome.runtime.sendMessage({ type: 'BOT_CHECKOUT_TIMER', remaining: ct }).catch(() => {});
     }
+
+    // ── Non-Sam's store: run the generic (scaffold) flow from its adapter ───────────
+    if (store && !isSams) { await runStore(store, botConfig, burst); return; }
 
     // Smart step detection (Sam's): figure out which step the PAGE is actually on and
     // act on that, self-correcting if the stored phase is stale or steps were skipped.
@@ -320,6 +342,7 @@
       if (outcome && outcome.ok) {
         log('success', '🎉 Order placed! ' + outcome.text);
         setStatus('done', 'Order complete!');
+        chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: 'Sam\'s order placed! ' + outcome.text.substring(0, 50) }).catch(() => {});
         // (falls through to stop-on-success below)
       } else if (outcome && !outcome.ok) {
         // Error banner = order was NOT placed (no charge happened) → safe to retry checkout.
@@ -465,6 +488,174 @@ async function setQuantity(qty) {
     return true;
   }
   return false;
+}
+
+// Detects a CAPTCHA / "verify you are human" / bot-challenge page (cross-store)
+function detectCaptcha() {
+  if (document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[title*="captcha" i], #px-captcha, [id*="px-captcha"], [class*="captcha" i], [id*="captcha" i], [data-testid*="captcha" i], [aria-label*="captcha" i]')) return true;
+  const t = (document.body && document.body.innerText || '').toLowerCase();
+  return /are you a human|verify (?:you(?:'| a)?re|that you are) (?:a )?human|i'?m not a robot|complete the (?:captcha|security check)|press (?:and|&) hold|unusual traffic|confirm you(?:'| a)?re human|enter the characters|verify your identity|security check to access/.test(t);
+}
+
+// ── Generic store flow (scaffold) ──────────────────────────────────────────────
+// Drives Target/Walmart/Best Buy/Pokémon Center from their adapter config. This is a
+// best-effort starting point — each store's selectors/CVV handling need real-HTML tuning.
+function waitForAny(selectorList, timeout = 5000) {
+  return new Promise(resolve => {
+    const find = () => (window.__storeFirstMatch ? window.__storeFirstMatch(selectorList) : document.querySelector(selectorList));
+    const el = find(); if (el) return resolve(el);
+    const obs = new MutationObserver(() => { const el = find(); if (el) { obs.disconnect(); resolve(el); } });
+    obs.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled', 'aria-disabled'] });
+    setTimeout(() => { obs.disconnect(); resolve(null); }, timeout);
+  });
+}
+function fillGeneric(el, val) {
+  el.focus();
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+  setter.call(el, String(val));
+  el.dispatchEvent(new Event('input',  { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+async function storeSetQty(S, qty) {
+  const inc = document.querySelector(S.qtyInc);
+  if (!inc) return;
+  const btn = inc.closest('button, [role="button"]') || inc;
+  for (let i = 1; i < qty; i++) { pressEl(btn); await sleep(200); }
+}
+// Pokémon Center payment screen. Step 1 (this build): pick Credit/Debit Card and set the
+// expiry selects. Card# and CVV (secure CyberSource iframes) + Place Order come next via CDP.
+async function pokemonCheckout(S, cfg) {
+  setStatus('running', 'Pokémon: payment...');
+
+  // Guard: card details must be saved in THIS profile's Payment tab
+  if (!cfg.cardNumber || !cfg.cvv || !cfg.expiry) {
+    log('error', '🛑 No card saved for Pokémon — fill the Payment tab (Card #, CVV, Expiry) on the ⚡ Pokémon profile and Save.');
+    setStatus('error', 'No card saved — fill Payment tab');
+    await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+    chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+    return;
+  }
+
+  // 1) Select "Credit/Debit Card" in the payment dropdown (reveals the card fields)
+  const sel = await waitForAny(S.paymentSelect, 8000);
+  if (!sel) { log('warning', 'Payment dropdown not found — reloading...'); await sleep(1200); location.reload(); return; }
+  if (sel.value !== 'credit-card') {
+    sel.value = 'credit-card';
+    sel.dispatchEvent(new Event('input',  { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    log('success', 'Selected Credit/Debit Card');
+    await sleep(900); // let the card fields render
+  } else {
+    log('info', 'Credit/Debit Card already selected');
+  }
+
+  // 2) Set expiry month/year from "MM/YY"
+  const exp = (cfg.expiry || '').replace(/[^0-9]/g, '');
+  const mm = exp.slice(0, 2), yy = exp.slice(-2);
+  const mSel = document.querySelector(S.expMonth);
+  const ySel = document.querySelector(S.expYear);
+  if (mSel && mm) { mSel.value = mm; mSel.dispatchEvent(new Event('change', { bubbles: true })); }
+  if (ySel && yy) { ySel.value = '20' + yy; ySel.dispatchEvent(new Event('change', { bubbles: true })); }
+  log('info', 'Set expiry ' + (mm || '??') + '/' + (yy || '??'));
+
+  // 3) Card # and CVV are secure CyberSource iframes — fill via CDP (background)
+  log('info', 'Filling card # and CVV (secure iframes) via CDP...');
+  await new Promise(res => chrome.runtime.sendMessage({
+    type: 'POKE_PAY', card: cfg.cardNumber, cvv: cfg.cvv, cardSel: S.cardIframe, cvvSel: S.cvvIframe
+  }, () => res()));
+  await sleep(500);
+
+  // 4) Click CONTINUE to advance to the next checkout step
+  const cont = await waitForAny(S.continueBtn, 6000);
+  if (cont) { log('success', 'Clicking Continue...'); cont.click(); }
+  else { log('warning', 'Continue button not found'); }
+}
+
+async function runStore(store, cfg, burst) {
+  const S = store.sel;
+  const phase = store.detectPhase(location.href) || 'SEARCH';
+  log('info', '── ' + store.name + ' | ' + phase + ' | ' + location.pathname + ' ──');
+  setStatus('running', store.name + ': ' + phase);
+
+  if (phase === 'RESULTS') {
+    const want = (cfg.itemName || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2);
+    const first = await waitForAny(S.productLink, 8000);
+    if (!first) { log('warning', 'No results yet — reloading...'); await sleep(1200); location.reload(); return; }
+    let best = first, score = -1;
+    for (const a of document.querySelectorAll(S.productLink)) {
+      const text = (a.textContent + ' ' + ((a.closest('li,div,article,[class*="card"]') || {}).textContent || '')).toLowerCase();
+      const sc = want.length ? want.filter(w => text.includes(w)).length : 1;
+      if (sc > score) { score = sc; best = a; }
+    }
+    log('success', 'Opening: "' + (best.textContent.trim().substring(0, 40) || best.href) + '"');
+    location.href = best.href; return;
+  }
+
+  if (phase === 'SEARCH') {
+    const interval = parseInt(cfg.refreshInterval || '2');
+    // Only set quantity here (product page) if the store has NO cart-page qty input.
+    // Pokémon Center uses a cart-page input, so quantity is handled after viewing the cart.
+    if (parseInt(cfg.quantity || '1') > 1 && !S.qtyInput) await storeSetQty(S, parseInt(cfg.quantity));
+    const addBtn = await waitForAny(S.addToCart, burst ? 700 : 8000);
+    if (!addBtn) {
+      const delay = burst ? 150 : interval * 1000;
+      log('warning', burst ? '⚡ Not live — burst reloading...' : store.name + ': not available — refreshing...');
+      await sleep(delay); location.reload(); return;
+    }
+    log('success', 'Adding to cart...'); addBtn.click();
+    await sleep(900);
+    const vc = await waitForAny(S.viewCart, 4000);
+    if (vc) { log('info', 'Opening cart...'); vc.click(); }
+    return;
+  }
+
+  if (phase === 'CART') {
+    // Change the amount on the cart page if you asked for more than 1 (qty input).
+    // The box is React-controlled, so set it with real CDP keystrokes (via background).
+    const wantQty = parseInt(cfg.quantity || '1');
+    if (wantQty > 1 && S.qtyInput) {
+      // WAIT for the qty box to render (cart React mounts after DOMContentLoaded)
+      const qin = await waitForAny(S.qtyInput, 6000);
+      if (!qin) {
+        log('warning', 'Quantity box not found on cart page yet');
+      } else if (parseInt(qin.value) === wantQty) {
+        log('info', 'Quantity already ' + qin.value);
+      } else {
+        log('info', 'Setting cart quantity to ' + wantQty + '...');
+        await new Promise(res => chrome.runtime.sendMessage({ type: 'STORE_SET_QTY', selector: S.qtyInput, value: wantQty }, () => res()));
+        // no extra pause — the CDP set already commits the change
+      }
+    }
+
+    const co = await waitForAny(S.checkout, 10000);
+    if (!co) { log('warning', store.name + ': checkout not ready — reloading...'); await sleep(1200); location.reload(); return; }
+    log('success', 'Proceeding to checkout...'); co.click(); return;
+  }
+
+  if (phase === 'CHECKOUT') {
+    // Pokémon Center has its own payment screen (dropdown + secure card iframes)
+    if (store.key === 'pokemoncenter') { await pokemonCheckout(S, cfg); return; }
+
+    const cvv = document.querySelector(S.cvv);
+    if (cvv && cfg.cvv) { fillGeneric(cvv, cfg.cvv); log('info', 'CVV filled'); await sleep(400); }
+    const po = await waitForAny(S.placeOrder, 10000);
+    if (!po) { log('warning', store.name + ': Place Order not ready — reloading...'); await sleep(1200); location.reload(); return; }
+    log('success', 'Placing order...'); po.click(); return;
+  }
+
+  if (phase === 'CONFIRM') {
+    log('success', '🎉 ' + store.name + ' — order step reached (verify the page).');
+    setStatus('done', 'Order step complete');
+    chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: store.name + ' order placed (please verify).' }).catch(() => {});
+    if (cfg.stopOnSuccess) {
+      await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+      chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+    }
+    return;
+  }
+
+  log('info', store.name + ': unrecognized page — waiting...');
+  await sleep(1500); location.reload();
 }
 
 // Finds the first enabled button matching any keyword across all attributes

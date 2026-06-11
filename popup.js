@@ -3,9 +3,19 @@ const FIELDS = ['siteUrl','useCurrentTab','itemName','itemSku','searchType','qua
                 'firstName','lastName','email','address','city','state','zip',
                 'cardNumber','cardName','expiry','cvv','stopOnSuccess'];
 
-let activeProfile = 'default';
+let activeProfile = 'sams';
 let cryptoKey = null;     // AES-GCM key derived from the PIN (in memory only, never stored)
 let lockMode  = 'unlock'; // 'unlock' (PIN exists) or 'create' (first-time PIN setup)
+
+// Per-store navigation (the popup needs the URLs; content.js has the selectors).
+const STORE_NAV = {
+  sams:          { name: "Sam's Bot",      search: q => 'https://www.samsclub.com/s/' + encodeURIComponent(q),               item: id => 'https://www.samsclub.com/ip/' + encodeURIComponent(id) },
+  target:        { name: 'Target Bot',     search: q => 'https://www.target.com/s?searchTerm=' + encodeURIComponent(q),       item: id => 'https://www.target.com/p/-/A-' + encodeURIComponent(id) },
+  walmart:       { name: 'Walmart Bot',    search: q => 'https://www.walmart.com/search?q=' + encodeURIComponent(q),          item: id => 'https://www.walmart.com/ip/' + encodeURIComponent(id) },
+  bestbuy:       { name: 'Best Buy Bot',   search: q => 'https://www.bestbuy.com/site/searchpage.jsp?st=' + encodeURIComponent(q), item: id => 'https://www.bestbuy.com/site/x/x/' + encodeURIComponent(id) + '.p?skuId=' + encodeURIComponent(id) },
+  pokemoncenter: { name: 'Pokémon Bot',    search: q => 'https://www.pokemoncenter.com/search/' + encodeURIComponent(q),      item: id => 'https://www.pokemoncenter.com/product/' + encodeURIComponent(id) },
+};
+const profileLabel = (p) => (STORE_NAV[p] && STORE_NAV[p].name) || 'Bot';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Crypto helpers — AES-256-GCM with a PBKDF2 key derived from the 6-digit PIN.
@@ -18,7 +28,28 @@ async function deriveKey(pin, saltBytes) {
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey(
     { name: 'PBKDF2', salt: saltBytes, iterations: 250000, hash: 'SHA-256' },
-    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    base, { name: 'AES-GCM', length: 256 }, true /* extractable, to cache in session */, ['encrypt', 'decrypt']);
+}
+
+// ── 2-hour unlock window ───────────────────────────────────────────────────────
+// Cache the key with an expiry so reopening the panel (or reloading the extension)
+// within 2 hours skips the PIN. Stored in local so it survives a reset; auto-deleted
+// when it expires. (Tradeoff: the key sits cached for up to 2h — bounded exposure.)
+const UNLOCK_HOURS = 2;
+async function cacheKey() {
+  try {
+    const raw = await crypto.subtle.exportKey('raw', cryptoKey);
+    await chrome.storage.local.set({ keyCache: { keyB64: b64(raw), exp: Date.now() + UNLOCK_HOURS * 3600 * 1000 } });
+  } catch (_) {}
+}
+async function tryRestoreKey() {
+  try {
+    const { keyCache } = await chrome.storage.local.get('keyCache');
+    if (!keyCache) return false;
+    if (Date.now() > keyCache.exp) { await chrome.storage.local.remove('keyCache'); return false; }
+    cryptoKey = await crypto.subtle.importKey('raw', ub64(keyCache.keyB64), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+    return true;
+  } catch (_) { return false; }
 }
 async function encryptObj(key, obj) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -149,6 +180,7 @@ async function handlePin() {
     await chrome.storage.local.set({ pinSalt: b64(salt), pinCheck: check });
     // Remove any legacy plaintext configs from before encryption existed
     await chrome.storage.local.remove(['botConfig', 'botConfig_default', 'botConfig_sams']);
+    await cacheKey(); // start the 2-hour unlock window
     hideLock();
     await saveProfileConfig(activeProfile); // persist current form encrypted
     addLog('success', 'PIN set — saved data is now encrypted');
@@ -167,9 +199,10 @@ async function handlePin() {
       // Correct — clear the failure counter and unlock
       cryptoKey = key;
       await chrome.storage.local.set({ pinFails: 0, pinLockUntil: 0 });
+      await cacheKey(); // start the 2-hour unlock window
       hideLock();
       await loadProfileConfig(activeProfile);
-      addLog('success', 'Unlocked');
+      addLog('success', 'Unlocked (stays unlocked ' + UNLOCK_HOURS + 'h)');
     } catch (_) {
       // Wrong PIN — 3 free attempts, then lock 5 min and double each lockout after (5,10,20…)
       const fails = pinFails + 1;
@@ -193,19 +226,42 @@ async function handlePin() {
   }
 }
 
-// ── Encrypted per-profile save/load ──────────────────────────────────────────
+// Address + payment are SHARED across all stores; everything else is per-store.
+const SHARED_FIELDS  = ['firstName', 'lastName', 'email', 'address', 'city', 'state', 'zip',
+                        'cardNumber', 'cardName', 'expiry', 'cvv'];
+const PROFILE_FIELDS = FIELDS.filter(f => !SHARED_FIELDS.includes(f));
+
+// ── Encrypted save/load (per-store item settings + one shared address/payment) ──
 async function saveProfileConfig(profile) {
   if (!cryptoKey) return; // locked / no PIN yet
-  const blob = await encryptObj(cryptoKey, readForm());
-  await chrome.storage.local.set({ ['botConfigEnc_' + profile]: blob });
+  const all = readForm();
+  const profileCfg = {}; PROFILE_FIELDS.forEach(k => profileCfg[k] = all[k]);
+  const sharedCfg  = {}; SHARED_FIELDS.forEach(k  => sharedCfg[k]  = all[k]);
+  await chrome.storage.local.set({
+    ['botConfigEnc_' + profile]: await encryptObj(cryptoKey, profileCfg),
+    botConfigShared:             await encryptObj(cryptoKey, sharedCfg),
+  });
 }
 async function loadProfileConfig(profile) {
   if (!cryptoKey) return;
-  const key = 'botConfigEnc_' + profile;
-  const data = await chrome.storage.local.get(key);
-  if (!data[key]) { clearForm(); return; }
-  try { writeForm(await decryptObj(cryptoKey, data[key])); }
-  catch (_) { clearForm(); addLog('warning', 'Could not decrypt ' + profile + ' config'); }
+  const data = await chrome.storage.local.get(['botConfigEnc_' + profile, 'botConfigShared']);
+  // Start from sensible defaults so a brand-new store isn't blank
+  const cfg = { siteUrl: 'http://localhost:3000', quantity: '1', maxPrice: '999',
+                refreshInterval: '2', stopOnSuccess: true, useCurrentTab: false, searchType: 'name' };
+  // Per-store item settings (older configs also carried address/payment — kept for migration)
+  if (data['botConfigEnc_' + profile]) {
+    try { Object.assign(cfg, await decryptObj(cryptoKey, data['botConfigEnc_' + profile])); } catch (_) {}
+  }
+  // Shared address/payment overlays on top (fill once, applies to every store)
+  if (data.botConfigShared) {
+    try { Object.assign(cfg, await decryptObj(cryptoKey, data.botConfigShared)); } catch (_) {}
+  } else if (cfg.cardNumber || cfg.address) {
+    // First run after the shared-config change: publish the address/payment we found
+    // (from an older per-store config) into the shared blob so every store inherits it.
+    const sharedCfg = {}; SHARED_FIELDS.forEach(k => sharedCfg[k] = cfg[k]);
+    await chrome.storage.local.set({ botConfigShared: await encryptObj(cryptoKey, sharedCfg) });
+  }
+  writeForm(cfg);
 }
 
 // ── Profile switcher (top tabs) ────────────────────────────────────────────────
@@ -214,11 +270,12 @@ document.querySelectorAll('.profile-tab').forEach(tab => {
     if (tab.dataset.profile === activeProfile) return;
     await saveProfileConfig(activeProfile);
     activeProfile = tab.dataset.profile;
+    chrome.storage.local.set({ lastProfile: activeProfile }); // reopen on this store next time
     document.querySelectorAll('.profile-tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     await loadProfileConfig(activeProfile);
     updateStartLabel();
-    addLog('info', 'Switched to ' + (activeProfile === 'sams' ? "Sam's Bot" : 'Bot'));
+    addLog('info', 'Switched to ' + profileLabel(activeProfile));
   });
 });
 
@@ -234,7 +291,7 @@ document.querySelectorAll('.tab').forEach(tab => {
 
 function updateStartLabel() {
   const btn     = document.getElementById('startBtn');
-  const label   = activeProfile === 'sams' ? "Sam's Bot" : 'Bot';
+  const label   = profileLabel(activeProfile);
   const running = btn.classList.contains('running');
   btn.textContent = running ? ('⏹ Stop ' + label) : ('▶ Start ' + label);
 }
@@ -256,6 +313,19 @@ document.getElementById('startBtn').addEventListener('click', toggleBot);
 document.getElementById('saveBtn').addEventListener('click', saveConfig);
 document.getElementById('clearBtn').addEventListener('click', clearLog);
 document.getElementById('closeBtn').addEventListener('click', () => window.close());
+
+// Auto-format the card number into groups of 4 as you type (display only; the bot
+// strips it back to digits when filling the store's field).
+document.getElementById('cardNumber').addEventListener('input', function () {
+  const digits = this.value.replace(/\D/g, '').slice(0, 16);
+  this.value = digits.replace(/(.{4})/g, '$1 ').trim();
+});
+// Auto-format expiry as MM/YY
+document.getElementById('expiry').addEventListener('input', function () {
+  let v = this.value.replace(/\D/g, '').slice(0, 4);
+  if (v.length >= 3) v = v.slice(0, 2) + '/' + v.slice(2);
+  this.value = v;
+});
 
 // Stop the bot + wipe the temporary plaintext config when the sidebar is closed
 window.addEventListener('unload', () => {
@@ -279,11 +349,14 @@ tzSelect.addEventListener('change', () => chrome.storage.local.set({ clockTz: tz
 function renderClock() {
   const tz = tzSelect.value;
   const now = new Date();
-  let hms;
+  const ms = String(now.getMilliseconds()).padStart(3, '0');
   try {
-    hms = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(now);
-  } catch (_) { hms = now.toTimeString().slice(0, 8); }
-  liveClock.textContent = hms + '.' + String(now.getMilliseconds()).padStart(3, '0') + ' ' + (TZ_ABBR[tz] || '');
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(now);
+    const get = (t) => (parts.find(p => p.type === t) || {}).value || '';
+    liveClock.textContent = get('hour') + ':' + get('minute') + ':' + get('second') + '.' + ms + ' ' + get('dayPeriod') + ' ' + (TZ_ABBR[tz] || '');
+  } catch (_) {
+    liveClock.textContent = now.toTimeString().slice(0, 8) + '.' + ms;
+  }
 }
 setInterval(renderClock, 47);
 renderClock();
@@ -392,16 +465,26 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
   }
 });
 
-// ── On popup open: lock if a PIN exists, else first-time (no lock yet) ──────────
+// ── On popup open: restore last store, then unlock (cached key, or PIN) ─────────
 (async () => {
+  // 1) Reopen on the store you were last using
+  const { lastProfile } = await chrome.storage.local.get('lastProfile');
+  if (lastProfile && STORE_NAV[lastProfile]) {
+    activeProfile = lastProfile;
+    document.querySelectorAll('.profile-tab').forEach(t => t.classList.toggle('active', t.dataset.profile === activeProfile));
+  }
+
   const { pinSalt, botRunning, pinLockUntil = 0 } = await chrome.storage.local.get(['pinSalt', 'botRunning', 'pinLockUntil']);
   if (pinSalt) {
-    showLock('unlock');           // PIN exists — require unlock before anything
-    // If a lockout is still active, show the countdown (can't bypass by reopening)
-    if (pinLockUntil && Date.now() < pinLockUntil) showLockedCountdown(pinLockUntil);
+    // Within the 2-hour window? Skip the PIN using the cached key.
+    if (await tryRestoreKey()) {
+      await loadProfileConfig(activeProfile);
+    } else {
+      showLock('unlock');         // PIN expired/never entered — require it
+      if (pinLockUntil && Date.now() < pinLockUntil) showLockedCountdown(pinLockUntil);
+    }
   } else {
-    // No PIN yet — migrate any legacy plaintext config into the form so the user's
-    // existing address/card carry over and get encrypted when they set a PIN.
+    // No PIN yet — migrate any legacy plaintext config so it carries over + gets encrypted.
     const legacy = await chrome.storage.local.get('botConfig_' + activeProfile);
     const cfg = legacy['botConfig_' + activeProfile];
     if (cfg) writeForm(cfg); else clearForm();
@@ -419,6 +502,7 @@ chrome.runtime.onMessage.addListener(msg => {
     else stopQueueTimer();
   }
   if (msg.type === 'BOT_CHECKOUT_TIMER') startCheckoutTimer(msg.remaining);
+  if (msg.type === 'PLAY_SOUND') playSound(msg.kind);
   if (msg.type === 'BOT_DONE') {
     setRunningUI(false);
     stopQueueTimer(); stopCheckoutTimer();
@@ -465,12 +549,39 @@ function stopCheckoutTimer() {
   el.classList.remove('warn'); el.textContent = '—';
 }
 
+// ── Alert sounds (Web Audio — no asset files needed) ───────────────────────────
+let _audioCtx = null;
+function playSound(kind) {
+  try {
+    _audioCtx = _audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (_audioCtx.state === 'suspended') _audioCtx.resume();
+    const seqs = {
+      success: [[660, 0], [880, 150], [1175, 300]],                 // pleasant rising chime
+      captcha: [[1000, 0], [1000, 220], [1000, 440], [1000, 660]],  // urgent repeated beeps
+      fail:    [[300, 0], [220, 220]],                              // low buzz
+      stuck:   [[800, 0], [800, 200]],
+    };
+    const seq = seqs[kind] || seqs.stuck;
+    for (const [f, t] of seq) tone(f, t, kind === 'captcha' ? 'square' : 'sine');
+  } catch (_) {}
+}
+function tone(freq, startMs, type) {
+  const ctx = _audioCtx;
+  const t0 = ctx.currentTime + startMs / 1000;
+  const osc = ctx.createOscillator(), g = ctx.createGain();
+  osc.type = type; osc.frequency.value = freq;
+  osc.connect(g); g.connect(ctx.destination);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(0.35, t0 + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.17);
+  osc.start(t0); osc.stop(t0 + 0.19);
+}
+
 // ── Save config (encrypted) ──────────────────────────────────────────────────
 async function saveConfig() {
   if (!cryptoKey) { showLock('create'); return; } // first save sets the PIN
   await saveProfileConfig(activeProfile);
-  const label = activeProfile === 'sams' ? "Sam's Bot" : 'Bot';
-  addLog('success', label + ' config saved ✓ (encrypted)');
+  addLog('success', profileLabel(activeProfile) + ' config saved ✓ (encrypted)');
 }
 
 // ── Start / Stop bot ───────────────────────────────────────────────────────────
@@ -498,8 +609,9 @@ async function toggleBot() {
       return;
     }
 
-    // Sam's "search & navigate" mode: Sam's profile with "use current tab" UNCHECKED.
-    const samsSearchMode = activeProfile === 'sams' && !cfg.useCurrentTab;
+    // Store "search & navigate" mode: a store profile with "use current tab" UNCHECKED.
+    const navStore = STORE_NAV[activeProfile];
+    const samsSearchMode = !!navStore && !cfg.useCurrentTab;
     if (samsSearchMode) cfg.samsSearch = true; // background uses this to inject on navigation
 
     addLog('info', cfg.useCurrentTab ? 'Using current tab' : 'Search type: ' + searchType + ' | Value: "' + identifier + '"');
@@ -523,15 +635,13 @@ async function toggleBot() {
       chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
       addLog('success', 'Bot injected into current tab');
     } else if (samsSearchMode) {
-      // By Item #/SKU → direct product URL; By Name → Sam's search results
-      const url = searchType === 'sku'
-        ? 'https://www.samsclub.com/ip/' + encodeURIComponent(cfg.itemSku)
-        : 'https://www.samsclub.com/s/'  + encodeURIComponent(cfg.itemName);
-      addLog('info', 'Opening Sam\'s: ' + url);
+      // By Item #/SKU → direct product URL; By Name → store search results
+      const url = searchType === 'sku' ? navStore.item(cfg.itemSku) : navStore.search(cfg.itemName);
+      addLog('info', 'Opening ' + navStore.name + ': ' + url);
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       await chrome.storage.local.set({ currentTabId: tab.id });
       await chrome.tabs.update(tab.id, { url, active: true });
-      addLog('success', searchType === 'sku' ? 'Going to item…' : 'Searching Sam\'s…');
+      addLog('success', searchType === 'sku' ? 'Going to item…' : 'Searching ' + navStore.name + '…');
     } else {
       const url = searchType === 'sku'
         ? siteUrl + '/product.html?id='     + encodeURIComponent(cfg.itemSku)
@@ -555,7 +665,7 @@ async function toggleBot() {
 // ── UI helpers ─────────────────────────────────────────────────────────────────
 function setRunningUI(running) {
   const btn   = document.getElementById('startBtn');
-  const label = activeProfile === 'sams' ? "Sam's Bot" : 'Bot';
+  const label = profileLabel(activeProfile);
   if (running) {
     btn.textContent = '⏹ Stop ' + label;
     btn.classList.add('running');

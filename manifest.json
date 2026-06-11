@@ -3,10 +3,10 @@
   "name": "Checkout Bot – School Demo",
   "version": "1.0",
   "description": "Educational checkout automation demo for localhost mock store.",
-  "permissions": ["storage", "activeTab", "scripting", "tabs", "sidePanel", "alarms", "debugger", "webNavigation"],
+  "permissions": ["storage", "activeTab", "scripting", "tabs", "sidePanel", "alarms", "debugger", "webNavigation", "notifications"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "side_panel": { "default_path": "popup.html" },
   "action": { "default_title": "Checkout Bot" },
-  "content_scripts": [{ "matches": ["http://localhost:3000/*"], "js": ["sams.js", "content.js"], "run_at": "document_end" }],
+  "content_scripts": [{ "matches": ["http://localhost:3000/*"], "js": ["stores.js", "sams.js", "content.js"], "run_at": "document_end" }],
   "background": { "service_worker": "background.js" }
 }

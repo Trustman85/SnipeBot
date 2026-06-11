@@ -32,9 +32,10 @@ async function injectBot(tabId, url) {
   if (url && url === lastInjectedUrl && now - lastInjectAt < 3000) return;
   lastInjectedUrl = url || '';
   lastInjectAt = now;
-  // content.js guards itself by URL, so no external flag reset is needed
-  // sams.js must be injected before content.js so its helpers are in scope
-  await chrome.scripting.executeScript({ target: { tabId }, files: ['sams.js', 'content.js'] });
+  // content.js guards itself by URL, so no external flag reset is needed.
+  // Store adapter files load before content.js so their registry + helpers are in scope.
+  await chrome.scripting.executeScript({ target: { tabId },
+    files: ['stores.js', 'sams.js', 'target.js', 'walmart.js', 'bestbuy.js', 'pokemoncenter.js', 'content.js'] });
 }
 
 // PRIMARY (fast): inject as soon as the DOM is parsed — well before the page finishes
@@ -82,8 +83,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Popup is starting a fresh run — detach any stale debugger so it can't block this run
   if (msg.type === 'RESET_BOT') detachAllDebuggers();
 
+  // Alert the human (desktop notification + relay a sound to the popup)
+  if (msg.type === 'BOT_ALERT') handleAlert(msg.kind, msg.text);
+
   // Sam's CVV + Place Order — must run in the page's MAIN world to reach React's state
   if (msg.type === 'SAMS_CHECKOUT') samsCheckout(sender.tab?.id, msg.cvv);
+
+  // Set a React-controlled input (e.g. Pokémon Center cart quantity) via real CDP keystrokes
+  if (msg.type === 'STORE_SET_QTY') { cdpSetValue(sender.tab?.id, msg.selector, msg.value).then(() => sendResponse(true)); return true; }
+
+  // Pokémon Center: type card# + CVV into the secure CyberSource iframes via CDP
+  if (msg.type === 'POKE_PAY') { pokemonPay(sender.tab?.id, msg).then(() => sendResponse(true)); return true; }
 
   // NOTE: BOT_LOG / BOT_STATUS / BOT_DONE are NOT relayed here — the side panel
   // receives them directly from content.js. Relaying caused every log to appear twice.
@@ -149,6 +159,86 @@ async function samsCheckout(tabId, cvv) {
   }
 }
 
+// Pokémon Center: card # and CVV live in cross-origin CyberSource iframes that normal
+// scripts can't fill. CDP types at the browser level, so clicking the iframe to focus it
+// and then sending real keystrokes works the same as a person typing.
+async function pokemonPay(tabId, msg) {
+  if (!tabId) return;
+  const dbg = { tabId };
+  const cardDigits = String(msg.card || '').replace(/\D/g, '');
+  const cvv = String(msg.cvv || '');
+  try {
+    await chrome.debugger.attach(dbg, '1.3');
+
+    // Card number iframe — click near the top-left (where the input text sits), not dead
+    // center (the iframe can be taller than the input, so center may miss it).
+    const cardRect = await getRect(tabId, msg.cardSel);
+    if (cardRect) {
+      const cx = cardRect.x + Math.min(40, cardRect.w * 0.25);
+      const cy = cardRect.y + cardRect.h * 0.4;
+      log('info', 'Card iframe ' + Math.round(cardRect.w) + 'x' + Math.round(cardRect.h) + ' — clicking ' + Math.round(cx) + ',' + Math.round(cy) + ' + typing ' + cardDigits.length + ' digits');
+      await cdpClick(dbg, cx, cy);
+      await cdpClick(dbg, cx, cy); // double-tap to be sure the iframe input is focused
+      await sleep(350);
+      // insertText goes to the focused element (the iframe's input). Type slowly so the
+      // microform's space-formatter (every 4 digits) keeps up and doesn't drop digits.
+      for (const ch of cardDigits) { await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: ch }); await sleep(55); }
+      log('success', 'Card number typed via CDP');
+      await sleep(250);
+    } else { log('warning', 'Card number iframe not found'); }
+
+    // CVV iframe
+    const cvvPt = await waitPoint(tabId, 'document.querySelector(' + JSON.stringify(msg.cvvSel) + ')', 4000);
+    if (cvvPt) {
+      log('info', 'CVV iframe at ' + Math.round(cvvPt.x) + ',' + Math.round(cvvPt.y) + ' — clicking + typing ' + cvv.length + ' digits');
+      await cdpClick(dbg, cvvPt.x, cvvPt.y);
+      await sleep(200);
+      for (const ch of cvv) { await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: ch }); await sleep(15); }
+      log('success', 'CVV typed via CDP');
+      await sleep(200);
+    } else { log('warning', 'CVV iframe not found'); }
+  } catch (e) {
+    log('error', 'Pokémon pay CDP error: ' + e.message);
+  } finally {
+    try { await chrome.debugger.detach(dbg); } catch (_) {}
+  }
+}
+
+// Sets a React-controlled input to `value` using genuine CDP keystrokes (click → select
+// all → type → Enter), so the page commits it the way it would for a real person.
+async function cdpSetValue(tabId, selector, value) {
+  if (!tabId) return;
+  const dbg = { tabId };
+  const expr = 'document.querySelector(' + JSON.stringify(selector) + ')';
+  try {
+    await chrome.debugger.attach(dbg, '1.3');
+    const pt = await waitPoint(tabId, expr, 4000);
+    if (!pt) { log('warning', 'Quantity input not found'); return; }
+    await cdpClick(dbg, pt.x, pt.y);          // focus the field
+    await sleep(30);
+    // Select all (Ctrl+A) so typing replaces the current number
+    await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyDown', modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+    await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyUp',   modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+    await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: String(value) });
+    // Commit: Enter, then Tab to blur (carts usually recalc on the change/blur)
+    await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+    await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+    await sleep(250);
+    // Read the value back so we can see whether it actually stuck
+    const [{ result: now }] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [selector],
+      func: (sel) => { const el = document.querySelector(sel); return el ? el.value : '(no input)'; }
+    });
+    log('success', 'Quantity field now shows: "' + now + '" (wanted ' + value + ')');
+  } catch (e) {
+    log('error', 'Quantity CDP error: ' + e.message);
+  } finally {
+    try { await chrome.debugger.detach(dbg); } catch (_) {}
+  }
+}
+
 // Polls elementPoint until the element appears or the timeout elapses (returns null if never)
 async function waitPoint(tabId, expr, timeout = 3000) {
   const start = Date.now();
@@ -158,6 +248,21 @@ async function waitPoint(tabId, expr, timeout = 3000) {
     await sleep(80);
   }
   return null;
+}
+
+// Scrolls an element into view and returns its viewport rect {x,y,w,h} (top-left + size)
+async function getRect(tabId, selector) {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN', args: [selector],
+    func: (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+      return { x: r.left, y: r.top, w: r.width, h: r.height };
+    }
+  });
+  return result;
 }
 
 // Scrolls an element into view (via main-world eval of `expr`) and returns its viewport-center point
@@ -253,6 +358,27 @@ function stopBot() {
 
   // Notify the popup so it can update the UI
   log('warning', 'Background: bot stopped');
+}
+
+// ── Alerts: desktop notification + sound relay to popup ────────────────────────
+// 1x1 transparent PNG (valid iconUrl so the notification renders without a bundled icon)
+const ICON_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+function handleAlert(kind, text) {
+  const titles = {
+    captcha: '🛑 CAPTCHA — needs you!',
+    success: '🎉 Order placed!',
+    fail:    '❌ Order problem',
+    stuck:   '⏳ Bot needs attention',
+  };
+  try {
+    chrome.notifications.create('bot-' + kind + '-' + Date.now(), {
+      type: 'basic', iconUrl: ICON_DATA_URL,
+      title: titles[kind] || 'Checkout Bot', message: text || '',
+      priority: 2, requireInteraction: kind === 'captcha',
+    });
+  } catch (_) {}
+  // Popup/side panel plays the sound (service workers can't play audio)
+  chrome.runtime.sendMessage({ type: 'PLAY_SOUND', kind }).catch(() => {});
 }
 
 // Pauses execution for the given number of milliseconds
