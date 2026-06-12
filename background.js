@@ -95,6 +95,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Pokémon Center: type card# + CVV into the secure CyberSource iframes via CDP
   if (msg.type === 'POKE_PAY') { pokemonPay(sender.tab?.id, msg).then(() => sendResponse(true)); return true; }
 
+  // Real browser-level click for buttons gated on trusted events (Target Buy now / Place order)
+  if (msg.type === 'CDP_CLICK') { cdpClickSelector(sender.tab?.id, msg.selector).then(ok => sendResponse(ok)); return true; }
+
+  // Find (and optionally click) a button across ALL frames — for drawers rendered in an iframe
+  if (msg.type === 'PLACE_ORDER_FRAMES') { findClickInFrames(sender.tab?.id, msg).then(r => sendResponse(r)); return true; }
+
+  // Target CVV-confirm sidebar (in an iframe): fill #enter-cvv, optionally click Confirm
+  if (msg.type === 'TARGET_CVV') { targetCvvInFrames(sender.tab?.id, msg).then(r => sendResponse(r)); return true; }
+
   // NOTE: BOT_LOG / BOT_STATUS / BOT_DONE are NOT relayed here — the side panel
   // receives them directly from content.js. Relaying caused every log to appear twice.
 });
@@ -296,6 +305,120 @@ async function elementPoint(tabId, expr) {
     }
   });
   return result;
+}
+
+// Searches EVERY frame in the tab (the drawer/checkout may be an iframe the content script can't
+// see) for a button matching one of `selectors` or, failing that, one whose text/data-test matches
+// a keyword. If `click` is true, clicks it in its own frame. Returns the first frame that matched.
+async function findClickInFrames(tabId, msg) {
+  if (!tabId) return { found: false };
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      args: [msg.selectors || [], msg.keywords || [], !!msg.click],
+      func: (selectors, keywords, doClick) => {
+        const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        let el = null;
+        for (const sel of selectors) { try { const e = document.querySelector(sel); if (e) { el = e; break; } } catch (_) {} }
+        if (!el) {
+          for (const b of document.querySelectorAll('button, [role="button"], input[type="submit"], a[role="button"]')) {
+            if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+            const t = norm((b.textContent || '') + ' ' + (b.getAttribute('data-test') || '') + ' ' + (b.getAttribute('aria-label') || ''));
+            if (keywords.some(k => t.includes(norm(k)))) { el = b; break; }
+          }
+        }
+        if (!el) return { found: false };
+        const text = (el.textContent || '').trim().slice(0, 40);
+        if (doClick) { el.scrollIntoView({ block: 'center' }); el.click(); }
+        return { found: true, text, url: location.href };
+      }
+    });
+    return results.map(r => r && r.result).find(r => r && r.found) || { found: false };
+  } catch (e) {
+    log('error', 'findClickInFrames error: ' + e.message);
+    return { found: false, error: e.message };
+  }
+}
+
+// Target's "Confirm your CVV" sidebar (rendered in an iframe). Fills #enter-cvv with the card's
+// CVV via the native value setter (so React commits it), then optionally clicks Confirm — which
+// is the FINAL submit (the actual charge). Searches all frames since the sidebar is an iframe.
+async function targetCvvInFrames(tabId, msg) {
+  if (!tabId) return { found: false };
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      args: [String(msg.cvv || ''), !!msg.confirm],
+      func: (cvv, doConfirm) => {
+        const input = document.querySelector('#enter-cvv, input[name="enter-cvv"]');
+        if (!input) return { found: false };
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        input.focus();
+        setter.call(input, cvv);
+        input.dispatchEvent(new Event('input',  { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        let confirmed = false;
+        if (doConfirm) {
+          const b = document.querySelector('[data-test="confirm-button"]');
+          if (b && !b.disabled && b.getAttribute('aria-disabled') !== 'true') { b.click(); confirmed = true; }
+        }
+        return { found: true, confirmed };
+      }
+    });
+    return results.map(r => r && r.result).find(r => r && r.found) || { found: false };
+  } catch (e) {
+    log('error', 'targetCvvInFrames error: ' + e.message);
+    return { found: false, error: e.message };
+  }
+}
+
+// Attaches the debugger and dispatches a REAL left-click on `selector` (a trusted browser-level
+// event). Needed for buttons that ignore a scripted .click() — e.g. Target's Buy now / Place
+// your order, which are gated on trusted user gestures. Returns true if the click was sent.
+async function cdpClickSelector(tabId, selector) {
+  if (!tabId || !selector) return false;
+  const dbg = { tabId };
+  try {
+    await chrome.debugger.attach(dbg, '1.3');
+    // Step 1: scroll the VISIBLE match into view if needed (instant, 'nearest' = minimal movement
+    // so the page doesn't jump). There can be hidden/duplicate copies, so pick the visible one.
+    await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [selector],
+      func: (sel) => {
+        const els = [...document.querySelectorAll(sel)];
+        const vis = els.find(e => {
+          const r = e.getBoundingClientRect();
+          return r.width > 1 && r.height > 1 && e.offsetParent !== null;
+        }) || els[0];
+        if (vis) vis.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+      }
+    });
+    // Step 2: AFTER the scroll settles, measure the button's CURRENT position, then click it.
+    // (Measuring before the scroll finished was making the click miss.)
+    await new Promise(r => setTimeout(r, 200));
+    const [{ result: info }] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [selector],
+      func: (sel) => {
+        const els = [...document.querySelectorAll(sel)];
+        const vis = els.find(e => {
+          const r = e.getBoundingClientRect();
+          return r.width > 1 && r.height > 1 && e.offsetParent !== null;
+        }) || els[0];
+        if (!vis) return { found: false, count: els.length };
+        const r = vis.getBoundingClientRect();
+        return { found: true, count: els.length, x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height };
+      }
+    });
+    if (!info || !info.found) { log('warning', 'CDP click: not found — ' + selector + ' (matches: ' + (info && info.count) + ')'); return false; }
+    log('info', 'CDP click @ ' + Math.round(info.x) + ',' + Math.round(info.y) + ' (' + info.count + ' match · ' + Math.round(info.w) + '×' + Math.round(info.h) + ')');
+    await cdpClick(dbg, info.x, info.y);
+    return true;
+  } catch (e) {
+    log('error', 'CDP click error: ' + e.message);
+    return false;
+  } finally {
+    try { await chrome.debugger.detach(dbg); } catch (_) {}
+  }
 }
 
 // Dispatches a real left-click (press + release) at viewport coordinates via CDP

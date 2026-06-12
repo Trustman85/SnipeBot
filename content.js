@@ -1,14 +1,16 @@
 // Runs on every page load — checks current bot phase and acts accordingly
 (async () => {
-  // Guard by URL: window persists across injections into the SAME document, so a
-  // second injection of the same page exits here. A real navigation or location.reload()
-  // creates a fresh document (window reset), so the bot runs again as intended.
-  if (window.__botLastUrl === location.href) return;
-  window.__botLastUrl = location.href;
-
   try {
-    const { botRunning, botPhase, botConfig, activeProfile, burstUntil } = await chrome.storage.local.get(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'burstUntil']);
+    const { botRunning, botPhase, botConfig, activeProfile, burstUntil, botRunToken } = await chrome.storage.local.get(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'burstUntil', 'botRunToken']);
     if (!botRunning || !botConfig) return;
+    // Dedup guard: window persists across injections into the SAME document. Skip ONLY when
+    // both the URL and the run-token are unchanged (a true duplicate injection within one run).
+    //  • A real navigation/reload makes a fresh document (window reset) → runs again.
+    //  • An SPA route change (same document, new URL) → URL differs → runs again.
+    //  • Stopping and pressing Start again gets a NEW token → runs again on the same page.
+    if (window.__botLastUrl === location.href && window.__botRunToken === botRunToken) return;
+    window.__botLastUrl  = location.href;
+    window.__botRunToken = botRunToken;
     const isSams = activeProfile === 'sams';
     const store  = (window.__STORES && window.__STORES[activeProfile]) || null; // non-Sam's store adapter
     const isStore = isSams || !!store;
@@ -509,12 +511,34 @@ function waitForAny(selectorList, timeout = 5000) {
     setTimeout(() => { obs.disconnect(); resolve(null); }, timeout);
   });
 }
+// Real browser-level click via CDP (background). For buttons gated on trusted events
+// (Target's Buy now / Place your order ignore a scripted .click()). Returns true on success.
+async function trustedClickSel(selector) {
+  return await new Promise(res => chrome.runtime.sendMessage({ type: 'CDP_CLICK', selector }, r => res(!!r)));
+}
 function fillGeneric(el, val) {
   el.focus();
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
   setter.call(el, String(val));
   el.dispatchEvent(new Event('input',  { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+// Sets a <select> quantity dropdown (Target) to qty. Native selects commit on a bubbling
+// 'change' event, which React's onChange picks up.
+async function storeSetQtySelect(S, qty) {
+  const sel = await waitForAny(S.qtySelect, 6000);
+  if (!sel) { log('warning', 'Quantity dropdown not found'); return false; }
+  if (parseInt(sel.value) === qty) { log('info', 'Quantity already ' + qty); return true; }
+  // Only pick a value the dropdown actually offers (Target caps at 10)
+  if (!Array.from(sel.options).some(o => o.value === String(qty))) {
+    log('warning', 'Quantity ' + qty + ' not available (max ' + sel.options.length + ') — leaving as is');
+    return false;
+  }
+  sel.value = String(qty);
+  sel.dispatchEvent(new Event('input',  { bubbles: true }));
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  log('success', 'Set quantity to ' + qty);
+  return true;
 }
 async function storeSetQty(S, qty) {
   const inc = document.querySelector(S.qtyInc);
@@ -658,6 +682,67 @@ async function pokemonCheckout(S, cfg) {
   log('error', 'Card rejected even at ' + MAX_SPEED + 'ms — check the number.');
 }
 
+// Target's "Buy now" opens the checkout as a DRAWER on the same product URL (no navigation),
+// so we finish the order right here instead of waiting for a CHECKOUT page that never loads.
+// Waits for the Total to populate, fills CVV if asked, then submits (or, in Test mode, shows
+// the confirmation banner without submitting).
+async function buyNowDrawerCheckout(store, cfg) {
+  const S = store.sel;
+  // The side drawer animates in and loads its contents asynchronously — give it a beat.
+  log('info', 'Buy now clicked — waiting for checkout drawer...');
+  await sleep(400);
+
+  // The drawer is rendered in an IFRAME, so search ALL frames (via background) — the top-frame
+  // content script can't see inside it. Poll tightly so we act the instant it loads.
+  const kw = ['place your order', 'place order', 'placeorder', 'submit order'];
+  let res = { found: false };
+  for (let i = 0; i < 20; i++) {
+    res = await new Promise(r => chrome.runtime.sendMessage(
+      { type: 'PLACE_ORDER_FRAMES', selectors: [S.placeOrder], keywords: kw, click: false }, resp => r(resp || { found: false })));
+    if (res.found) break;
+    await sleep(300);
+  }
+  if (!res.found) {
+    log('warning', 'Target: "Place your order" not found in any frame.');
+    return;
+  }
+  log('success', 'Found "Place your order"' + (res.url ? ' in ' + res.url.replace(/^https?:\/\//, '').slice(0, 40) : ''));
+
+  // TEST MODE: stop HERE. Do NOT click Place your order — clicking it can complete the purchase.
+  // Show the banner and end; nothing that submits an order ever runs in Test mode.
+  const { botTestMode } = await chrome.storage.local.get('botTestMode');
+  if (botTestMode) {
+    log('success', '🧪 TEST MODE — found "Place your order", NOT clicking it. No order placed.');
+    showBigBanner('✓ ORDER CONFIRMED', 'TEST MODE — no real order was placed');
+    setStatus('done', '🧪 Test passed — order NOT placed');
+    await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+    chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+    return;
+  }
+
+  // ── REAL run only beyond this point ──────────────────────────────────────────────
+  // Click "Place your order", which opens the "Confirm your CVV" sidebar.
+  log('success', 'Clicking "Place your order"...');
+  await new Promise(r => chrome.runtime.sendMessage(
+    { type: 'PLACE_ORDER_FRAMES', selectors: [S.placeOrder], keywords: kw, click: true }, resp => r(resp)));
+
+  // Target re-asks for the CVV even with saved payment. Fill #enter-cvv (in its iframe), poll
+  // while the sidebar renders, then click Confirm → final submit (the charge).
+  log('info', 'Waiting for CVV confirmation sidebar...');
+  let cvvRes = { found: false };
+  for (let i = 0; i < 20; i++) {
+    cvvRes = await new Promise(r => chrome.runtime.sendMessage(
+      { type: 'TARGET_CVV', cvv: cfg.cvv, confirm: false }, resp => r(resp || { found: false })));
+    if (cvvRes.found) break;
+    await sleep(300);
+  }
+  if (!cvvRes.found) { log('warning', 'Target: CVV sidebar not found — stopping before order.'); return; }
+  log('success', 'CVV entered — confirming order...');
+  await chrome.storage.local.set({ botPhase: 'CONFIRM' });
+  await new Promise(r => chrome.runtime.sendMessage(
+    { type: 'TARGET_CVV', cvv: cfg.cvv, confirm: true }, resp => r(resp)));
+}
+
 async function runStore(store, cfg, burst) {
   const S = store.sel;
   const phase = store.detectPhase(location.href) || 'SEARCH';
@@ -680,19 +765,47 @@ async function runStore(store, cfg, burst) {
 
   if (phase === 'SEARCH') {
     const interval = parseInt(cfg.refreshInterval || '2');
-    // Only set quantity here (product page) if the store has NO cart-page qty input.
-    // Pokémon Center uses a cart-page input, so quantity is handled after viewing the cart.
-    if (parseInt(cfg.quantity || '1') > 1 && !S.qtyInput) await storeSetQty(S, parseInt(cfg.quantity));
-    const addBtn = await waitForAny(S.addToCart, burst ? 700 : 8000);
+    const wantQty = parseInt(cfg.quantity || '1');
+    // If the Buy-now checkout drawer is already open (e.g. after a stop/restart on this page),
+    // go straight to placing the order instead of clicking Buy now again. Instant check.
+    if (S.buyNow && await findBtn(['place your order'], 0)) {
+      log('info', 'Checkout drawer already open — placing order...');
+      await buyNowDrawerCheckout(store, cfg); return;
+    }
+    // Set quantity ON THE PRODUCT PAGE (must happen BEFORE Buy now uses it):
+    //  • qtySelect → <select> dropdown (Target)
+    //  • qtyInc    → +/- stepper buttons
+    //  • qtyInput  → cart-page number box (Pokémon) → handled later, not here
+    if (wantQty > 1) {
+      if (S.qtySelect)      await storeSetQtySelect(S, wantQty);
+      else if (!S.qtyInput) await storeSetQty(S, wantQty);
+    }
+    // Prefer "Buy now" (skips the cart, straight to checkout). If it isn't present — some items
+    // (e.g. apparel that needs a size picked) don't offer Buy now — fall back to Add to cart.
+    let usingBuyNow = false, addBtn = null;
+    if (S.buyNow) { addBtn = await waitForAny(S.buyNow, burst ? 700 : 6000); usingBuyNow = !!addBtn; }
+    if (!addBtn)  { addBtn = await waitForAny(S.addToCart, burst ? 500 : 4000); }
     if (!addBtn) {
       const delay = burst ? 150 : interval * 1000;
       log('warning', burst ? '⚡ Not live — burst reloading...' : store.name + ': not available — refreshing...');
       await sleep(delay); location.reload(); return;
     }
-    log('success', 'Adding to cart...'); addBtn.click();
+    log('success', usingBuyNow ? 'Buy now — opening checkout drawer...' : 'Adding to cart...');
+    const clickSel = usingBuyNow ? S.buyNow : S.addToCart;
+    if (store.trustedClick) {
+      const ok = await trustedClickSel(clickSel);
+      if (!ok) { log('warning', 'Trusted click failed — falling back to DOM click'); addBtn.click(); }
+    } else {
+      addBtn.click();
+    }
     await sleep(900);
-    const vc = await waitForAny(S.viewCart, 4000);
-    if (vc) { log('info', 'Opening cart...'); vc.click(); }
+    if (usingBuyNow) {
+      // Buy now opens a checkout drawer on THIS same page — finish the order inline.
+      await buyNowDrawerCheckout(store, cfg);
+    } else {
+      const vc = await waitForAny(S.viewCart, 4000);
+      if (vc) { log('info', 'Opening cart...'); vc.click(); }
+    }
     return;
   }
 
@@ -727,7 +840,22 @@ async function runStore(store, cfg, burst) {
     if (cvv && cfg.cvv) { fillGeneric(cvv, cfg.cvv); log('info', 'CVV filled'); await sleep(400); }
     const po = await waitForAny(S.placeOrder, 10000);
     if (!po) { log('warning', store.name + ': Place Order not ready — reloading...'); await sleep(1200); location.reload(); return; }
-    log('success', 'Placing order...'); po.click(); return;
+    // TEST MODE: everything ran for real, but DON'T submit — show the confirmation banner.
+    const { botTestMode } = await chrome.storage.local.get('botTestMode');
+    if (botTestMode) {
+      log('success', '🧪 TEST MODE — found Place Order, NOT submitting. Order would go through here.');
+      showBigBanner('✓ ORDER CONFIRMED', 'TEST MODE — no real order was placed');
+      setStatus('done', '🧪 Test passed — order NOT placed');
+      await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+      chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+      return;
+    }
+    log('success', 'Placing order...');
+    if (store.trustedClick) {
+      const ok = await trustedClickSel(S.placeOrder);
+      if (!ok) po.click();
+    } else { po.click(); }
+    return;
   }
 
   if (phase === 'CONFIRM') {

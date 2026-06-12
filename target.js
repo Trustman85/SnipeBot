@@ -3,19 +3,25 @@ window.__STORES = window.__STORES || {};
 window.__STORES.target = {
   key: 'target',
   name: 'Target',
+  // Target gates Buy now / Place your order on TRUSTED clicks — a scripted .click() is ignored,
+  // so the bot clicks these via CDP (real browser-level mouse event) instead.
+  trustedClick: true,
   // By Name search + direct item URL (Target item pages look like /p/-/A-<TCIN>)
   searchUrl: (q)  => 'https://www.target.com/s?searchTerm=' + encodeURIComponent(q),
   itemUrl:   (id) => 'https://www.target.com/p/-/A-' + encodeURIComponent(id),
 
-  // TODO: confirm these against live Target pages
   sel: {
-    addToCart:  '[data-test="shippingButton"], [data-test="addToCartButton"], [data-test="orderPickupButton"]',
+    // Product-page quantity DROPDOWN (1–10). Class hash changes, so match the module prefix.
+    qtySelect:  'select[class*="styles_select__"]',
+    // "Buy now" skips the cart and goes straight to checkout — fastest path for a drop.
+    buyNow:     '[data-test="buy-now-button"]',
+    // Fallback if we ever switch to the cart route instead of Buy now
+    addToCart:  '[data-test="shippingButton"], [data-test="addToCartButton"], button[data-test="orderPickupButton"]',
     productLink:'a[href*="/p/"]',
     viewCart:   'a[href*="/cart"], [data-test="@web/CartLink"]',
     checkout:   '[data-test="checkout-button"], [data-test="content-checkout-button"]',
     placeOrder: '[data-test="placeOrderButton"]',
     cvv:        '#credit-card-cvv, input[name="cvv"], [data-test*="cvv"]',
-    qtyInc:     '[data-test="stepUp"], button[aria-label*="increase" i]',
   },
 
   // Which checkout step the current URL represents

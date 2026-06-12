@@ -626,7 +626,7 @@ async function toggleBot(testMode = false) {
     // Persist the encrypted copy, and a TEMPORARY plaintext copy the bot reads during the run.
     await saveProfileConfig(activeProfile);
     // Fresh run flags: qtyDone (quantity), samsFellBack (SKU fallback), addAttempts (stuck guard)
-    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0, pokePlaceRetries: 0, botTestMode: !!testMode });
+    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0, pokePlaceRetries: 0, botTestMode: !!testMode, botRunToken: Date.now() });
     if (testMode) addLog('info', '🧪 TEST MODE: full flow will run but the order will NOT be submitted.');
     setRunningUI(true);
 
