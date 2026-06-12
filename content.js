@@ -688,8 +688,9 @@ async function pokemonCheckout(S, cfg) {
 // the confirmation banner without submitting).
 async function buyNowDrawerCheckout(store, cfg) {
   const S = store.sel;
-  // The side drawer animates in and loads its contents asynchronously — give it a beat.
-  log('info', 'Buy now clicked — waiting for checkout drawer...');
+  // The checkout (Buy now drawer OR cart-route page) loads its contents asynchronously — give
+  // it a beat, then search all frames for "Place your order".
+  log('info', 'Checkout — looking for "Place your order"...');
   await sleep(400);
 
   // The drawer is rendered in an IFRAME, so search ALL frames (via background) — the top-frame
@@ -766,9 +767,10 @@ async function runStore(store, cfg, burst) {
   if (phase === 'SEARCH') {
     const interval = parseInt(cfg.refreshInterval || '2');
     const wantQty = parseInt(cfg.quantity || '1');
+    const canBuyNow = !!S.buyNow && !store.preferAddToCart; // preferAddToCart forces the cart route
     // If the Buy-now checkout drawer is already open (e.g. after a stop/restart on this page),
     // go straight to placing the order instead of clicking Buy now again. Instant check.
-    if (S.buyNow && await findBtn(['place your order'], 0)) {
+    if (canBuyNow && await findBtn(['place your order'], 0)) {
       log('info', 'Checkout drawer already open — placing order...');
       await buyNowDrawerCheckout(store, cfg); return;
     }
@@ -783,8 +785,8 @@ async function runStore(store, cfg, burst) {
     // Prefer "Buy now" (skips the cart, straight to checkout). If it isn't present — some items
     // (e.g. apparel that needs a size picked) don't offer Buy now — fall back to Add to cart.
     let usingBuyNow = false, addBtn = null;
-    if (S.buyNow) { addBtn = await waitForAny(S.buyNow, burst ? 700 : 6000); usingBuyNow = !!addBtn; }
-    if (!addBtn)  { addBtn = await waitForAny(S.addToCart, burst ? 500 : 4000); }
+    if (canBuyNow) { addBtn = await waitForAny(S.buyNow, burst ? 700 : 6000); usingBuyNow = !!addBtn; }
+    if (!addBtn)   { addBtn = await waitForAny(S.addToCart, burst ? 500 : 4000); }
     if (!addBtn) {
       const delay = burst ? 150 : interval * 1000;
       log('warning', burst ? '⚡ Not live — burst reloading...' : store.name + ': not available — refreshing...');
@@ -835,6 +837,9 @@ async function runStore(store, cfg, burst) {
   if (phase === 'CHECKOUT') {
     // Pokémon Center has its own payment screen (dropdown + secure card iframes)
     if (store.key === 'pokemoncenter') { await pokemonCheckout(S, cfg); return; }
+    // Target: whether we got here via Buy now OR the cart route, finish through the SAME handler
+    // (all-frames "Place your order" → CVV → Confirm) which STOPS in Test mode before submitting.
+    if (store.key === 'target') { await buyNowDrawerCheckout(store, cfg); return; }
 
     const cvv = document.querySelector(S.cvv);
     if (cvv && cfg.cvv) { fillGeneric(cvv, cfg.cvv); log('info', 'CVV filled'); await sleep(400); }

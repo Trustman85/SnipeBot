@@ -6,6 +6,8 @@ window.__STORES.target = {
   // Target gates Buy now / Place your order on TRUSTED clicks — a scripted .click() is ignored,
   // so the bot clicks these via CDP (real browser-level mouse event) instead.
   trustedClick: true,
+  // Set preferAddToCart: true to FORCE the Add to cart → cart → checkout route (skips Buy now).
+  // Left off so the bot prefers Buy now and only falls back to Add to cart when there's no Buy now.
   // By Name search + direct item URL (Target item pages look like /p/-/A-<TCIN>)
   searchUrl: (q)  => 'https://www.target.com/s?searchTerm=' + encodeURIComponent(q),
   itemUrl:   (id) => 'https://www.target.com/p/-/A-' + encodeURIComponent(id),
@@ -15,8 +17,8 @@ window.__STORES.target = {
     qtySelect:  'select[class*="styles_select__"]',
     // "Buy now" skips the cart and goes straight to checkout — fastest path for a drop.
     buyNow:     '[data-test="buy-now-button"]',
-    // Fallback if we ever switch to the cart route instead of Buy now
-    addToCart:  '[data-test="shippingButton"], [data-test="addToCartButton"], button[data-test="orderPickupButton"]',
+    // Add to cart (Target uses data-test="orderPickupButton" for it; id is a stable pattern)
+    addToCart:  '[data-test="addToCartButton"], button[data-test="orderPickupButton"], [data-test="shippingButton"], button[id^="addToCartButton"]',
     productLink:'a[href*="/p/"]',
     viewCart:   'a[href*="/cart"], [data-test="@web/CartLink"]',
     checkout:   '[data-test="checkout-button"], [data-test="content-checkout-button"]',
