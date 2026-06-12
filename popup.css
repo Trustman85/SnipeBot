@@ -255,6 +255,12 @@ body {
   font-weight: 700; cursor: pointer; font-size: 13px;
 }
 .btn-save:hover { background: #e6f2f9; }
+.btn-test {
+  flex: 1; padding: 10px; border: 1.5px solid #f5a623;
+  background: white; color: #b9760f; border-radius: 4px;
+  font-weight: 700; cursor: pointer; font-size: 13px;
+}
+.btn-test:hover { background: #fff6e6; }
 .btn-start {
   flex: 2; padding: 10px; background: #0067A0;
   color: white; border: none; border-radius: 4px;

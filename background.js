@@ -167,6 +167,7 @@ async function pokemonPay(tabId, msg) {
   const dbg = { tabId };
   const cardDigits = String(msg.card || '').replace(/\D/g, '');
   const cvv = String(msg.cvv || '');
+  const speed = msg.speed || 55; // ms per card digit (raised on each retry)
   try {
     await chrome.debugger.attach(dbg, '1.3');
 
@@ -176,15 +177,32 @@ async function pokemonPay(tabId, msg) {
     if (cardRect) {
       const cx = cardRect.x + Math.min(40, cardRect.w * 0.25);
       const cy = cardRect.y + cardRect.h * 0.4;
-      log('info', 'Card iframe ' + Math.round(cardRect.w) + 'x' + Math.round(cardRect.h) + ' — clicking ' + Math.round(cx) + ',' + Math.round(cy) + ' + typing ' + cardDigits.length + ' digits');
+      log('info', 'Card iframe — typing ' + cardDigits.length + ' digits @ ' + speed + 'ms');
+      // The microform iframe needs a moment to become interactive. A single click right after
+      // it appears often misses (focus lands on the page, not the inner input — which is why
+      // Ctrl+A used to highlight the whole page). Click twice with a pause so focus reliably
+      // lands inside the field on the FIRST attempt.
       await cdpClick(dbg, cx, cy);
-      await cdpClick(dbg, cx, cy); // double-tap to be sure the iframe input is focused
-      await sleep(350);
-      // insertText goes to the focused element (the iframe's input). Type slowly so the
-      // microform's space-formatter (every 4 digits) keeps up and doesn't drop digits.
-      for (const ch of cardDigits) { await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: ch }); await sleep(55); }
-      log('success', 'Card number typed via CDP');
       await sleep(250);
+      await cdpClick(dbg, cx, cy);
+      await sleep(250);
+      // Clear the field with targeted Backspaces (NOT Ctrl+A — that selects the whole page
+      // when focus misses). Harmless when the field is already empty.
+      for (let i = 0; i < 24; i++) {
+        await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+        await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+      }
+      await sleep(120);
+      // Send REAL digit keystrokes (raw digits) and let CyberSource's microform add the
+      // spaces itself — same as a human typing.
+      for (const ch of cardDigits) {
+        const vk = ch.charCodeAt(0); // '0'..'9' -> 48..57
+        await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, key: ch, code: 'Digit' + ch, text: ch, unmodifiedText: ch });
+        await chrome.debugger.sendCommand(dbg, 'Input.dispatchKeyEvent', { type: 'keyUp',   windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, key: ch, code: 'Digit' + ch });
+        await sleep(speed);
+      }
+      log('success', 'Card number typed @ ' + speed + 'ms');
+      await sleep(120);
     } else { log('warning', 'Card number iframe not found'); }
 
     // CVV iframe
@@ -192,10 +210,10 @@ async function pokemonPay(tabId, msg) {
     if (cvvPt) {
       log('info', 'CVV iframe at ' + Math.round(cvvPt.x) + ',' + Math.round(cvvPt.y) + ' — clicking + typing ' + cvv.length + ' digits');
       await cdpClick(dbg, cvvPt.x, cvvPt.y);
-      await sleep(200);
-      for (const ch of cvv) { await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: ch }); await sleep(15); }
+      await sleep(100);
+      for (const ch of cvv) { await chrome.debugger.sendCommand(dbg, 'Input.insertText', { text: ch }); await sleep(10); }
       log('success', 'CVV typed via CDP');
-      await sleep(200);
+      await sleep(100);
     } else { log('warning', 'CVV iframe not found'); }
   } catch (e) {
     log('error', 'Pokémon pay CDP error: ' + e.message);

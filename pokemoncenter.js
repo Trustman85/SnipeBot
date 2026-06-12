@@ -25,7 +25,7 @@ window.__STORES.pokemoncenter = {
     expYear:       '#expiryYear',                // <select> full year (2026…)
     continueBtn:   'button[value="CONTINUE"]',   // advances to the next checkout step
     // TODO: the final Place Order button on the review step
-    placeOrder: 'button[data-testid="place-order"], button[aria-label*="place order" i]',
+    placeOrder: 'button[value="PLACE ORDER" i], button[type="button"][value*="place order" i]',
     qtyInc:     'button[aria-label*="increase" i], [data-testid="quantity-increment"]',
   },
 

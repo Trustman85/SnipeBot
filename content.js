@@ -527,6 +527,71 @@ async function storeSetQty(S, qty) {
 async function pokemonCheckout(S, cfg) {
   setStatus('running', 'Pokémon: payment...');
 
+  // The /checkout/address step (shipping) comes BEFORE payment. If the address is already
+  // saved on the account it just needs a Continue; otherwise send me this page's HTML to fill it.
+  if (/\/address/.test(location.pathname)) {
+    log('info', 'On address step — continuing to payment...');
+    setStatus('running', 'Pokémon: address...');
+    const cont = await waitForAny(S.continueBtn, 6000);
+    if (cont) { log('success', 'Address — clicking Continue...'); cont.click(); }
+    else { log('warning', 'Address Continue not found — may need the address form filled (send HTML).'); await sleep(1500); }
+    return;
+  }
+
+  // The /checkout/summary (or /review) page is the FINAL review step — don't re-enter the
+  // card there; find and click Place Order. Card entry only happens on /checkout/payment.
+  if (/\/summary|\/review/.test(location.pathname)) {
+    log('info', 'On review page — looking for Place Order...');
+
+    // If the gateway already rejected a prior attempt ("Payment could not be processed,
+    // please refresh and retry"), reload to retry — but cap it so we never loop or double-submit.
+    const payErr = /payment could not be processed|please refresh and retry/i.test(document.body.innerText || '');
+    if (payErr) {
+      const r = (await chrome.storage.local.get('pokePlaceRetries')).pokePlaceRetries || 0;
+      if (r >= 3) { log('error', '🛑 Gateway kept rejecting payment after ' + r + ' tries — stopping.'); setStatus('error', 'Payment rejected — check card'); return; }
+      await chrome.storage.local.set({ pokePlaceRetries: r + 1 });
+      log('warning', 'Gateway rejected the payment — refreshing to retry (' + (r + 1) + '/3)...');
+      await sleep(1200); location.reload(); return;
+    }
+
+    // The order summary (totals) renders as grey skeletons for a moment. Clicking Place Order
+    // before the Total has loaded makes the gateway reject it. Wait until a real Total ($amount)
+    // is showing, then give it one more beat to settle, before clicking.
+    log('info', 'Waiting for order total to load...');
+    for (let i = 0; i < 30 && !/total[\s\S]{0,60}\$\s*\d/i.test(document.body.innerText || ''); i++) await sleep(200);
+    await sleep(1000);
+
+    // Try the known selector first, then fall back to finding the button by its text.
+    let po = await waitForAny(S.placeOrder, 3000);
+    if (!po) po = await findBtn(['place order', 'placeorder', 'submit order', 'pay now', 'complete order'], 6000);
+    if (po) {
+      // TEST MODE: everything ran for real up to here, but DON'T actually submit the order.
+      // Show a big confirmation banner and stop, so you can verify the full flow safely.
+      const { botTestMode } = await chrome.storage.local.get('botTestMode');
+      if (botTestMode) {
+        log('success', '🧪 TEST MODE — found Place Order, NOT submitting. Order would go through here.');
+        showBigBanner('✓ ORDER CONFIRMED', 'TEST MODE — no real order was placed');
+        setStatus('done', '🧪 Test passed — order NOT placed');
+        await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+        chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+        return;
+      }
+      log('success', 'Placing order: "' + (po.textContent || '').trim().substring(0, 40) + '"');
+      await chrome.storage.local.set({ botPhase: 'CONFIRM' });
+      po.click();
+      // Watch for a gateway rejection right after clicking; if it appears, the next injection
+      // (or the block above on reload) handles the retry.
+      await sleep(2500);
+      if (/payment could not be processed|please refresh and retry/i.test(document.body.innerText || '')) {
+        log('warning', 'Gateway returned an error after Place Order — will refresh & retry.');
+        await sleep(800); location.reload();
+      }
+    } else {
+      log('warning', 'Place Order button not found — paste its HTML so I can pin the selector.');
+    }
+    return;
+  }
+
   // Guard: card details must be saved in THIS profile's Payment tab
   if (!cfg.cardNumber || !cfg.cvv || !cfg.expiry) {
     log('error', '🛑 No card saved for Pokémon — fill the Payment tab (Card #, CVV, Expiry) on the ⚡ Pokémon profile and Save.');
@@ -544,7 +609,8 @@ async function pokemonCheckout(S, cfg) {
     sel.dispatchEvent(new Event('input',  { bubbles: true }));
     sel.dispatchEvent(new Event('change', { bubbles: true }));
     log('success', 'Selected Credit/Debit Card');
-    await sleep(900); // let the card fields render
+    // Wait for the card iframe to actually render (instead of a fixed pause)
+    await waitForAny(S.cardIframe, 4000);
   } else {
     log('info', 'Credit/Debit Card already selected');
   }
@@ -558,17 +624,38 @@ async function pokemonCheckout(S, cfg) {
   if (ySel && yy) { ySel.value = '20' + yy; ySel.dispatchEvent(new Event('change', { bubbles: true })); }
   log('info', 'Set expiry ' + (mm || '??') + '/' + (yy || '??'));
 
-  // 3) Card # and CVV are secure CyberSource iframes — fill via CDP (background)
-  log('info', 'Filling card # and CVV (secure iframes) via CDP...');
-  await new Promise(res => chrome.runtime.sendMessage({
-    type: 'POKE_PAY', card: cfg.cardNumber, cvv: cfg.cvv, cardSel: S.cardIframe, cvvSel: S.cvvIframe
-  }, () => res()));
-  await sleep(500);
+  // 3+4) Fill card/CVV (CDP) then Continue. FIXED fast speed every run (no auto-tuning, so
+  // it never creeps). If a run gets unlucky and is rejected, retry a bit slower for THAT
+  // run only — the starting speed never changes.
+  const START_SPEED = 48;  // proven reliable. Going lower risks dropped/scrambled digits that
+                           // still pass the front-end check but get DECLINED by the gateway.
+  let speed = START_SPEED;
+  const MAX_SPEED = 90;
+  let attempt = 0;
+  // The iframe element appears instantly, but the CyberSource microform inside takes a couple
+  // seconds to become interactive. Without this wait, try 1 always failed (typing into a
+  // not-yet-ready field) and only try 2 — ~3s later — succeeded. Give it that head start once.
+  log('info', 'Letting card field initialize...');
+  await sleep(1000);
+  while (speed <= MAX_SPEED) {
+    attempt++;
+    log('info', 'Filling card # and CVV @ ' + speed + 'ms (try ' + attempt + ')...');
+    await new Promise(res => chrome.runtime.sendMessage({
+      type: 'POKE_PAY', card: cfg.cardNumber, cvv: cfg.cvv,
+      cardSel: S.cardIframe, cvvSel: S.cvvIframe, speed: speed, clear: true // focus+clear every attempt
+    }, () => res()));
 
-  // 4) Click CONTINUE to advance to the next checkout step
-  const cont = await waitForAny(S.continueBtn, 6000);
-  if (cont) { log('success', 'Clicking Continue...'); cont.click(); }
-  else { log('warning', 'Continue button not found'); }
+    const cont = await waitForAny(S.continueBtn, 6000);
+    if (cont) { log('info', 'Clicking Continue...'); cont.click(); }
+    else { log('warning', 'Continue button not found'); }
+
+    await sleep(1400); // wait for validation / page to advance
+    const bad = /please enter a valid|enter a valid (?:credit )?card|invalid card/i.test(document.body.innerText || '');
+    if (!bad) { log('success', '✓ Payment accepted @ ' + speed + 'ms/digit'); return; }
+    log('warning', 'Rejected @ ' + speed + 'ms — retrying this run @ ' + (speed + 4) + 'ms...');
+    speed += 4;
+  }
+  log('error', 'Card rejected even at ' + MAX_SPEED + 'ms — check the number.');
 }
 
 async function runStore(store, cfg, burst) {
@@ -722,4 +809,25 @@ function log(level, text) {
 
 function setStatus(state, text) {
   chrome.runtime.sendMessage({ type: 'BOT_STATUS', status: state, text }).catch(() => {});
+}
+
+// Big full-screen confirmation banner drawn ON the page (used by Test mode). Self-contained
+// inline styles so it shows regardless of the site's CSS; click or 6s auto-dismiss.
+function showBigBanner(title, sub) {
+  try {
+    document.getElementById('__botBigBanner')?.remove();
+    const o = document.createElement('div');
+    o.id = '__botBigBanner';
+    o.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;'
+      + 'align-items:center;justify-content:center;background:rgba(0,40,10,.92);cursor:pointer;'
+      + 'font-family:Arial,Helvetica,sans-serif;text-align:center;';
+    o.innerHTML =
+      '<div style="font-size:96px;line-height:1;margin-bottom:18px">✅</div>'
+      + '<div style="font-size:64px;font-weight:900;color:#fff;letter-spacing:1px">' + title + '</div>'
+      + (sub ? '<div style="font-size:22px;color:#bff5cf;margin-top:14px;font-weight:700">' + sub + '</div>' : '')
+      + '<div style="font-size:14px;color:#8fd9a8;margin-top:28px">(click to dismiss)</div>';
+    o.addEventListener('click', () => o.remove());
+    document.documentElement.appendChild(o);
+    setTimeout(() => o.remove(), 6000);
+  } catch (_) {}
 }

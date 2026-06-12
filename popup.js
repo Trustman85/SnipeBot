@@ -309,7 +309,8 @@ document.querySelectorAll('.search-type-btn').forEach(btn => {
 });
 
 // ── Wire up buttons ────────────────────────────────────────────────────────────
-document.getElementById('startBtn').addEventListener('click', toggleBot);
+document.getElementById('startBtn').addEventListener('click', () => toggleBot(false));
+document.getElementById('testBtn').addEventListener('click', () => toggleBot(true));
 document.getElementById('saveBtn').addEventListener('click', saveConfig);
 document.getElementById('clearBtn').addEventListener('click', clearLog);
 document.getElementById('closeBtn').addEventListener('click', () => window.close());
@@ -585,12 +586,12 @@ async function saveConfig() {
 }
 
 // ── Start / Stop bot ───────────────────────────────────────────────────────────
-async function toggleBot() {
-  addLog('info', 'Button clicked...');
+async function toggleBot(testMode = false) {
+  addLog('info', testMode ? '🧪 Test run...' : 'Button clicked...');
   try {
     const data = await chrome.storage.local.get('botRunning');
     if (data.botRunning) {
-      chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+      chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE', botTestMode: false });
       chrome.storage.local.remove(['botConfig', 'burstUntil', 'queueSince']); // wipe temp state on stop
       stopQueueTimer(); stopCheckoutTimer();
       setRunningUI(false);
@@ -625,7 +626,8 @@ async function toggleBot() {
     // Persist the encrypted copy, and a TEMPORARY plaintext copy the bot reads during the run.
     await saveProfileConfig(activeProfile);
     // Fresh run flags: qtyDone (quantity), samsFellBack (SKU fallback), addAttempts (stuck guard)
-    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0 });
+    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0, pokePlaceRetries: 0, botTestMode: !!testMode });
+    if (testMode) addLog('info', '🧪 TEST MODE: full flow will run but the order will NOT be submitted.');
     setRunningUI(true);
 
     const siteUrl = (cfg.siteUrl || 'http://localhost:3000').replace(/\/$/, '');
