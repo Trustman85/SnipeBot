@@ -17,10 +17,12 @@ window.__STORES.target = {
     qtySelect:  'select[class*="styles_select__"]',
     // "Buy now" skips the cart and goes straight to checkout — fastest path for a drop.
     buyNow:     '[data-test="buy-now-button"]',
-    // Add to cart (Target uses data-test="orderPickupButton" for it; id is a stable pattern)
-    addToCart:  '[data-test="addToCartButton"], button[data-test="orderPickupButton"], [data-test="shippingButton"], button[id^="addToCartButton"]',
+    // Add to cart / Preorder (Target uses data-test="orderPickupButton" or "preorderButton";
+    // the id "addToCartButtonOrTextIdFor<TCIN>" is a stable pattern across both)
+    addToCart:  '[data-test="addToCartButton"], button[data-test="orderPickupButton"], [data-test="preorderButton"], [data-test="shippingButton"], button[id^="addToCartButton"]',
     productLink:'a[href*="/p/"]',
-    viewCart:   'a[href*="/cart"], [data-test="@web/CartLink"]',
+    // "View cart & check out" link in the flyout after Add to cart / Preorder (href="/cart")
+    viewCart:   '[data-test="errorContent-viewCartButton"], a[data-test*="viewCart" i], a[href="/cart"], [data-test="@web/CartLink"]',
     checkout:   '[data-test="checkout-button"], [data-test="content-checkout-button"]',
     placeOrder: '[data-test="placeOrderButton"]',
     cvv:        '#credit-card-cvv, input[name="cvv"], [data-test*="cvv"]',

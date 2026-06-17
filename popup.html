@@ -25,7 +25,34 @@
       <div class="logo">🤖 Checkout Bot</div>
       <div class="subtitle">Automated checkout assistant</div>
     </div>
-    <button id="closeBtn" class="close-btn" title="Close">✕</button>
+    <div class="header-actions">
+      <button id="hotkeyBtn" class="hotkey-btn" title="Set keyboard shortcuts">⌨</button>
+      <button id="closeBtn" class="close-btn" title="Close">✕</button>
+    </div>
+  </div>
+
+  <!-- Keyboard shortcuts — global (chrome.commands), so they fire anywhere in Chrome -->
+  <div id="hotkeyOverlay" class="hk-overlay" style="display:none">
+    <div class="hk-box">
+      <div class="hk-head">
+        <span class="hk-title">⌨ Keyboard Shortcuts</span>
+        <button id="hotkeyClose" class="hk-x" title="Close">✕</button>
+      </div>
+      <p class="hk-note">These work <b>anywhere in Chrome</b> — you don't need to click the panel first (it just has to be open). The same key toggles Start/Stop and Test. Click <b>Change keys</b> to rebind them.</p>
+      <div class="hk-row">
+        <span class="hk-label">▶ Start / Stop</span>
+        <span class="hk-combo unset" id="hk-start">Not set</span>
+      </div>
+      <div class="hk-row">
+        <span class="hk-label">🧪 Test / Stop</span>
+        <span class="hk-combo unset" id="hk-test">Not set</span>
+      </div>
+      <div class="hk-row">
+        <span class="hk-label">💾 Save</span>
+        <span class="hk-combo unset" id="hk-save">Not set</span>
+      </div>
+      <button id="hotkeyChange" class="hk-change">⚙ Change keys in Chrome</button>
+    </div>
   </div>
 
   <!-- Top-level profile switcher — one independent config per store -->
@@ -73,7 +100,13 @@
     <input type="hidden" id="searchType" value="name">
     <div class="form-group"><label>Quantity (how many to add)</label><input type="number" id="quantity" placeholder="1" value="1" min="1" max="20"></div>
     <div class="form-group"><label>Max Price ($)</label><input type="number" id="maxPrice" placeholder="999" value="999" min="0"></div>
-    <div class="form-group"><label>Auto-refresh interval (seconds)</label><input type="number" id="refreshInterval" placeholder="2" value="2" min="1" max="60"></div>
+    <div class="form-group">
+      <label>Auto-refresh interval (seconds — e.g. 0.5, 0.2 = 200ms)</label>
+      <div class="refresh-row">
+        <input type="number" id="refreshInterval" placeholder="2" value="2" min="0.05" max="60" step="0.01">
+        <button id="speedTestBtn" class="speed-test-btn" title="Reload the current page a few times and measure how fast it loads">⏱ Test</button>
+      </div>
+    </div>
     <div class="checkbox-row"><input type="checkbox" id="stopOnSuccess" checked><label for="stopOnSuccess">Stop bot after successful order</label></div>
   </div>
 
@@ -104,9 +137,10 @@
     <div class="drop-row">
       <input type="time" id="dropTime" step="1">
       <input type="number" id="leadSec" class="lead-input" min="0" max="60" value="3" title="Start this many seconds early">
+      <label class="arm-test" title="ON = armed drop runs in TEST mode (stops before placing the order). OFF = real order."><input type="checkbox" id="armTest">Test</label>
       <button id="armBtn" class="arm-btn">Arm</button>
     </div>
-    <span class="drop-hint" id="dropStatus">Set time + early-seconds, press Arm. Bot starts early and burst-polls to grab a spot.</span>
+    <span class="drop-hint" id="dropStatus">Set time + early-seconds. Test ON = rehearse safely; OFF = real order. Press Arm.</span>
   </div>
 
   <!-- Live clock + timezone (for timing a drop) -->

@@ -3,6 +3,15 @@ chrome.action.onClicked.addListener((tab) => {
   chrome.sidePanel.open({ windowId: tab.windowId });
 });
 
+// Keep the service worker alive while the side panel is open. The panel holds a "keepalive" port
+// and pings it; an open port + incoming messages reset the worker's idle timer, so it won't die
+// out from under the panel (which left Start/Test doing nothing until the panel was reopened).
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'keepalive') return;
+  port.onMessage.addListener(() => {}); // each ping keeps the worker warm
+  port.onDisconnect.addListener(() => {}); // panel closed → worker may sleep (fine)
+});
+
 // Stop the bot whenever the extension is reloaded/updated or Chrome restarts,
 // so a refresh of the extension always leaves it in a clean stopped state.
 chrome.runtime.onInstalled.addListener(() => stopBot());
@@ -67,6 +76,28 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   await injectBot(tabId, tab?.url || '');
 });
 
+// A real navigation/reload starts a BRAND-NEW document. Clear the dedup tracker so the upcoming
+// re-injection is allowed even when the URL is identical — a fast refresh loop reloads the SAME
+// url every cycle, and the 3s dedup window in injectBot would otherwise swallow it (one cycle,
+// then silence). SPA "complete"/historyState spam does NOT fire onBeforeNavigate, so those stay
+// coalesced by the time window. The DOMContentLoaded + complete pair for THIS load still dedup
+// against each other (only the first resets, the second is within 3s), so we inject exactly once.
+chrome.webNavigation.onBeforeNavigate.addListener(async (d) => {
+  if (d.frameId !== 0) return; // main frame only
+  const { botRunning, currentTabId } = await chrome.storage.local.get(['botRunning', 'currentTabId']);
+  if (!botRunning || d.tabId !== currentTabId) return;
+  lastInjectedUrl = '';
+});
+
+// GLOBAL keyboard shortcuts. Unlike the in-panel keydown, chrome.commands fire even when a web
+// page (not the side panel) is focused — so the user doesn't have to click the panel first after
+// opening/switching a tab. The actual actions (start/test/save) live in the panel, so we just
+// forward the command to it. Works while the panel is OPEN (sendMessage rejects harmlessly if not).
+chrome.commands.onCommand.addListener((command) => {
+  const action = { 'start-bot': 'start', 'test-bot': 'test', 'save-config': 'save' }[command];
+  if (action) chrome.runtime.sendMessage({ type: 'HOTKEY', action }).catch(() => {});
+});
+
 // Central message listener — background script is always alive and receives messages from popup and content script
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
@@ -77,8 +108,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'STOP_BOT') stopBot();
 
   // Popup requested initial injection into the current tab — routed through the same dedup gate.
-  // Clear any stale debugger attachment first so it can't block page clicks this run.
-  if (msg.type === 'INJECT_BOT') detachAllDebuggers().then(() => injectBot(msg.tabId, msg.url));
+  // Clear any stale debugger attachment first so it can't block page clicks this run. Also ensure
+  // the keepalive alarm is running so the worker survives the whole run (not just the localhost flow).
+  if (msg.type === 'INJECT_BOT') { chrome.alarms.create('keepalive', { periodInMinutes: 0.4 }); detachAllDebuggers().then(() => injectBot(msg.tabId, msg.url)); }
 
   // Popup is starting a fresh run — detach any stale debugger so it can't block this run
   if (msg.type === 'RESET_BOT') detachAllDebuggers();

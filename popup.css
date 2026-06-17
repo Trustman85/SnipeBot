@@ -51,6 +51,7 @@ body {
 .header-text { display: flex; flex-direction: column; }
 .logo { font-size: 18px; font-weight: 800; letter-spacing: -.3px; }
 .subtitle { font-size: 11px; opacity: .75; margin-top: 2px; }
+.header-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 .close-btn {
   background: rgba(255,255,255,.15); border: none; color: white;
   width: 26px; height: 26px; border-radius: 50%; font-size: 14px;
@@ -58,6 +59,45 @@ body {
   flex-shrink: 0;
 }
 .close-btn:hover { background: rgba(255,255,255,.3); }
+.hotkey-btn {
+  background: rgba(255,255,255,.15); border: none; color: white;
+  width: 26px; height: 26px; border-radius: 50%; font-size: 14px;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.hotkey-btn:hover { background: rgba(255,255,255,.3); }
+
+/* HOTKEY RECORDER OVERLAY */
+.hk-overlay {
+  position: fixed; inset: 0; z-index: 900;
+  background: rgba(0,16,48,.55);
+  display: flex; align-items: center; justify-content: center;
+}
+.hk-box {
+  background: white; border-radius: 10px; padding: 18px;
+  width: 300px; box-shadow: 0 8px 30px rgba(0,0,0,.3);
+}
+.hk-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.hk-title { font-size: 15px; font-weight: 800; color: #003087; }
+.hk-x {
+  background: #eee; border: none; color: #555; width: 22px; height: 22px;
+  border-radius: 50%; font-size: 12px; cursor: pointer;
+}
+.hk-x:hover { background: #ddd; }
+.hk-note { font-size: 11px; color: #777; line-height: 1.45; margin-bottom: 12px; }
+.hk-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.hk-label { flex: 0 0 88px; font-size: 12px; font-weight: 600; color: #333; }
+.hk-combo {
+  flex: 1; font-size: 12px; font-weight: 700; text-align: center;
+  padding: 6px 4px; border: 1.5px solid #ddd; border-radius: 5px;
+  background: #f7f8fa; color: #003087; min-width: 0;
+}
+.hk-combo.unset { color: #aaa; font-weight: 500; font-style: italic; }
+.hk-change {
+  width: 100%; margin-top: 8px; padding: 10px; background: #0067A0; color: white;
+  border: none; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer;
+}
+.hk-change:hover { background: #005a8e; }
 
 /* PROFILE TABS (top-level store switcher) — all fit, no scrollbar */
 .profile-tabs {
@@ -129,8 +169,13 @@ body {
   flex: 0 0 52px; padding: 6px 6px; border: 1px solid #ddd; border-radius: 4px;
   font-size: 13px; text-align: center;
 }
+.arm-test {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 3px;
+  font-size: 11px; font-weight: 700; color: #8fb3d9; white-space: nowrap; cursor: pointer;
+}
+.arm-test input { width: 14px; height: 14px; cursor: pointer; }
 .arm-btn {
-  flex: 0 0 70px; border: none; border-radius: 4px; font-weight: 700; font-size: 12px;
+  flex: 0 0 64px; border: none; border-radius: 4px; font-weight: 700; font-size: 12px;
   background: #f5a623; color: #1a1a1a; cursor: pointer;
 }
 .arm-btn:hover { background: #e0941a; }
@@ -190,6 +235,17 @@ body {
 .search-type-btn:hover:not(.active) { background: #e6f2f9; }
 
 .field-hint { font-size: 10px; color: #999; margin-top: 2px; }
+
+/* Auto-refresh interval + speed-test button row */
+.refresh-row { display: flex; gap: 8px; }
+.refresh-row input { flex: 1; min-width: 0; }
+.speed-test-btn {
+  flex: 0 0 auto; padding: 6px 10px; border: 1.5px solid #0067A0;
+  background: white; color: #0067A0; border-radius: 4px;
+  font-weight: 700; font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.speed-test-btn:hover { background: #e6f2f9; }
+.speed-test-btn:disabled { opacity: .5; cursor: default; }
 
 /* ACTIVITY LOG — takes remaining space and scrolls internally; min-height:0 lets it
    shrink so the form above and the buttons below always stay fully visible */

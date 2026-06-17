@@ -7,6 +7,20 @@
   "host_permissions": ["http://*/*", "https://*/*"],
   "side_panel": { "default_path": "popup.html" },
   "action": { "default_title": "Checkout Bot" },
+  "commands": {
+    "start-bot": {
+      "suggested_key": { "default": "Ctrl+Shift+S" },
+      "description": "Start / Stop the bot"
+    },
+    "test-bot": {
+      "suggested_key": { "default": "Ctrl+Shift+E" },
+      "description": "Test run / Stop"
+    },
+    "save-config": {
+      "suggested_key": { "default": "Ctrl+Shift+U" },
+      "description": "Save config"
+    }
+  },
   "content_scripts": [{ "matches": ["http://localhost:3000/*"], "js": ["stores.js", "sams.js", "content.js"], "run_at": "document_end" }],
   "background": { "service_worker": "background.js" }
 }

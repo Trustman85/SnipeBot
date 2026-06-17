@@ -14,6 +14,7 @@
     const isSams = activeProfile === 'sams';
     const store  = (window.__STORES && window.__STORES[activeProfile]) || null; // non-Sam's store adapter
     const isStore = isSams || !!store;
+    log('info', '⚙️ Bot live on ' + location.pathname + ' | profile=' + activeProfile + ' store=' + (isStore ? 'yes' : 'NO-adapter'));
     // Burst mode (around a drop): reload as fast as possible to catch the item going live
     const burst = burstUntil && Date.now() < burstUntil;
 
@@ -141,7 +142,8 @@
   // ── PHASE: SEARCH ──────────────────────────────────────────────
   if (phase === 'SEARCH') {
     setStatus('running', 'Looking for item...');
-    const interval = parseInt(botConfig.refreshInterval || '2');
+    // Fractional seconds allowed (0.2 = 200ms, 0.07 = 70ms); floor at 0.05s so it can't hammer to 0ms.
+    const interval = Math.max(0.05, parseFloat(botConfig.refreshInterval) || 2);
 
     if (isSams) {
       log('info', 'Checking shipping selection...');
@@ -511,6 +513,20 @@ function waitForAny(selectorList, timeout = 5000) {
     setTimeout(() => { obs.disconnect(); resolve(null); }, timeout);
   });
 }
+// Like waitForAny, but resolves as soon as the element EXISTS in ANY state (enabled OR disabled).
+// __storeFirstMatch deliberately skips disabled buttons, so waiting for the action button with
+// waitForAny on an OUT-OF-STOCK page never matches and burns the whole timeout. Here we want to
+// detect the button the moment it renders — disabled or not — so the caller can decide (click vs
+// refresh) immediately instead of waiting 8s every cycle.
+function waitForAnyState(selectorList, timeout = 5000) {
+  return new Promise(resolve => {
+    const find = () => document.querySelector(selectorList);
+    const el = find(); if (el) return resolve(el);
+    const obs = new MutationObserver(() => { const el = find(); if (el) { obs.disconnect(); resolve(el); } });
+    obs.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => { obs.disconnect(); resolve(null); }, timeout);
+  });
+}
 // Real browser-level click via CDP (background). For buttons gated on trusted events
 // (Target's Buy now / Place your order ignore a scripted .click()). Returns true on success.
 async function trustedClickSel(selector) {
@@ -765,7 +781,8 @@ async function runStore(store, cfg, burst) {
   }
 
   if (phase === 'SEARCH') {
-    const interval = parseInt(cfg.refreshInterval || '2');
+    // Fractional seconds allowed (0.2 = 200ms, 0.07 = 70ms); floor at 0.05s so it can't hammer to 0ms.
+    const interval = Math.max(0.05, parseFloat(cfg.refreshInterval) || 2);
     const wantQty = parseInt(cfg.quantity || '1');
     const canBuyNow = !!S.buyNow && !store.preferAddToCart; // preferAddToCart forces the cart route
     // If the Buy-now checkout drawer is already open (e.g. after a stop/restart on this page),
@@ -782,18 +799,49 @@ async function runStore(store, cfg, burst) {
       if (S.qtySelect)      await storeSetQtySelect(S, wantQty);
       else if (!S.qtyInput) await storeSetQty(S, wantQty);
     }
-    // Prefer "Buy now" (skips the cart, straight to checkout). If it isn't present — some items
-    // (e.g. apparel that needs a size picked) don't offer Buy now — fall back to Add to cart.
-    let usingBuyNow = false, addBtn = null;
-    if (canBuyNow) { addBtn = await waitForAny(S.buyNow, burst ? 700 : 6000); usingBuyNow = !!addBtn; }
-    if (!addBtn)   { addBtn = await waitForAny(S.addToCart, burst ? 500 : 4000); }
-    if (!addBtn) {
+    // Wait for the primary action button to EXIST (enabled OR disabled). On Target the main
+    // button's id is "addToCartButtonOrTextIdFor<TCIN>" and the TCIN is in the URL, so anchor on
+    // it: that way an OUT-OF-STOCK (disabled) button is detected the instant it renders instead of
+    // burning the full timeout waiting for an enabled one that never comes (the old ~8s/cycle bug).
+    const tcin = (location.pathname.match(/\/A-(\d+)/) || [])[1];
+    const mainSel = tcin ? '#addToCartButtonOrTextIdFor' + tcin : null;
+    const actionSel = (canBuyNow ? S.buyNow + ', ' : '') + S.addToCart;
+    await waitForAnyState(mainSel || actionSel, burst ? 700 : 8000);
+
+    // Resolve the action button + a UNIQUE selector to click. For Target, anchor on the MAIN
+    // product button (its id is "addToCartButtonOrTextIdFor<TCIN>"), so a "Buy now"/"Add to cart"
+    // in a related-items CAROUSEL can't be picked by mistake. Only use Buy now if it sits next to
+    // the main button (not a carousel); preorders have none.
+    let usingBuyNow = false, addBtn = null, clickSel = null;
+    const mainBtn = tcin ? document.getElementById('addToCartButtonOrTextIdFor' + tcin) : null;
+    if (mainBtn) {
+      const isPreorder = mainBtn.getAttribute('data-test') === 'preorderButton';
+      let mainBuyNow = null;
+      if (canBuyNow && !isPreorder) { // find a Buy now in the main button's nearby container
+        let node = mainBtn;
+        for (let i = 0; i < 4 && node && !mainBuyNow; i++) { node = node.parentElement; if (node) mainBuyNow = node.querySelector(S.buyNow); }
+      }
+      if (mainBuyNow) { usingBuyNow = true; addBtn = mainBuyNow; clickSel = S.buyNow; }
+      else            { addBtn = mainBtn;  clickSel = '#' + (window.CSS && CSS.escape ? CSS.escape(mainBtn.id) : mainBtn.id); }
+    } else {
+      // Non-Target / unknown layout: prefer Buy now if present, else Add to cart (first match).
+      const buyNowEl = canBuyNow ? document.querySelector(S.buyNow) : null;
+      usingBuyNow = !!buyNowEl;
+      addBtn = buyNowEl || document.querySelector(S.addToCart);
+      clickSel = usingBuyNow ? S.buyNow : S.addToCart;
+    }
+    // OUT OF STOCK: the "Add to cart"/"Buy now" button is present but DISABLED (greyed out). Treat
+    // that exactly like "not available" and keep refreshing — do NOT click it (a disabled click is
+    // a no-op, and proceeding would wrongly open the empty cart). When it restocks the button goes
+    // enabled and we click it.
+    const isDisabled = (el) => !el || el.disabled || el.getAttribute('aria-disabled') === 'true';
+    if (!addBtn || isDisabled(addBtn)) {
       const delay = burst ? 150 : interval * 1000;
-      log('warning', burst ? '⚡ Not live — burst reloading...' : store.name + ': not available — refreshing...');
+      const why = !addBtn ? 'not available' : 'out of stock (button disabled)';
+      log('warning', burst ? '⚡ Not live — burst reloading...' : store.name + ': ' + why + ' — refreshing...');
       await sleep(delay); location.reload(); return;
     }
     log('success', usingBuyNow ? 'Buy now — opening checkout drawer...' : 'Adding to cart...');
-    const clickSel = usingBuyNow ? S.buyNow : S.addToCart;
     if (store.trustedClick) {
       const ok = await trustedClickSel(clickSel);
       if (!ok) { log('warning', 'Trusted click failed — falling back to DOM click'); addBtn.click(); }
@@ -805,8 +853,18 @@ async function runStore(store, cfg, burst) {
       // Buy now opens a checkout drawer on THIS same page — finish the order inline.
       await buyNowDrawerCheckout(store, cfg);
     } else {
-      const vc = await waitForAny(S.viewCart, 4000);
-      if (vc) { log('info', 'Opening cart...'); vc.click(); }
+      // "View cart & check out" flyout link → go to the cart. Navigate via its href when it's an
+      // anchor (more reliable than .click(), which the page can intercept); else click it.
+      const vc = await waitForAny(S.viewCart, 5000);
+      if (vc) {
+        log('info', 'Opening cart...');
+        const href = vc.getAttribute && vc.getAttribute('href');
+        if (href) location.href = new URL(href, location.origin).href;
+        else vc.click();
+      } else {
+        log('warning', store.name + ': "View cart" not found — going to /cart directly');
+        location.href = new URL('/cart', location.origin).href;
+      }
     }
     return;
   }
@@ -831,6 +889,18 @@ async function runStore(store, cfg, burst) {
 
     const co = await waitForAny(S.checkout, 10000);
     if (!co) { log('warning', store.name + ': checkout not ready — reloading...'); await sleep(1200); location.reload(); return; }
+    // TEST MODE: the item is in the cart — STOP here. Proceeding to checkout on a logged-in
+    // account with saved payment can run straight through to placing a real order, so Test never
+    // clicks "Check out".
+    const { botTestMode: testCart } = await chrome.storage.local.get('botTestMode');
+    if (testCart) {
+      log('success', '🧪 TEST MODE — item is in the cart, NOT proceeding to checkout. No order placed.');
+      showBigBanner('✓ ADDED TO CART', 'TEST MODE — stopped before checkout');
+      setStatus('done', '🧪 Test passed — in cart, not ordered');
+      await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+      chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+      return;
+    }
     log('success', 'Proceeding to checkout...'); co.click(); return;
   }
 

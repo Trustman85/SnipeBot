@@ -314,6 +314,132 @@ document.getElementById('testBtn').addEventListener('click', () => toggleBot(tru
 document.getElementById('saveBtn').addEventListener('click', saveConfig);
 document.getElementById('clearBtn').addEventListener('click', clearLog);
 document.getElementById('closeBtn').addEventListener('click', () => window.close());
+document.getElementById('speedTestBtn').addEventListener('click', testLoadSpeed);
+
+// ── Keyboard shortcuts (GLOBAL) ────────────────────────────────────────────────
+// Uses Chrome's commands API (manifest "commands") so the keys fire ANYWHERE in Chrome — the user
+// doesn't have to click the side panel after opening/switching a tab. The command is handled in
+// background.js and forwarded here as a {type:'HOTKEY'} message. We ALSO match the same combo via
+// keydown as a fallback for when the panel itself is focused. dispatchHotkey() debounces so the two
+// paths can't double-trigger one keypress. Keys are rebound by the user at chrome://extensions/shortcuts
+// (Chrome doesn't allow extensions to set command keys programmatically), so the panel only displays them.
+const HOTKEY_ACTIONS = {
+  start: 'startBtn',  // ▶ Start / ⏹ Stop (toggle — same key stops it)
+  test:  'testBtn',   // 🧪 Test / ⏹ Stop (toggle)
+  save:  'saveBtn',   // 💾 Save
+};
+let cmdKeys = { start: '', test: '', save: '' }; // current Chrome-assigned combos (for display + keydown match)
+const lastHotkeyAt = {};
+
+function dispatchHotkey(action) {
+  if (!HOTKEY_ACTIONS[action]) return;
+  if (document.getElementById('lockOverlay').style.display !== 'none') return; // ignore while locked
+  const now = Date.now();
+  if (now - (lastHotkeyAt[action] || 0) < 400) return; // de-dupe the global + keydown paths for one press
+  lastHotkeyAt[action] = now;
+  const btn = document.getElementById(HOTKEY_ACTIONS[action]);
+  if (btn && !btn.disabled) btn.click(); // start/test buttons toggle, so re-pressing stops the bot
+}
+
+// Build a canonical combo string from a keydown event (matches Chrome's "Ctrl+Shift+S" format),
+// or null if only a modifier is held.
+function comboFromEvent(e) {
+  const k = e.key;
+  if (['Control', 'Alt', 'Shift', 'Meta', 'OS', 'CapsLock', 'Dead'].includes(k)) return null;
+  const parts = [];
+  if (e.ctrlKey)  parts.push('Ctrl');
+  if (e.altKey)   parts.push('Alt');
+  if (e.shiftKey) parts.push('Shift');
+  if (e.metaKey)  parts.push('Command'); // Chrome labels Meta as "Command"
+  parts.push(k.length === 1 ? k.toUpperCase() : k); // letters/digits uppercased; F2/Enter/Arrow* as-is
+  return parts.join('+');
+}
+
+// Pull the live key assignments from Chrome (the user may have rebound them) and show them.
+function refreshCmdKeys() {
+  if (!chrome.commands || !chrome.commands.getAll) return;
+  chrome.commands.getAll(cmds => {
+    const map = { 'start-bot': 'start', 'test-bot': 'test', 'save-config': 'save' };
+    cmdKeys = { start: '', test: '', save: '' };
+    for (const c of cmds) { const a = map[c.name]; if (a) cmdKeys[a] = c.shortcut || ''; }
+    for (const a of Object.keys(HOTKEY_ACTIONS)) {
+      const el = document.getElementById('hk-' + a);
+      if (el) { el.textContent = cmdKeys[a] || 'Not set'; el.classList.toggle('unset', !cmdKeys[a]); }
+    }
+  });
+}
+function openHotkeys()  { document.getElementById('hotkeyOverlay').style.display = 'flex'; refreshCmdKeys(); }
+function closeHotkeys() { document.getElementById('hotkeyOverlay').style.display = 'none'; }
+
+document.getElementById('hotkeyBtn').addEventListener('click', openHotkeys);
+document.getElementById('hotkeyClose').addEventListener('click', closeHotkeys);
+document.getElementById('hotkeyChange').addEventListener('click', () => {
+  chrome.tabs.create({ url: 'chrome://extensions/shortcuts' });
+});
+
+// Global command relayed from the background service worker (fires even when a web page is focused).
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === 'HOTKEY') dispatchHotkey(msg.action);
+});
+
+// Panel-focused fallback: match the same Chrome-assigned combo via keydown.
+document.addEventListener('keydown', (e) => {
+  if (document.getElementById('hotkeyOverlay').style.display !== 'none') return; // not while the recorder is open
+  const combo = comboFromEvent(e);
+  if (!combo) return;
+  const hasMod = e.ctrlKey || e.altKey || e.metaKey;
+  const el = document.activeElement;
+  const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+  for (const action of Object.keys(cmdKeys)) {
+    if (cmdKeys[action] && cmdKeys[action] === combo) {
+      if (typing && !hasMod) return; // a plain key shouldn't hijack typing in a field
+      e.preventDefault();
+      dispatchHotkey(action);
+      return;
+    }
+  }
+});
+refreshCmdKeys();
+
+// Measure how fast the CURRENT tab's page loads by reloading it a few times. Reports DOM-ready
+// time (when the bot can first act) + full-load time, and suggests a refresh interval. This lets
+// you tune the auto-refresh to the site's real speed instead of guessing.
+async function testLoadSpeed() {
+  const btn = document.getElementById('speedTestBtn');
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !/^https?:\/\//.test(tab.url || '')) {
+    addLog('error', 'Open a store page in this tab first, then ⏱ Test.');
+    return;
+  }
+  btn.disabled = true; btn.textContent = '⏱ …';
+  addLog('info', '⏱ Testing "' + (tab.url || '').replace(/^https?:\/\//, '').slice(0, 40) + '" — 3 reloads...');
+  const dcl = [], full = [];
+  try {
+    for (let i = 0; i < 3; i++) {
+      await new Promise((resolve) => {
+        const to = setTimeout(() => { chrome.tabs.onUpdated.removeListener(l); resolve(); }, 20000);
+        const l = (id, info) => {
+          if (id === tab.id && info.status === 'complete') { clearTimeout(to); chrome.tabs.onUpdated.removeListener(l); resolve(); }
+        };
+        chrome.tabs.onUpdated.addListener(l);
+        chrome.tabs.reload(tab.id);
+      });
+      try {
+        const [{ result }] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => { const n = performance.getEntriesByType('navigation')[0]; return n ? { dcl: Math.round(n.domContentLoadedEventEnd), load: Math.round(n.loadEventEnd) } : null; }
+        });
+        if (result) { dcl.push(result.dcl); full.push(result.load); }
+      } catch (_) {}
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = '⏱ Test';
+  }
+  if (!dcl.length) { addLog('warning', '⏱ Could not measure load timing on this page.'); return; }
+  const avg = (a) => Math.round(a.reduce((x, y) => x + y, 0) / a.length);
+  const dclAvg = avg(dcl), suggest = Math.max(0.1, Math.round(dclAvg / 100) / 10);
+  addLog('success', '⏱ DOM-ready ~' + dclAvg + 'ms · full-load ~' + avg(full) + 'ms. Suggested interval: ' + suggest + 's');
+}
 
 // Auto-format the card number into groups of 4 as you type (display only; the bot
 // strips it back to digits when filling the store's field).
@@ -328,8 +454,35 @@ document.getElementById('expiry').addEventListener('input', function () {
   this.value = v;
 });
 
-// Stop the bot + wipe the temporary plaintext config when the sidebar is closed
+// Keep the background service worker ALIVE while the panel is open. MV3 kills idle workers after
+// ~30s — and when that happened, Start/Test did nothing (there was no live worker to inject the
+// bot) until the panel was reopened (which wakes the worker via the action click). A persistent
+// port + periodic ping keeps the worker warm the whole time the panel is open, so opening tabs no
+// longer leaves the bot unable to start. (Reloading the panel did NOT fix it — only waking the
+// worker does.)
+let kaPort = null;
+function connectKeepAlive() {
+  try {
+    kaPort = chrome.runtime.connect({ name: 'keepalive' });
+    kaPort.onDisconnect.addListener(() => { kaPort = null; });
+  } catch (_) { kaPort = null; }
+}
+connectKeepAlive();
+setInterval(() => {
+  if (kaPort) { try { kaPort.postMessage({ ping: Date.now() }); } catch (_) { kaPort = null; } }
+  else connectKeepAlive(); // reconnect if the worker had cycled
+}, 20000);
+
+// Auto-refresh the panel when a NEW TAB is opened (keeps the panel snappy during drops; OK to lose
+// the log). Flagged so the unload handler below does NOT stop the running bot on our own reload.
+// The armed drop + running state are persisted in storage, so they survive this reload.
+let isReloading = false;
+chrome.tabs.onCreated.addListener(() => { isReloading = true; location.reload(); });
+
+// On genuine panel close: stop the bot + wipe the temporary plaintext config. On our own reload
+// (new-tab refresh), do NEITHER — the bot keeps running, its config stays, and the arm persists.
 window.addEventListener('unload', () => {
+  if (isReloading) return;
   chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
   chrome.storage.local.remove(['botConfig', 'burstUntil']);
   chrome.runtime.sendMessage({ type: 'STOP_BOT' }).catch(() => {});
@@ -347,20 +500,35 @@ const liveClock = document.getElementById('liveClock');
 chrome.storage.local.get('clockTz', d => { if (d.clockTz && TZ_ABBR[d.clockTz]) tzSelect.value = d.clockTz; });
 tzSelect.addEventListener('change', () => chrome.storage.local.set({ clockTz: tzSelect.value }));
 
+// Cache one Intl.DateTimeFormat per timezone — building one is expensive, and the clock renders
+// ~20×/sec. Creating it every frame (the old code) saturated the panel thread and froze it.
+const _fmtCache = {};
+function clockFmt(tz) {
+  if (!_fmtCache[tz]) {
+    try { _fmtCache[tz] = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
+    catch (_) { _fmtCache[tz] = null; }
+  }
+  return _fmtCache[tz];
+}
 function renderClock() {
   const tz = tzSelect.value;
   const now = new Date();
   const ms = String(now.getMilliseconds()).padStart(3, '0');
-  try {
-    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(now);
+  const fmt = clockFmt(tz);
+  if (fmt) {
+    const parts = fmt.formatToParts(now);
     const get = (t) => (parts.find(p => p.type === t) || {}).value || '';
     liveClock.textContent = get('hour') + ':' + get('minute') + ':' + get('second') + '.' + ms + ' ' + get('dayPeriod') + ' ' + (TZ_ABBR[tz] || '');
-  } catch (_) {
+  } else {
     liveClock.textContent = now.toTimeString().slice(0, 8) + '.' + ms;
   }
 }
-setInterval(renderClock, 47);
-renderClock();
+// Only tick while the panel is actually visible — pause when hidden to save CPU.
+let clockTimer = null;
+function startClock() { if (!clockTimer) { renderClock(); clockTimer = setInterval(renderClock, 50); } }
+function stopClock()  { if (clockTimer) { clearInterval(clockTimer); clockTimer = null; } }
+document.addEventListener('visibilitychange', () => { document.hidden ? stopClock() : startClock(); });
+startClock();
 
 // ── Drop-time scheduler (auto-start at the drop) ───────────────────────────────
 // Returns the timezone's UTC offset (ms) at a given moment
@@ -384,45 +552,57 @@ let dropInterval = null;
 const armBtn       = document.getElementById('armBtn');
 const dropStatusEl = document.getElementById('dropStatus');
 
-armBtn.addEventListener('click', () => {
-  if (dropInterval) { // Disarm
-    clearInterval(dropInterval); dropInterval = null;
-    armBtn.textContent = 'Arm'; armBtn.classList.remove('armed');
-    dropStatusEl.textContent = 'Disarmed.';
-    return;
-  }
-  const v = document.getElementById('dropTime').value; // "HH:MM:SS" or "HH:MM"
-  if (!v) { dropStatusEl.textContent = 'Set a drop time first.'; return; }
-  const [hh, mm, ss = 0] = v.split(':').map(Number);
-  const tz = tzSelect.value;
-  const target = dropTimestamp(tz, hh, mm, ss);
-  const leadMs = Math.max(0, parseInt(document.getElementById('leadSec').value || '3')) * 1000;
-  const fireAt = target - leadMs; // start early
+function disarm() {
+  if (dropInterval) { clearInterval(dropInterval); dropInterval = null; }
+  armBtn.textContent = 'Arm'; armBtn.classList.remove('armed');
+  chrome.storage.local.remove('armState');
+}
 
+// Start (or restore) an armed drop. The arm is persisted in storage (armState) so it SURVIVES a
+// panel reload/refresh — without that, opening a tab wiped the arm and the drop never fired.
+// testMode ON → the drop fires the bot in TEST mode (stops before placing the order, for rehearsing
+// the timing safely). OFF → fires a real order (same as the Start button).
+function startArm(target, leadMs, tz, testMode) {
+  const fireAt = target - leadMs; // start early
+  const tag = testMode ? ' [TEST]' : ' [REAL]';
   armBtn.textContent = 'Disarm'; armBtn.classList.add('armed');
   if (!cryptoKey) addLog('warning', '⚠️ Armed — but unlock your PIN before the drop or it can\'t auto-start');
-
+  if (dropInterval) clearInterval(dropInterval);
   dropInterval = setInterval(async () => {
     const remFire = fireAt - Date.now();
     if (remFire <= 0) {
       clearInterval(dropInterval); dropInterval = null;
       armBtn.textContent = 'Arm'; armBtn.classList.remove('armed');
-      dropStatusEl.textContent = '🚀 Starting early — burst-polling for the drop!';
+      await chrome.storage.local.remove('armState'); // fired — don't re-arm on a later reload
+      dropStatusEl.textContent = '🚀 Drop fired' + tag + ' — burst-polling!';
       const { botRunning } = await chrome.storage.local.get('botRunning');
       if (botRunning) return;
       if (!cryptoKey) { addLog('error', 'Drop fired but PIN is locked — unlock and Start manually'); return; }
       // Burst window: from the drop moment until 90s after, the bot reloads as fast as it
       // can to grab a spot the instant the item goes live; then it settles to normal pace.
       await chrome.storage.local.set({ burstUntil: target + 90000 });
-      toggleBot(); // same as pressing Start
+      toggleBot(testMode); // TEST (stops before order) or real, per the Test toggle
       return;
     }
     const s = Math.ceil(remFire / 1000);
     const h2 = String(Math.floor(s / 3600)).padStart(2, '0');
     const m2 = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
     const s2 = String(s % 60).padStart(2, '0');
-    dropStatusEl.textContent = 'Starts in ' + h2 + ':' + m2 + ':' + s2 + ' (' + (leadMs / 1000) + 's early, ' + (TZ_ABBR[tz] || '') + ')';
+    dropStatusEl.textContent = 'Starts in ' + h2 + ':' + m2 + ':' + s2 + tag + ' (' + (leadMs / 1000) + 's early, ' + (TZ_ABBR[tz] || '') + ')';
   }, 50);
+}
+
+armBtn.addEventListener('click', () => {
+  if (dropInterval) { disarm(); dropStatusEl.textContent = 'Disarmed.'; return; }
+  const v = document.getElementById('dropTime').value; // "HH:MM:SS" or "HH:MM"
+  if (!v) { dropStatusEl.textContent = 'Set a drop time first.'; return; }
+  const [hh, mm, ss = 0] = v.split(':').map(Number);
+  const tz = tzSelect.value;
+  const target = dropTimestamp(tz, hh, mm, ss);
+  const leadMs = Math.max(0, parseInt(document.getElementById('leadSec').value || '3')) * 1000;
+  const testMode = document.getElementById('armTest').checked;
+  chrome.storage.local.set({ armState: { target, leadMs, tz, testMode } }); // persist so a reload restores it
+  startArm(target, leadMs, tz, testMode);
 });
 
 // ── Auto-detect item name/SKU from current tab ───────────────────────────────
@@ -492,6 +672,18 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
   }
   if (botRunning) setRunningUI(true);
   updateStartLabel();
+
+  // Restore an armed drop that was set before a panel refresh/reopen, so opening tabs (or the
+  // auto-refresh) never loses the arm. Drop stale ones (target already well past).
+  const { armState } = await chrome.storage.local.get('armState');
+  if (armState && typeof armState.target === 'number') {
+    if (armState.target - Date.now() > -90000) {
+      document.getElementById('armTest').checked = !!armState.testMode; // restore the Test toggle
+      startArm(armState.target, armState.leadMs, armState.tz, armState.testMode);
+    } else {
+      chrome.storage.local.remove('armState');
+    }
+  }
 })();
 
 // ── Messages from content script ───────────────────────────────────────────────
@@ -633,9 +825,12 @@ async function toggleBot(testMode = false) {
     const siteUrl = (cfg.siteUrl || 'http://localhost:3000').replace(/\/$/, '');
     if (cfg.useCurrentTab) {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab) { addLog('error', 'No active tab found — click the store tab, then Start.'); setRunningUI(false); return; }
+      const okPage = /^https?:\/\//.test(tab.url || '');
+      if (!okPage) { addLog('error', 'Current tab is "' + (tab.url || 'blank') + '" — open the STORE PAGE in this tab, then Start.'); setRunningUI(false); return; }
       await chrome.storage.local.set({ currentTabId: tab.id });
       chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
-      addLog('success', 'Bot injected into current tab');
+      addLog('success', 'Bot injected → ' + (tab.url || '').replace(/^https?:\/\//, '').slice(0, 45));
     } else if (samsSearchMode) {
       // By Item #/SKU → direct product URL; By Name → store search results
       const url = searchType === 'sku' ? navStore.item(cfg.itemSku) : navStore.search(cfg.itemName);
