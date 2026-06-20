@@ -532,7 +532,8 @@ window.addEventListener('unload', () => {
   if (isReloading) return;
   wset({ botRunning: false, botPhase: 'IDLE' });
   wremove(['botConfig', 'burstUntil']);
-  chrome.runtime.sendMessage({ type: 'STOP_BOT' }).catch(() => {});
+  // Window-scoped stop: close THIS window's bot only — don't disturb other windows' running bots.
+  chrome.runtime.sendMessage({ type: 'STOP_BOT', wid: MY_WID }).catch(() => {});
 });
 
 // ── Live clock + timezone ──────────────────────────────────────────────────────
@@ -650,6 +651,12 @@ armBtn.addEventListener('click', () => {
   const testMode = document.getElementById('armTest').checked;
   wset({ armState: { target, leadMs, tz, testMode } }); // persist so a reload restores it
   startArm(target, leadMs, tz, testMode);
+});
+
+// As soon as a time is picked, close the native time picker and commit the value (blur), so you
+// don't have to click away — the chosen time lands in the field automatically.
+document.getElementById('dropTime').addEventListener('change', (e) => {
+  if (e.target.value) e.target.blur();
 });
 
 // ── Auto-detect item name/SKU from current tab ───────────────────────────────

@@ -40,6 +40,10 @@ const NS_ON = true;
 const PW_KEYS = new Set(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'currentTabId',
   'botTestMode', 'botRunToken', 'burstUntil', 'queueSince', 'qtyDone', 'samsFellBack', 'addAttempts',
   'pokePlaceRetries', 'armState']);
+// Per-window RUN-state keys to wipe on stop (everything except armState, which intentionally
+// survives a stop/reload so an armed drop isn't lost).
+const PW_RUN_KEYS = ['botRunning', 'botPhase', 'botConfig', 'currentTabId', 'botTestMode',
+  'botRunToken', 'burstUntil', 'queueSince', 'qtyDone', 'samsFellBack', 'addAttempts', 'pokePlaceRetries'];
 const nskw = (wid, key) => (NS_ON && wid != null && PW_KEYS.has(key)) ? ('w' + wid + ':' + key) : key;
 // Reads per-window keys for the window that owns `tabId` (returns the ORIGINAL key names).
 async function wgetTab(tabId, keys) {
@@ -137,8 +141,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Popup sent START_BOT — kick off the bot with the user's config
   if (msg.type === 'START_BOT') startBot(msg.config);
 
-  // Popup sent STOP_BOT — cancel any timers and reset state
-  if (msg.type === 'STOP_BOT') stopBot();
+  // Popup sent STOP_BOT — stop just that window's bot (wid provided), else a full global stop
+  if (msg.type === 'STOP_BOT') { if (msg.wid != null) stopBotWin(msg.wid); else stopBot(); }
 
   // Popup requested initial injection into the current tab — routed through the same dedup gate.
   // Clear any stale debugger attachment first so it can't block page clicks this run. Also ensure
@@ -551,7 +555,31 @@ async function detachAllDebuggers() {
   } catch (_) {}
 }
 
-// Stops the bot by clearing any pending retry timer and resetting storage state
+// Stops ONLY the bot for window `wid` (used when a single panel closes). Detaches just that
+// window's tab, wipes its per-window run-state, and keeps keepalive alive while ANY other bot is
+// still running — so closing one window's bot never disturbs the others' (incl. mid-checkout).
+async function stopBotWin(wid) {
+  if (wid == null) { stopBot(); return; } // no window id → fall back to a full stop
+  // Detach ONLY this window's tab (leave other windows' in-flight checkouts attached).
+  const tk = nskw(wid, 'currentTabId');
+  const tabId = (await chrome.storage.local.get(tk))[tk];
+  if (tabId != null) { try { await chrome.debugger.detach({ tabId }); } catch (_) {} }
+  // Wipe this window's run-state (the panel also clears it, but may not flush as it closes).
+  await chrome.storage.local.remove(PW_RUN_KEYS.map(k => nskw(wid, k)));
+  // Keep the worker alive while any OTHER window's bot is still running.
+  if (!(await anyBotRunning())) chrome.alarms.clear('keepalive');
+}
+
+// Wipes the RUN-state of EVERY window (used on a full/global stop, e.g. extension reload), so no
+// panel restores a stale "running" state for a bot whose content script no longer exists.
+async function clearAllPerWindowRunState() {
+  const all = await chrome.storage.local.get(null);
+  const re = new RegExp('^w\\d+:(' + PW_RUN_KEYS.join('|') + ')$');
+  const rm = Object.keys(all).filter(k => re.test(k));
+  if (rm.length) await chrome.storage.local.remove(rm);
+}
+
+// Stops ALL bots by clearing timers and resetting state (extension reload / startup).
 function stopBot() {
 
   // Clear any stale debugger attachment so it doesn't block page clicks next run
@@ -566,13 +594,14 @@ function stopBot() {
     botInterval = null;         // Clear the reference so it can be garbage collected
   }
 
-  // Update storage so the content script won't act on the next page load,
-  // and wipe the temporary plaintext config (only the encrypted copy remains at rest)
+  // Update storage so the content script won't act on the next page load, and wipe the temporary
+  // plaintext config (global keys for the localhost flow, plus EVERY window's per-window run-state).
   chrome.storage.local.set({
     botRunning: false,    // Tells content script to do nothing
     botPhase: 'IDLE'      // Reset phase back to idle
   });
   chrome.storage.local.remove(['botConfig', 'burstUntil', 'queueSince']);
+  clearAllPerWindowRunState();
 
   // Notify the popup so it can update the UI
   log('warning', 'Background: bot stopped');

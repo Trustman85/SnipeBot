@@ -132,18 +132,8 @@
     <p class="demo-note">⚠️ Demo only – data never leaves your browser</p>
   </div>
 
-  <!-- Drop-time scheduler — sits right above the clock -->
-  <div class="drop-bar">
-    <div class="drop-row">
-      <input type="time" id="dropTime" step="1">
-      <input type="number" id="leadSec" class="lead-input" min="0" max="60" value="3" title="Start this many seconds early">
-      <label class="arm-test" title="ON = armed drop runs in TEST mode (stops before placing the order). OFF = real order."><input type="checkbox" id="armTest">Test</label>
-      <button id="armBtn" class="arm-btn">Arm</button>
-    </div>
-    <span class="drop-hint" id="dropStatus">Set time + early-seconds. Test ON = rehearse safely; OFF = real order. Press Arm.</span>
-  </div>
-
-  <!-- Live clock + timezone (for timing a drop) -->
+  <!-- Live clock + timezone (for timing a drop) — kept ABOVE the arm row so the time-picker
+       dropdown (which opens downward) doesn't cover the clock. -->
   <div class="clock-bar">
     <span class="clock-time" id="liveClock">--:--:--.---</span>
     <select id="tzSelect" class="tz-select">
@@ -156,6 +146,17 @@
       <option value="Pacific/Honolulu">HI</option>
       <option value="UTC">UTC</option>
     </select>
+  </div>
+
+  <!-- Drop-time scheduler — sits right below the clock -->
+  <div class="drop-bar">
+    <div class="drop-row">
+      <input type="time" id="dropTime" step="1">
+      <input type="number" id="leadSec" class="lead-input" min="0" max="60" value="3" title="Start this many seconds early">
+      <label class="arm-test" title="ON = armed drop runs in TEST mode (stops before placing the order). OFF = real order."><input type="checkbox" id="armTest">Test</label>
+      <button id="armBtn" class="arm-btn">Arm</button>
+    </div>
+    <span class="drop-hint" id="dropStatus">Set time + early-seconds. Test ON = rehearse safely; OFF = real order. Press Arm.</span>
   </div>
 
   <!-- Queue / waiting-room timers (between the clock and the log) -->

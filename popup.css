@@ -261,7 +261,7 @@ body {
   flex: 1; overflow-y: auto; padding: 8px 14px;
   display: flex; flex-direction: column; gap: 3px;
 }
-.log-entry { font-size: 11px; font-family: "Courier New", monospace; line-height: 1.5; word-break: break-all; }
+.log-entry { font-size: 11px; font-family: "Courier New", monospace; line-height: 1.5; word-break: normal; overflow-wrap: break-word; }
 .log-entry.info    { color: #7ec8e3; }
 .log-entry.success { color: #6fcf97; }
 .log-entry.warning { color: #f5a623; }

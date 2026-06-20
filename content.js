@@ -39,7 +39,12 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
     const isSams = activeProfile === 'sams';
     const store  = (window.__STORES && window.__STORES[activeProfile]) || null; // non-Sam's store adapter
     const isStore = isSams || !!store;
-    log('info', '⚙️ Bot ' + botNum + ' live on ' + location.pathname + ' | profile=' + activeProfile + ' store=' + (isStore ? 'yes' : 'NO-adapter') + ' [wid=' + myWid + ']');
+    // Short, readable item id: Target's TCIN (the digits after /A-), else the last path segment.
+    const itemId = (location.pathname.match(/\/A-(\d+)/) || [])[1] || location.pathname.replace(/\/+$/, '').split('/').pop() || location.pathname;
+    // The panel prepends (newest on top), so log the detail line FIRST and the headline LAST,
+    // which renders as: "Bot N live" on top with the profile/store/wid detail directly under it.
+    log('info', 'profile=' + activeProfile + ' store=' + (isStore ? 'yes' : 'NO-adapter') + ' [wid=' + myWid + ']');
+    log('info', '⚙️ Bot ' + botNum + ' live #' + itemId);
     // Burst mode (around a drop): reload as fast as possible to catch the item going live
     const burst = burstUntil && Date.now() < burstUntil;
 
@@ -788,7 +793,7 @@ async function buyNowDrawerCheckout(store, cfg) {
 async function runStore(store, cfg, burst) {
   const S = store.sel;
   const phase = store.detectPhase(location.href) || 'SEARCH';
-  log('info', '── ' + store.name + ' | ' + phase + ' | ' + location.pathname + ' ──');
+  log('info', '── ' + phase + ' ──');
   setStatus('running', store.name + ': ' + phase);
 
   if (phase === 'RESULTS') {
@@ -862,8 +867,8 @@ async function runStore(store, cfg, burst) {
     const isDisabled = (el) => !el || el.disabled || el.getAttribute('aria-disabled') === 'true';
     if (!addBtn || isDisabled(addBtn)) {
       const delay = burst ? 150 : interval * 1000;
-      const why = !addBtn ? 'not available' : 'out of stock (button disabled)';
-      log('warning', burst ? '⚡ Not live — burst reloading...' : store.name + ': ' + why + ' — refreshing...');
+      const why = !addBtn ? 'not available' : 'out of stock';
+      log('warning', burst ? '⚡ burst reloading…' : why + ' — refreshing…');
       await sleep(delay); location.reload(); return;
     }
     log('success', usingBuyNow ? 'Buy now — opening checkout drawer...' : 'Adding to cart...');
