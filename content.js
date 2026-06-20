@@ -1036,7 +1036,7 @@ function waitFor(id, timeout = 5000) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function log(level, text) {
-  console.log('[CheckoutBot][' + level + '] ' + text);
+  console.log('[SnipeBot][' + level + '] ' + text);
   // Tag with this tab's window id so ONLY the owning window's panel shows it (per-window logs).
   const wid = (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null;
   chrome.runtime.sendMessage({ type: 'BOT_LOG', level, text, wid }).catch(() => {});

@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "Checkout Bot – School Demo",
+  "name": "SnipeBot",
   "version": "1.0",
-  "description": "Educational checkout automation demo for localhost mock store.",
+  "description": "Multi-store automated checkout assistant — independent bots per browser window for product drops.",
   "permissions": ["storage", "activeTab", "scripting", "tabs", "sidePanel", "alarms", "debugger", "webNavigation", "notifications"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "side_panel": { "default_path": "popup.html" },
-  "action": { "default_title": "Checkout Bot" },
+  "action": { "default_title": "SnipeBot" },
   "commands": {
     "start-bot": {
       "suggested_key": { "default": "Ctrl+Shift+S" },

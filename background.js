@@ -620,7 +620,7 @@ function handleAlert(kind, text) {
   try {
     chrome.notifications.create('bot-' + kind + '-' + Date.now(), {
       type: 'basic', iconUrl: ICON_DATA_URL,
-      title: titles[kind] || 'Checkout Bot', message: text || '',
+      title: titles[kind] || 'SnipeBot', message: text || '',
       priority: 2, requireInteraction: kind === 'captcha',
     });
   } catch (_) {}
