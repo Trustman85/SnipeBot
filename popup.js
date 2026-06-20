@@ -7,6 +7,53 @@ let activeProfile = 'sams';
 let cryptoKey = null;     // AES-GCM key derived from the PIN (in memory only, never stored)
 let lockMode  = 'unlock'; // 'unlock' (PIN exists) or 'create' (first-time PIN setup)
 
+// This side panel's own browser-window id. Each window has its own panel instance; capturing the
+// window id here is the foundation for running an INDEPENDENT bot per window (separate state/log).
+// Captured at load while this window is focused (the panel opens in the focused window).
+let MY_WID = null;
+let MY_BOT_NUM = null;    // friendly "Bot N" label for this window (raw window id is unreadable)
+
+// Maps this window's id to a small, stable, human-friendly number using a shared registry in
+// storage. Reuses numbers freed by closed windows so labels stay small (Bot 1, Bot 2, ...).
+async function assignBotNumber(wid) {
+  if (wid == null) return '?';
+  let liveIds = [];
+  try { liveIds = (await chrome.windows.getAll()).map(w => w.id); } catch (_) {}
+  const { windowNames = {} } = await chrome.storage.local.get('windowNames');
+  // Drop entries for windows that no longer exist, so their numbers can be reused.
+  for (const id of Object.keys(windowNames)) if (liveIds.length && !liveIds.includes(Number(id))) delete windowNames[id];
+  if (windowNames[wid] == null) {
+    const used = new Set(Object.values(windowNames));
+    let n = 1; while (used.has(n)) n++;       // smallest free positive integer
+    windowNames[wid] = n;
+  }
+  await chrome.storage.local.set({ windowNames });
+  return windowNames[wid];
+}
+
+// ── Per-window state namespacing ────────────────────────────────────────────────
+// Each browser window runs its own INDEPENDENT bot. The keys below are per-window: stored under
+// "w<windowId>:<key>" so two windows never stomp each other's run-state. Everything else (PIN/crypto,
+// saved card/address, clockTz, lastProfile, windowNames) stays GLOBAL/shared.
+// NS_ON is a kill-switch: false = behaves exactly like the old single-window build (bare keys);
+// true = real per-window isolation. (Step 4a keeps it false; Step 4b flips it on.)
+const NS_ON = true;
+const PW_KEYS = new Set(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'currentTabId',
+  'botTestMode', 'botRunToken', 'burstUntil', 'queueSince', 'qtyDone', 'samsFellBack', 'addAttempts',
+  'pokePlaceRetries', 'armState']);
+const nsk = (key) => (NS_ON && MY_WID != null && PW_KEYS.has(key)) ? ('w' + MY_WID + ':' + key) : key;
+// Storage wrappers that auto-namespace ONLY per-window keys (global keys pass through unchanged),
+// so a mixed get([...global, ...perWindow]) Just Works and returns the ORIGINAL key names.
+function wget(keys) {
+  const arr = Array.isArray(keys) ? keys : [keys];
+  const mapped = arr.map(nsk);
+  return chrome.storage.local.get(mapped).then(res => {
+    const out = {}; arr.forEach((orig, i) => { out[orig] = res[mapped[i]]; }); return out;
+  });
+}
+function wset(obj)    { const o = {}; for (const key in obj) o[nsk(key)] = obj[key]; return chrome.storage.local.set(o); }
+function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return chrome.storage.local.remove(arr.map(nsk)); }
+
 // Per-store navigation (the popup needs the URLs; content.js has the selectors).
 const STORE_NAV = {
   sams:          { name: "Sam's Bot",      search: q => 'https://www.samsclub.com/s/' + encodeURIComponent(q),               item: id => 'https://www.samsclub.com/ip/' + encodeURIComponent(id) },
@@ -483,8 +530,8 @@ chrome.tabs.onCreated.addListener(() => { isReloading = true; location.reload();
 // (new-tab refresh), do NEITHER — the bot keeps running, its config stays, and the arm persists.
 window.addEventListener('unload', () => {
   if (isReloading) return;
-  chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
-  chrome.storage.local.remove(['botConfig', 'burstUntil']);
+  wset({ botRunning: false, botPhase: 'IDLE' });
+  wremove(['botConfig', 'burstUntil']);
   chrome.runtime.sendMessage({ type: 'STOP_BOT' }).catch(() => {});
 });
 
@@ -555,7 +602,7 @@ const dropStatusEl = document.getElementById('dropStatus');
 function disarm() {
   if (dropInterval) { clearInterval(dropInterval); dropInterval = null; }
   armBtn.textContent = 'Arm'; armBtn.classList.remove('armed');
-  chrome.storage.local.remove('armState');
+  wremove('armState');
 }
 
 // Start (or restore) an armed drop. The arm is persisted in storage (armState) so it SURVIVES a
@@ -573,14 +620,14 @@ function startArm(target, leadMs, tz, testMode) {
     if (remFire <= 0) {
       clearInterval(dropInterval); dropInterval = null;
       armBtn.textContent = 'Arm'; armBtn.classList.remove('armed');
-      await chrome.storage.local.remove('armState'); // fired — don't re-arm on a later reload
+      await wremove('armState'); // fired — don't re-arm on a later reload
       dropStatusEl.textContent = '🚀 Drop fired' + tag + ' — burst-polling!';
-      const { botRunning } = await chrome.storage.local.get('botRunning');
+      const { botRunning } = await wget('botRunning');
       if (botRunning) return;
       if (!cryptoKey) { addLog('error', 'Drop fired but PIN is locked — unlock and Start manually'); return; }
       // Burst window: from the drop moment until 90s after, the bot reloads as fast as it
       // can to grab a spot the instant the item goes live; then it settles to normal pace.
-      await chrome.storage.local.set({ burstUntil: target + 90000 });
+      await wset({ burstUntil: target + 90000 });
       toggleBot(testMode); // TEST (stops before order) or real, per the Test toggle
       return;
     }
@@ -601,7 +648,7 @@ armBtn.addEventListener('click', () => {
   const target = dropTimestamp(tz, hh, mm, ss);
   const leadMs = Math.max(0, parseInt(document.getElementById('leadSec').value || '3')) * 1000;
   const testMode = document.getElementById('armTest').checked;
-  chrome.storage.local.set({ armState: { target, leadMs, tz, testMode } }); // persist so a reload restores it
+  wset({ armState: { target, leadMs, tz, testMode } }); // persist so a reload restores it
   startArm(target, leadMs, tz, testMode);
 });
 
@@ -648,6 +695,17 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
 
 // ── On popup open: restore last store, then unlock (cached key, or PIN) ─────────
 (async () => {
+  // 0) Identify which browser window this panel belongs to (basis for per-window bots), and map
+  //    the raw window id to a friendly "Bot N" label.
+  try {
+    const win = await chrome.windows.getCurrent();
+    MY_WID = win && win.id;
+    MY_BOT_NUM = await assignBotNumber(MY_WID);
+    addLog('info', '🤖 Bot ' + MY_BOT_NUM + ' — panel ready');
+    const sub = document.querySelector('.subtitle');
+    if (sub) sub.textContent = 'Bot ' + MY_BOT_NUM;
+  } catch (e) { addLog('error', 'Could not get window id: ' + e.message); }
+
   // 1) Reopen on the store you were last using
   const { lastProfile } = await chrome.storage.local.get('lastProfile');
   if (lastProfile && STORE_NAV[lastProfile]) {
@@ -655,7 +713,7 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
     document.querySelectorAll('.profile-tab').forEach(t => t.classList.toggle('active', t.dataset.profile === activeProfile));
   }
 
-  const { pinSalt, botRunning, pinLockUntil = 0 } = await chrome.storage.local.get(['pinSalt', 'botRunning', 'pinLockUntil']);
+  const { pinSalt, botRunning, pinLockUntil = 0 } = await wget(['pinSalt', 'botRunning', 'pinLockUntil']);
   if (pinSalt) {
     // Within the 2-hour window? Skip the PIN using the cached key.
     if (await tryRestoreKey()) {
@@ -675,19 +733,22 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
 
   // Restore an armed drop that was set before a panel refresh/reopen, so opening tabs (or the
   // auto-refresh) never loses the arm. Drop stale ones (target already well past).
-  const { armState } = await chrome.storage.local.get('armState');
+  const { armState } = await wget('armState');
   if (armState && typeof armState.target === 'number') {
     if (armState.target - Date.now() > -90000) {
       document.getElementById('armTest').checked = !!armState.testMode; // restore the Test toggle
       startArm(armState.target, armState.leadMs, armState.tz, armState.testMode);
     } else {
-      chrome.storage.local.remove('armState');
+      wremove('armState');
     }
   }
 })();
 
 // ── Messages from content script ───────────────────────────────────────────────
 chrome.runtime.onMessage.addListener(msg => {
+  // Per-window routing: a message tagged with a wid belongs to THAT window's panel only. Untagged
+  // messages (background-origin, or the localhost Sam's flow) are shown everywhere as before.
+  if (msg.wid != null && msg.wid !== MY_WID) return;
   if (msg.type === 'BOT_LOG')    addLog(msg.level, msg.text);
   if (msg.type === 'BOT_STATUS') setStatus(msg.status, msg.text);
   if (msg.type === 'BOT_QUEUE') {
@@ -699,7 +760,7 @@ chrome.runtime.onMessage.addListener(msg => {
   if (msg.type === 'BOT_DONE') {
     setRunningUI(false);
     stopQueueTimer(); stopCheckoutTimer();
-    chrome.storage.local.remove(['botConfig', 'burstUntil', 'queueSince']); // wipe temp state
+    wremove(['botConfig', 'burstUntil', 'queueSince']); // wipe temp state
   }
 });
 
@@ -781,10 +842,10 @@ async function saveConfig() {
 async function toggleBot(testMode = false) {
   addLog('info', testMode ? '🧪 Test run...' : 'Button clicked...');
   try {
-    const data = await chrome.storage.local.get('botRunning');
+    const data = await wget('botRunning');
     if (data.botRunning) {
-      chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE', botTestMode: false });
-      chrome.storage.local.remove(['botConfig', 'burstUntil', 'queueSince']); // wipe temp state on stop
+      wset({ botRunning: false, botPhase: 'IDLE', botTestMode: false });
+      wremove(['botConfig', 'burstUntil', 'queueSince']); // wipe temp state on stop
       stopQueueTimer(); stopCheckoutTimer();
       setRunningUI(false);
       addLog('warning', 'Bot stopped by user');
@@ -811,14 +872,14 @@ async function toggleBot(testMode = false) {
 
     // HARD RESET: wipe any leftover state from a previous (possibly stuck) run so a new
     // run never inherits stale pointers/flags. Background detaches any stale debugger.
-    await chrome.storage.local.remove(['currentTabId', 'queueSince']);
+    await wremove(['currentTabId', 'queueSince']);
     stopQueueTimer(); stopCheckoutTimer();
     chrome.runtime.sendMessage({ type: 'RESET_BOT' }).catch(() => {});
 
     // Persist the encrypted copy, and a TEMPORARY plaintext copy the bot reads during the run.
     await saveProfileConfig(activeProfile);
     // Fresh run flags: qtyDone (quantity), samsFellBack (SKU fallback), addAttempts (stuck guard)
-    await chrome.storage.local.set({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0, pokePlaceRetries: 0, botTestMode: !!testMode, botRunToken: Date.now() });
+    await wset({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0, pokePlaceRetries: 0, botTestMode: !!testMode, botRunToken: Date.now() });
     if (testMode) addLog('info', '🧪 TEST MODE: full flow will run but the order will NOT be submitted.');
     setRunningUI(true);
 
@@ -828,7 +889,7 @@ async function toggleBot(testMode = false) {
       if (!tab) { addLog('error', 'No active tab found — click the store tab, then Start.'); setRunningUI(false); return; }
       const okPage = /^https?:\/\//.test(tab.url || '');
       if (!okPage) { addLog('error', 'Current tab is "' + (tab.url || 'blank') + '" — open the STORE PAGE in this tab, then Start.'); setRunningUI(false); return; }
-      await chrome.storage.local.set({ currentTabId: tab.id });
+      await wset({ currentTabId: tab.id });
       chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
       addLog('success', 'Bot injected → ' + (tab.url || '').replace(/^https?:\/\//, '').slice(0, 45));
     } else if (samsSearchMode) {
@@ -836,7 +897,7 @@ async function toggleBot(testMode = false) {
       const url = searchType === 'sku' ? navStore.item(cfg.itemSku) : navStore.search(cfg.itemName);
       addLog('info', 'Opening ' + navStore.name + ': ' + url);
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      await chrome.storage.local.set({ currentTabId: tab.id });
+      await wset({ currentTabId: tab.id });
       await chrome.tabs.update(tab.id, { url, active: true });
       addLog('success', searchType === 'sku' ? 'Going to item…' : 'Searching ' + navStore.name + '…');
     } else {

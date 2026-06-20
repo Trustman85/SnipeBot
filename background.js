@@ -21,26 +21,59 @@ chrome.runtime.onStartup.addListener(() => stopBot());
 // Chrome kills idle service workers after ~30s — this alarm fires every 25s to prevent that.
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== 'keepalive') return;
-  const { botRunning } = await chrome.storage.local.get('botRunning');
-  if (!botRunning) chrome.alarms.clear('keepalive');
+  if (!(await anyBotRunning())) chrome.alarms.clear('keepalive');
 });
 
 // Holds the reference to the OOS retry timer so we can cancel it if the user stops the bot
 let botInterval = null;
 
-// Tracks the last URL we injected into, to avoid re-injecting when an SPA fires
-// "complete" multiple times for the SAME page (which caused duplicate racing runs).
-let lastInjectedUrl = '';
-let lastInjectAt = 0;
+// Tracks the last URL we injected into PER TAB, to avoid re-injecting when an SPA fires "complete"
+// multiple times for the SAME page (which caused duplicate racing runs). Keyed by tab so multiple
+// windows — even two on the same URL — are deduped independently. Maps tabId -> { url, at }.
+const lastInjected = {};
+
+// ── Per-window state namespacing (mirror of popup.js / content.js) ──────────────
+// Per-window keys are stored as "w<windowId>:<key>". NS_ON is the shared kill-switch — popup.js,
+// content.js and background.js must ALL agree. false = old global single-window behavior (Step 4a);
+// flipping all three to true (Step 4b) gives each window its own independent bot state.
+const NS_ON = true;
+const PW_KEYS = new Set(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'currentTabId',
+  'botTestMode', 'botRunToken', 'burstUntil', 'queueSince', 'qtyDone', 'samsFellBack', 'addAttempts',
+  'pokePlaceRetries', 'armState']);
+const nskw = (wid, key) => (NS_ON && wid != null && PW_KEYS.has(key)) ? ('w' + wid + ':' + key) : key;
+// Reads per-window keys for the window that owns `tabId` (returns the ORIGINAL key names).
+async function wgetTab(tabId, keys) {
+  const wid = await widForTab(tabId);
+  const arr = Array.isArray(keys) ? keys : [keys];
+  const mapped = arr.map(k => nskw(wid, k));
+  const res = await chrome.storage.local.get(mapped);
+  const out = {}; arr.forEach((orig, i) => { out[orig] = res[mapped[i]]; }); return out;
+}
+// True if ANY window's bot is running — keepalive must persist while at least one runs.
+async function anyBotRunning() {
+  const all = await chrome.storage.local.get(null);
+  if (all.botRunning) return true;
+  for (const k in all) if (/^w\d+:botRunning$/.test(k) && all[k]) return true;
+  return false;
+}
 
 // Single injection gate — ALL injection (initial from popup + re-injection on
 // navigation) goes through here, so the dedup tracker covers every path.
 async function injectBot(tabId, url) {
   const now = Date.now();
-  // Skip a repeat injection of the same URL within 3s (SPA firing complete repeatedly)
-  if (url && url === lastInjectedUrl && now - lastInjectAt < 3000) return;
-  lastInjectedUrl = url || '';
-  lastInjectAt = now;
+  // Skip a repeat injection of the same URL into the SAME tab within 3s (SPA firing complete repeatedly)
+  const prev = lastInjected[tabId];
+  if (url && prev && url === prev.url && now - prev.at < 3000) return;
+  lastInjected[tabId] = { url: url || '', at: now };
+  // Stamp THIS tab's browser-window id into the content-script world FIRST, so content.js knows
+  // which window it belongs to without having to guess (foundation for per-window bots). It lands
+  // in the same isolated world the files use, so content.js can read window.__BOT_WID. A failure
+  // here must NOT block the real injection, so it's wrapped defensively.
+  let wid = null;
+  try { wid = (await chrome.tabs.get(tabId)).windowId; } catch (_) {}
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, args: [wid], func: (w) => { window.__BOT_WID = w; } });
+  } catch (_) {}
   // content.js guards itself by URL, so no external flag reset is needed.
   // Store adapter files load before content.js so their registry + helpers are in scope.
   await chrome.scripting.executeScript({ target: { tabId },
@@ -52,7 +85,7 @@ async function injectBot(tabId, url) {
 // next-step element appears, so it never waits for a full page load.
 chrome.webNavigation.onDOMContentLoaded.addListener(async (d) => {
   if (d.frameId !== 0) return; // main frame only
-  const { botRunning, botConfig, currentTabId } = await chrome.storage.local.get(['botRunning', 'botConfig', 'currentTabId']);
+  const { botRunning, botConfig, currentTabId } = await wgetTab(d.tabId, ['botRunning', 'botConfig', 'currentTabId']);
   if (!botRunning || !(botConfig?.useCurrentTab || botConfig?.samsSearch)) return;
   if (d.tabId !== currentTabId) return;
   await injectBot(d.tabId, d.url);
@@ -61,7 +94,7 @@ chrome.webNavigation.onDOMContentLoaded.addListener(async (d) => {
 // Client-side (SPA) navigations don't reload the document — catch those too
 chrome.webNavigation.onHistoryStateUpdated.addListener(async (d) => {
   if (d.frameId !== 0) return;
-  const { botRunning, botConfig, currentTabId } = await chrome.storage.local.get(['botRunning', 'botConfig', 'currentTabId']);
+  const { botRunning, botConfig, currentTabId } = await wgetTab(d.tabId, ['botRunning', 'botConfig', 'currentTabId']);
   if (!botRunning || !(botConfig?.useCurrentTab || botConfig?.samsSearch)) return;
   if (d.tabId !== currentTabId) return;
   await injectBot(d.tabId, d.url);
@@ -70,7 +103,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(async (d) => {
 // FALLBACK: if DOMContentLoaded was missed, the full-load event still injects (deduped)
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
-  const { botRunning, botConfig, currentTabId } = await chrome.storage.local.get(['botRunning', 'botConfig', 'currentTabId']);
+  const { botRunning, botConfig, currentTabId } = await wgetTab(tabId, ['botRunning', 'botConfig', 'currentTabId']);
   if (!botRunning || !(botConfig?.useCurrentTab || botConfig?.samsSearch)) return;
   if (tabId !== currentTabId) return;
   await injectBot(tabId, tab?.url || '');
@@ -84,9 +117,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 // against each other (only the first resets, the second is within 3s), so we inject exactly once.
 chrome.webNavigation.onBeforeNavigate.addListener(async (d) => {
   if (d.frameId !== 0) return; // main frame only
-  const { botRunning, currentTabId } = await chrome.storage.local.get(['botRunning', 'currentTabId']);
+  const { botRunning, currentTabId } = await wgetTab(d.tabId, ['botRunning', 'currentTabId']);
   if (!botRunning || d.tabId !== currentTabId) return;
-  lastInjectedUrl = '';
+  if (lastInjected[d.tabId]) lastInjected[d.tabId].url = ''; // allow re-inject after a real reload
 });
 
 // GLOBAL keyboard shortcuts. Unlike the in-panel keydown, chrome.commands fire even when a web
@@ -144,6 +177,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // CDP dispatches REAL, trusted browser-level input — indistinguishable from a human — so
 // React Aria commits the value to its state every time (synthetic DOM events did not).
 async function samsCheckout(tabId, cvv) {
+  const wid = await widForTab(tabId);
+  const log = (lvl, txt) => logWin(wid, lvl, txt); // route this op's logs to its window's panel
   if (!tabId) { log('error', 'SAMS_CHECKOUT: no tab id'); return; }
 
   const cvvExpr = 'document.getElementById("cvv-field") || document.querySelector(\'[id*="cvv-field"],[name="cvv"][type="password"]\')';
@@ -205,6 +240,8 @@ async function samsCheckout(tabId, cvv) {
 // and then sending real keystrokes works the same as a person typing.
 async function pokemonPay(tabId, msg) {
   if (!tabId) return;
+  const wid = await widForTab(tabId);
+  const log = (lvl, txt) => logWin(wid, lvl, txt); // route this op's logs to its window's panel
   const dbg = { tabId };
   const cardDigits = String(msg.card || '').replace(/\D/g, '');
   const cvv = String(msg.cvv || '');
@@ -267,6 +304,8 @@ async function pokemonPay(tabId, msg) {
 // all → type → Enter), so the page commits it the way it would for a real person.
 async function cdpSetValue(tabId, selector, value) {
   if (!tabId) return;
+  const wid = await widForTab(tabId);
+  const log = (lvl, txt) => logWin(wid, lvl, txt); // route this op's logs to its window's panel
   const dbg = { tabId };
   const expr = 'document.querySelector(' + JSON.stringify(selector) + ')';
   try {
@@ -344,6 +383,8 @@ async function elementPoint(tabId, expr) {
 // a keyword. If `click` is true, clicks it in its own frame. Returns the first frame that matched.
 async function findClickInFrames(tabId, msg) {
   if (!tabId) return { found: false };
+  const wid = await widForTab(tabId);
+  const log = (lvl, txt) => logWin(wid, lvl, txt); // route this op's logs to its window's panel
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
@@ -377,6 +418,8 @@ async function findClickInFrames(tabId, msg) {
 // is the FINAL submit (the actual charge). Searches all frames since the sidebar is an iframe.
 async function targetCvvInFrames(tabId, msg) {
   if (!tabId) return { found: false };
+  const wid = await widForTab(tabId);
+  const log = (lvl, txt) => logWin(wid, lvl, txt); // route this op's logs to its window's panel
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
@@ -409,6 +452,8 @@ async function targetCvvInFrames(tabId, msg) {
 // your order, which are gated on trusted user gestures. Returns true if the click was sent.
 async function cdpClickSelector(tabId, selector) {
   if (!tabId || !selector) return false;
+  const wid = await widForTab(tabId);
+  const log = (lvl, txt) => logWin(wid, lvl, txt); // route this op's logs to its window's panel
   const dbg = { tabId };
   try {
     await chrome.debugger.attach(dbg, '1.3');
@@ -562,4 +607,15 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function log(level, text) {
   // .catch(()=>{}) prevents unhandled errors when the popup window is not open
   chrome.runtime.sendMessage({ type: 'BOT_LOG', level, text }).catch(() => {});
+}
+
+// Per-window log: tags the message with `wid` so ONLY that window's panel shows it. Used by the
+// per-tab CDP operations below so their logs land in the right bot's panel, not every panel.
+function logWin(wid, level, text) {
+  chrome.runtime.sendMessage({ type: 'BOT_LOG', level, text, wid: wid == null ? null : wid }).catch(() => {});
+}
+// Maps a tab to its browser-window id (so a per-tab operation can tag its logs for that window).
+async function widForTab(tabId) {
+  if (!tabId) return null;
+  try { return (await chrome.tabs.get(tabId)).windowId; } catch (_) { return null; }
 }

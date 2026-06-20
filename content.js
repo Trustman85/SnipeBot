@@ -1,8 +1,33 @@
+// ── Per-window state namespacing (mirror of popup.js / background.js) ───────────
+// Per-window keys are stored as "w<windowId>:<key>" (background stamped window.__BOT_WID before
+// injecting us). NS_ON is the shared kill-switch — popup.js, background.js and content.js must ALL
+// agree. false = old global single-window behavior (Step 4a); true = per-window isolation (Step 4b).
+const NS_ON = true;
+const PW_KEYS = new Set(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'currentTabId',
+  'botTestMode', 'botRunToken', 'burstUntil', 'queueSince', 'qtyDone', 'samsFellBack', 'addAttempts',
+  'pokePlaceRetries', 'armState']);
+const _wid = () => (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null;
+const nsk = (key) => (NS_ON && _wid() != null && PW_KEYS.has(key)) ? ('w' + _wid() + ':' + key) : key;
+// Wrappers that auto-namespace ONLY per-window keys (global keys pass through); return original names.
+function wget(keys) {
+  const arr = Array.isArray(keys) ? keys : [keys];
+  const mapped = arr.map(nsk);
+  return chrome.storage.local.get(mapped).then(res => {
+    const out = {}; arr.forEach((orig, i) => { out[orig] = res[mapped[i]]; }); return out;
+  });
+}
+function wset(obj)    { const o = {}; for (const key in obj) o[nsk(key)] = obj[key]; return chrome.storage.local.set(o); }
+function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return chrome.storage.local.remove(arr.map(nsk)); }
+
 // Runs on every page load — checks current bot phase and acts accordingly
 (async () => {
   try {
-    const { botRunning, botPhase, botConfig, activeProfile, burstUntil, botRunToken } = await chrome.storage.local.get(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'burstUntil', 'botRunToken']);
+    const { botRunning, botPhase, botConfig, activeProfile, burstUntil, botRunToken, windowNames } = await wget(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'burstUntil', 'botRunToken', 'windowNames']);
     if (!botRunning || !botConfig) return;
+    // Which window/bot is this tab part of? Background stamped window.__BOT_WID before injecting us;
+    // map it to the friendly "Bot N" label so the log clearly says which bot a tab belongs to.
+    const myWid  = (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null;
+    const botNum = (windowNames && myWid != null && windowNames[myWid]) || '?';
     // Dedup guard: window persists across injections into the SAME document. Skip ONLY when
     // both the URL and the run-token are unchanged (a true duplicate injection within one run).
     //  • A real navigation/reload makes a fresh document (window reset) → runs again.
@@ -14,7 +39,7 @@
     const isSams = activeProfile === 'sams';
     const store  = (window.__STORES && window.__STORES[activeProfile]) || null; // non-Sam's store adapter
     const isStore = isSams || !!store;
-    log('info', '⚙️ Bot live on ' + location.pathname + ' | profile=' + activeProfile + ' store=' + (isStore ? 'yes' : 'NO-adapter'));
+    log('info', '⚙️ Bot ' + botNum + ' live on ' + location.pathname + ' | profile=' + activeProfile + ' store=' + (isStore ? 'yes' : 'NO-adapter') + ' [wid=' + myWid + ']');
     // Burst mode (around a drop): reload as fast as possible to catch the item going live
     const burst = burstUntil && Date.now() < burstUntil;
 
@@ -31,7 +56,7 @@
       while (detectCaptcha()) {
         await sleep(2500);
         if (++buzzed % 6 === 0) chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'captcha', text: 'Still waiting on the CAPTCHA…' }).catch(() => {});
-        const st = await chrome.storage.local.get('botRunning');
+        const st = await wget('botRunning');
         if (!st.botRunning) return;
       }
       log('success', 'CAPTCHA cleared — continuing');
@@ -42,8 +67,8 @@
     // your place). Track elapsed time, the queue's est-wait/position, and report to the panel.
     if (isStore && detectQueue()) {
       // Persist the queue start time so "time in line" survives queue-page reloads
-      let qs = (await chrome.storage.local.get('queueSince')).queueSince;
-      if (!qs) { qs = Date.now(); await chrome.storage.local.set({ queueSince: qs }); }
+      let qs = (await wget('queueSince')).queueSince;
+      if (!qs) { qs = Date.now(); await wset({ queueSince: qs }); }
       log('warning', '⏳ In high-demand queue — waiting in line (will not reload)...');
       setStatus('running', 'Waiting in queue (high demand)...');
       chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'in', since: qs, info: readQueueInfo() }).catch(() => {});
@@ -53,10 +78,10 @@
         chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'in', since: qs, info: readQueueInfo() }).catch(() => {});
         await sleep(3000); waited += 3;
         if (waited % 15 === 0) log('info', 'Still in queue... (' + Math.round((Date.now() - qs) / 1000) + 's in line)');
-        const st = await chrome.storage.local.get('botRunning');
+        const st = await wget('botRunning');
         if (!st.botRunning) return; // user stopped
       }
-      await chrome.storage.local.remove('queueSince');
+      await wremove('queueSince');
       chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'out' }).catch(() => {});
       log('success', 'Queue cleared after ' + Math.round((Date.now() - qs) / 1000) + 's — continuing');
     }
@@ -164,10 +189,10 @@
       // search for the number instead. Only once, and only in Sam's SKU search mode.
       if (isSams && botConfig.samsSearch && botConfig.searchType === 'sku') {
         const hasProduct = document.querySelector('h1, [class*="product-title"], [data-automation-id="productName"], .price, [itemprop="price"]');
-        const { samsFellBack } = await chrome.storage.local.get('samsFellBack');
+        const { samsFellBack } = await wget('samsFellBack');
         if (!hasProduct && !samsFellBack) {
           log('warning', 'Item number page not found — falling back to search...');
-          await chrome.storage.local.set({ samsFellBack: true });
+          await wset({ samsFellBack: true });
           location.href = 'https://www.samsclub.com/s/' + encodeURIComponent(botConfig.itemSku);
           return;
         }
@@ -194,7 +219,7 @@
     if (price > 0 && price > parseFloat(botConfig.maxPrice || '999')) {
       log('warning', 'Price $' + price + ' exceeds max $' + botConfig.maxPrice + ' — stopping');
       setStatus('error', 'Price too high – bot stopped');
-      await chrome.storage.local.set({ botRunning: false });
+      await wset({ botRunning: false });
       chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
       return;
     }
@@ -205,10 +230,10 @@
     log('info', 'Add to Cart clicked — waiting for confirmation...');
 
     if (isSams) {
-      await chrome.storage.local.set({ botPhase: 'ADDED' });
+      await wset({ botPhase: 'ADDED' });
       await waitForViewCart(botConfig, isSams);
     } else {
-      await chrome.storage.local.set({ botPhase: 'CART' });
+      await wset({ botPhase: 'CART' });
     }
   }
 
@@ -241,7 +266,7 @@
     }
     log('success', 'Found checkout button: "' + btn.textContent.trim().substring(0, 40) + '"');
     log('info', 'Clicking checkout...');
-    await chrome.storage.local.set({ botPhase: 'CHECKOUT' });
+    await wset({ botPhase: 'CHECKOUT' });
     btn.click();
   }
 
@@ -310,7 +335,7 @@
     if (!submitBtn) { log('error', 'Place Order button not found!'); return; }
     log('success', 'Found Place Order: "' + submitBtn.textContent.trim().substring(0, 40) + '"');
     log('info', 'Clicking Place Order...');
-    await chrome.storage.local.set({ botPhase: 'CONFIRM' });
+    await wset({ botPhase: 'CONFIRM' });
     submitBtn.click();
   }
 
@@ -352,7 +377,7 @@
         // Error banner = order was NOT placed (no charge happened) → safe to retry checkout.
         log('warning', '❌ Order not placed (' + outcome.text.substring(0, 40) + ') — retrying checkout...');
         setStatus('running', 'Retrying checkout...');
-        await chrome.storage.local.set({ botPhase: 'CHECKOUT' });
+        await wset({ botPhase: 'CHECKOUT' });
         await sleep(1500);
         location.reload();
         return;
@@ -371,14 +396,14 @@
       setStatus('done', 'Order complete! ID: ' + orderId);
     }
     if (botConfig.stopOnSuccess) {
-      await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+      await wset({ botRunning: false, botPhase: 'IDLE' });
       chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
       log('info', 'Bot stopped (stop-on-success)');
     }
   }
 
   } catch (err) {
-    log('error', 'Bot error: ' + err.message + ' (phase: ' + (await chrome.storage.local.get('botPhase')).botPhase + ')');
+    log('error', 'Bot error: ' + err.message + ' (phase: ' + (await wget('botPhase')).botPhase + ')');
   }
 })();
 
@@ -406,7 +431,7 @@ function pressEl(el) {
 async function maybeSetQuantity(botConfig) {
   const qty = parseInt(botConfig.quantity || '1');
   if (qty <= 1) return;
-  const { qtyDone } = await chrome.storage.local.get('qtyDone');
+  const { qtyDone } = await wget('qtyDone');
   if (qtyDone) return; // already set this order
 
   // Wait briefly for the stepper to render
@@ -424,7 +449,7 @@ async function maybeSetQuantity(botConfig) {
   }
 
   await setQuantity(qty);
-  await chrome.storage.local.set({ qtyDone: true }); // lock it so it can't run again
+  await wset({ qtyDone: true }); // lock it so it can't run again
   log('success', 'Quantity set to ' + qty);
   await sleep(400);
 }
@@ -587,9 +612,9 @@ async function pokemonCheckout(S, cfg) {
     // please refresh and retry"), reload to retry — but cap it so we never loop or double-submit.
     const payErr = /payment could not be processed|please refresh and retry/i.test(document.body.innerText || '');
     if (payErr) {
-      const r = (await chrome.storage.local.get('pokePlaceRetries')).pokePlaceRetries || 0;
+      const r = (await wget('pokePlaceRetries')).pokePlaceRetries || 0;
       if (r >= 3) { log('error', '🛑 Gateway kept rejecting payment after ' + r + ' tries — stopping.'); setStatus('error', 'Payment rejected — check card'); return; }
-      await chrome.storage.local.set({ pokePlaceRetries: r + 1 });
+      await wset({ pokePlaceRetries: r + 1 });
       log('warning', 'Gateway rejected the payment — refreshing to retry (' + (r + 1) + '/3)...');
       await sleep(1200); location.reload(); return;
     }
@@ -607,17 +632,17 @@ async function pokemonCheckout(S, cfg) {
     if (po) {
       // TEST MODE: everything ran for real up to here, but DON'T actually submit the order.
       // Show a big confirmation banner and stop, so you can verify the full flow safely.
-      const { botTestMode } = await chrome.storage.local.get('botTestMode');
+      const { botTestMode } = await wget('botTestMode');
       if (botTestMode) {
         log('success', '🧪 TEST MODE — found Place Order, NOT submitting. Order would go through here.');
         showBigBanner('✓ ORDER CONFIRMED', 'TEST MODE — no real order was placed');
         setStatus('done', '🧪 Test passed — order NOT placed');
-        await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+        await wset({ botRunning: false, botPhase: 'IDLE' });
         chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
         return;
       }
       log('success', 'Placing order: "' + (po.textContent || '').trim().substring(0, 40) + '"');
-      await chrome.storage.local.set({ botPhase: 'CONFIRM' });
+      await wset({ botPhase: 'CONFIRM' });
       po.click();
       // Watch for a gateway rejection right after clicking; if it appears, the next injection
       // (or the block above on reload) handles the retry.
@@ -636,7 +661,7 @@ async function pokemonCheckout(S, cfg) {
   if (!cfg.cardNumber || !cfg.cvv || !cfg.expiry) {
     log('error', '🛑 No card saved for Pokémon — fill the Payment tab (Card #, CVV, Expiry) on the ⚡ Pokémon profile and Save.');
     setStatus('error', 'No card saved — fill Payment tab');
-    await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+    await wset({ botRunning: false, botPhase: 'IDLE' });
     chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
     return;
   }
@@ -727,12 +752,12 @@ async function buyNowDrawerCheckout(store, cfg) {
 
   // TEST MODE: stop HERE. Do NOT click Place your order — clicking it can complete the purchase.
   // Show the banner and end; nothing that submits an order ever runs in Test mode.
-  const { botTestMode } = await chrome.storage.local.get('botTestMode');
+  const { botTestMode } = await wget('botTestMode');
   if (botTestMode) {
     log('success', '🧪 TEST MODE — found "Place your order", NOT clicking it. No order placed.');
     showBigBanner('✓ ORDER CONFIRMED', 'TEST MODE — no real order was placed');
     setStatus('done', '🧪 Test passed — order NOT placed');
-    await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+    await wset({ botRunning: false, botPhase: 'IDLE' });
     chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
     return;
   }
@@ -755,7 +780,7 @@ async function buyNowDrawerCheckout(store, cfg) {
   }
   if (!cvvRes.found) { log('warning', 'Target: CVV sidebar not found — stopping before order.'); return; }
   log('success', 'CVV entered — confirming order...');
-  await chrome.storage.local.set({ botPhase: 'CONFIRM' });
+  await wset({ botPhase: 'CONFIRM' });
   await new Promise(r => chrome.runtime.sendMessage(
     { type: 'TARGET_CVV', cvv: cfg.cvv, confirm: true }, resp => r(resp)));
 }
@@ -892,12 +917,12 @@ async function runStore(store, cfg, burst) {
     // TEST MODE: the item is in the cart — STOP here. Proceeding to checkout on a logged-in
     // account with saved payment can run straight through to placing a real order, so Test never
     // clicks "Check out".
-    const { botTestMode: testCart } = await chrome.storage.local.get('botTestMode');
+    const { botTestMode: testCart } = await wget('botTestMode');
     if (testCart) {
       log('success', '🧪 TEST MODE — item is in the cart, NOT proceeding to checkout. No order placed.');
       showBigBanner('✓ ADDED TO CART', 'TEST MODE — stopped before checkout');
       setStatus('done', '🧪 Test passed — in cart, not ordered');
-      await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+      await wset({ botRunning: false, botPhase: 'IDLE' });
       chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
       return;
     }
@@ -916,12 +941,12 @@ async function runStore(store, cfg, burst) {
     const po = await waitForAny(S.placeOrder, 10000);
     if (!po) { log('warning', store.name + ': Place Order not ready — reloading...'); await sleep(1200); location.reload(); return; }
     // TEST MODE: everything ran for real, but DON'T submit — show the confirmation banner.
-    const { botTestMode } = await chrome.storage.local.get('botTestMode');
+    const { botTestMode } = await wget('botTestMode');
     if (botTestMode) {
       log('success', '🧪 TEST MODE — found Place Order, NOT submitting. Order would go through here.');
       showBigBanner('✓ ORDER CONFIRMED', 'TEST MODE — no real order was placed');
       setStatus('done', '🧪 Test passed — order NOT placed');
-      await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+      await wset({ botRunning: false, botPhase: 'IDLE' });
       chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
       return;
     }
@@ -938,7 +963,7 @@ async function runStore(store, cfg, burst) {
     setStatus('done', 'Order step complete');
     chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: store.name + ' order placed (please verify).' }).catch(() => {});
     if (cfg.stopOnSuccess) {
-      await chrome.storage.local.set({ botRunning: false, botPhase: 'IDLE' });
+      await wset({ botRunning: false, botPhase: 'IDLE' });
       chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
     }
     return;
@@ -1007,11 +1032,14 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function log(level, text) {
   console.log('[CheckoutBot][' + level + '] ' + text);
-  chrome.runtime.sendMessage({ type: 'BOT_LOG', level, text }).catch(() => {});
+  // Tag with this tab's window id so ONLY the owning window's panel shows it (per-window logs).
+  const wid = (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null;
+  chrome.runtime.sendMessage({ type: 'BOT_LOG', level, text, wid }).catch(() => {});
 }
 
 function setStatus(state, text) {
-  chrome.runtime.sendMessage({ type: 'BOT_STATUS', status: state, text }).catch(() => {});
+  const wid = (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null;
+  chrome.runtime.sendMessage({ type: 'BOT_STATUS', status: state, text, wid }).catch(() => {});
 }
 
 // Big full-screen confirmation banner drawn ON the page (used by Test mode). Self-contained
