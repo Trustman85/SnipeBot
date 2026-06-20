@@ -640,10 +640,12 @@ function startArm(target, leadMs, tz, testMode) {
   }, 50);
 }
 
-armBtn.addEventListener('click', () => {
-  if (dropInterval) { disarm(); dropStatusEl.textContent = 'Disarmed.'; return; }
+// Reads the time/lead/test fields and (re)arms the drop. Shared by the Arm button and by the
+// field listeners below, so changing the time/lead/test AFTER arming just updates the live
+// countdown instead of leaving it stuck on the old time. Returns false if no time is set.
+function armFromFields() {
   const v = document.getElementById('dropTime').value; // "HH:MM:SS" or "HH:MM"
-  if (!v) { dropStatusEl.textContent = 'Set a drop time first.'; return; }
+  if (!v) { dropStatusEl.textContent = 'Set a drop time first.'; addLog('error', 'Arm failed — set a drop time first'); return false; }
   const [hh, mm, ss = 0] = v.split(':').map(Number);
   const tz = tzSelect.value;
   const target = dropTimestamp(tz, hh, mm, ss);
@@ -651,13 +653,52 @@ armBtn.addEventListener('click', () => {
   const testMode = document.getElementById('armTest').checked;
   wset({ armState: { target, leadMs, tz, testMode } }); // persist so a reload restores it
   startArm(target, leadMs, tz, testMode);
+  // Confirm in the activity log so you can verify the drop is set correctly.
+  addLog('success', '🎯 Armed → ' + v + ' ' + (TZ_ABBR[tz] || '') + ' · ' + (leadMs / 1000) + 's early · ' + (testMode ? 'TEST (rehearse)' : 'REAL order'));
+  return true;
+}
+
+armBtn.addEventListener('click', () => {
+  if (dropInterval) { disarm(); dropStatusEl.textContent = 'Disarmed.'; addLog('warning', 'Disarmed'); return; }
+  armFromFields();
 });
 
-// As soon as a time is picked, close the native time picker and commit the value (blur), so you
-// don't have to click away — the chosen time lands in the field automatically.
-document.getElementById('dropTime').addEventListener('change', (e) => {
-  if (e.target.value) e.target.blur();
+// Time field behavior:
+//  • TYPING: don't blur on change — blurring mid-edit kicked focus out before the 2nd digit, so
+//    "11" collapsed to "01". A keydown flags that you're typing, so the change handler leaves focus
+//    alone and you can finish the segment (highlight + type "11" → "11", "1" → "01").
+//  • PICKER/SPINNER (no keystroke): close it automatically by blurring once a value is chosen.
+//  • RE-ARM: if a drop is already armed, re-arm to the new time when you finish editing (on blur,
+//    only if the value actually changed) — so changing your mind on the time just works.
+// Current time as "HH:MM:SS" in the chosen timezone — used to seed the picker at "now".
+function nowTimeInTz(tz) {
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const p = {}; for (const x of fmt.formatToParts(new Date())) p[x.type] = x.value;
+  return (p.hour === '24' ? '00' : p.hour) + ':' + p.minute + ':' + p.second;
+}
+const dropTimeEl = document.getElementById('dropTime');
+let dropTimeTyped = false, dropTimeAtFocus = '';
+// Reset the field to the CURRENT live time whenever you open it. Seeding on MOUSEDOWN runs BEFORE
+// the native picker opens, so the dropdown ITSELF starts at "now" (focus alone fired too late — the
+// picker had already captured the old value, so the field only updated after closing). focus also
+// seeds it to cover keyboard/tab entry.
+const seedDropNow = () => { dropTimeEl.value = nowTimeInTz(tzSelect.value); };
+dropTimeEl.addEventListener('mousedown', seedDropNow);
+dropTimeEl.addEventListener('focus', () => {
+  seedDropNow();
+  dropTimeAtFocus = dropTimeEl.value; dropTimeTyped = false;
 });
+dropTimeEl.addEventListener('keydown', () => { dropTimeTyped = true; });
+dropTimeEl.addEventListener('change', (e) => {
+  if (e.target.value && !dropTimeTyped) e.target.blur(); // picked from dropdown/spinner → close it
+  dropTimeTyped = false;                                 // reset for the next interaction
+});
+dropTimeEl.addEventListener('blur', () => {
+  if (dropInterval && dropTimeEl.value && dropTimeEl.value !== dropTimeAtFocus) armFromFields();
+});
+// Same for the lead-seconds and Test toggle: if armed, changing them updates the live countdown.
+document.getElementById('leadSec').addEventListener('change', () => { if (dropInterval) armFromFields(); });
+document.getElementById('armTest').addEventListener('change', () => { if (dropInterval) armFromFields(); });
 
 // ── Auto-detect item name/SKU from current tab ───────────────────────────────
 document.getElementById('useCurrentTab').addEventListener('change', async function () {
@@ -745,6 +786,9 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
     if (armState.target - Date.now() > -90000) {
       document.getElementById('armTest').checked = !!armState.testMode; // restore the Test toggle
       startArm(armState.target, armState.leadMs, armState.tz, armState.testMode);
+      const t = new Date(armState.target).toLocaleTimeString('en-US', { hour12: false, timeZone: armState.tz });
+      dropTimeEl.value = t; // show the armed time on restore (resets to "now" next time you open the picker)
+      addLog('info', '🎯 Arm restored → ' + t + ' ' + (TZ_ABBR[armState.tz] || '') + ' · still counting down');
     } else {
       wremove('armState');
     }
