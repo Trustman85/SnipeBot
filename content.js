@@ -2,12 +2,16 @@
 // Per-window keys are stored as "w<windowId>:<key>" (background stamped window.__BOT_WID before
 // injecting us). NS_ON is the shared kill-switch — popup.js, background.js and content.js must ALL
 // agree. false = old global single-window behavior (Step 4a); true = per-window isolation (Step 4b).
-const NS_ON = true;
-const PW_KEYS = new Set(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'currentTabId',
+// Declared with var/function (NOT const) so a re-injection into an ALREADY-INJECTED world doesn't
+// throw "already declared" and abort the whole script. SPA route changes (Sam's "View Cart",
+// Target's Buy-now drawer, etc.) keep the SAME document, so the content script re-runs in the SAME
+// world — const would crash on the 2nd run and the bot would silently stall.
+var NS_ON = true;
+var PW_KEYS = new Set(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'currentTabId',
   'botTestMode', 'botRunToken', 'burstUntil', 'queueSince', 'qtyDone', 'samsFellBack', 'addAttempts',
   'pokePlaceRetries', 'armState']);
-const _wid = () => (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null;
-const nsk = (key) => (NS_ON && _wid() != null && PW_KEYS.has(key)) ? ('w' + _wid() + ':' + key) : key;
+function _wid() { return (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null; }
+function nsk(key) { return (NS_ON && _wid() != null && PW_KEYS.has(key)) ? ('w' + _wid() + ':' + key) : key; }
 // Wrappers that auto-namespace ONLY per-window keys (global keys pass through); return original names.
 function wget(keys) {
   const arr = Array.isArray(keys) ? keys : [keys];
@@ -51,21 +55,10 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
     const page = window.location.pathname;
 
     // ── CAPTCHA / bot challenge ────────────────────────────────────
-    // The bot can't solve these — alert the human (sound + notification) and WAIT for it
-    // to be cleared (don't reload, which can make it worse). Resume once it's gone.
-    if (isStore && detectCaptcha()) {
-      log('error', '🛑 CAPTCHA / verification detected — SOLVE IT in the page! (alerting you)');
-      setStatus('error', '🛑 CAPTCHA — solve it!');
-      chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'captcha', text: 'A CAPTCHA/verification is blocking the bot — solve it in the page.' }).catch(() => {});
-      let buzzed = 0;
-      while (detectCaptcha()) {
-        await sleep(2500);
-        if (++buzzed % 6 === 0) chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'captcha', text: 'Still waiting on the CAPTCHA…' }).catch(() => {});
-        const st = await wget('botRunning');
-        if (!st.botRunning) return;
-      }
-      log('success', 'CAPTCHA cleared — continuing');
-    }
+    // The bot can't solve these — pause, alert the human repeatedly, and WAIT for it to be
+    // cleared (don't reload, which can make it worse). Resume once it's gone. Also checked
+    // mid-checkout below, since press-and-hold / DataDome often appear AFTER a click.
+    if (isStore && !(await awaitCaptchaClear('page'))) return;
 
     // ── High-demand QUEUE / waiting room ───────────────────────────
     // If the site put us in a waiting line, WAIT it out — do NOT reload (that can lose
@@ -179,6 +172,15 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
       log('info', 'Checking shipping selection...');
       await selectShipping();
       await selectVariant(); // pick a Style if the item has variants and none is chosen
+      // Sam's shows an "Add to list" / "Members also considered" carousel "Add" even when the MAIN
+      // item is Not Available — so trusting a button alone makes the bot click a dead-end and loop on
+      // the missing View Cart. Check the real stock (schema.org / availabilityStatus in the SSR'd
+      // page) FIRST; if out of stock, WATCH for the restock instead of clicking a phantom Add.
+      if (samsPageOutOfStock()) {
+        log('warning', 'Out of stock (page: Not available) — watching for restock…');
+        setStatus('running', 'Out of stock — watching…');
+        await watchStockHtml(location.href.split('#')[0], interval, burst); return;
+      }
     }
 
     log('info', burst ? '⚡ Burst: checking if live...' : 'Looking for Add to Cart button...');
@@ -202,6 +204,10 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
           return;
         }
       }
+      // Sam's: WATCH the page HTML (schema.org availability) instead of reloading every cycle — poll
+      // until it flips to InStock, then reload ONCE to get the live Add to Cart button. (The localhost
+      // demo has no such markup, so it just reloads.)
+      if (isSams) { await watchStockHtml(location.href.split('#')[0], interval, burst); return; }
       // Burst: reload almost immediately to catch the live moment. Normal: wait the interval.
       const reloadDelay = burst ? 150 : (interval * 1000);
       if (burst) {
@@ -235,6 +241,17 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
     log('info', 'Add to Cart clicked — waiting for confirmation...');
 
     if (isSams) {
+      // VERIFY it actually added. During a drop the first click is often dropped, so if the "View
+      // Cart" confirmation doesn't show, re-click Add to Cart — but ONLY while it's confirmed NOT
+      // added (View Cart absent AND the Add button still present), so we can never double-add.
+      for (let t = 1; t <= 3; t++) {
+        const added = await findBtn(['viewcart', 'viewbag', 'gotocart', 'viewmycart'], 1800);
+        if (added) break;                        // confirmation shown → it added ✓
+        const again = await waitForSamsBtn('[data-automation-id="atc"], [data-dca-event="addToCart"]', 400);
+        if (!again) break;                        // Add button gone (added, or now OOS) → let the flow handle it
+        log('warning', 'Add to Cart didn’t confirm — clicking it again (try ' + (t + 1) + ')…');
+        again.click();
+      }
       await wset({ botPhase: 'ADDED' });
       await waitForViewCart(botConfig, isSams);
     } else {
@@ -272,7 +289,21 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
     log('success', 'Found checkout button: "' + btn.textContent.trim().substring(0, 40) + '"');
     log('info', 'Clicking checkout...');
     await wset({ botPhase: 'CHECKOUT' });
+    const cartUrl = location.href;
     btn.click();
+    if (isSams) {
+      // VERIFY we left the cart. If the click was dropped (still on /cart with the button present),
+      // re-click — bounded, and only while confirmed NOT advanced, so it can't misfire.
+      for (let t = 1; t <= 3; t++) {
+        let advanced = false;
+        for (let j = 0; j < 8; j++) { await sleep(250); if (location.href !== cartUrl || !/\/cart\b/.test(location.pathname)) { advanced = true; break; } }
+        if (advanced) break;
+        const again = await waitForSamsBtn('[data-automation-id="checkout"]', 400);
+        if (!again) break;
+        log('warning', 'Checkout didn’t advance — clicking it again (try ' + (t + 1) + ')…');
+        again.click();
+      }
+    }
   }
 
   // ── PHASE: CHECKOUT ────────────────────────────────────────────
@@ -526,9 +557,163 @@ async function setQuantity(qty) {
 
 // Detects a CAPTCHA / "verify you are human" / bot-challenge page (cross-store)
 function detectCaptcha() {
-  if (document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[title*="captcha" i], #px-captcha, [id*="px-captcha"], [class*="captcha" i], [id*="captcha" i], [data-testid*="captcha" i], [aria-label*="captcha" i]')) return true;
+  // Known anti-bot / human-verification widgets by their iframe/element fingerprints:
+  //  reCAPTCHA, hCaptcha, PerimeterX press-and-hold (#px-captcha), DataDome (geo.captcha-delivery),
+  //  Cloudflare Turnstile (challenges.cloudflare.com), Arkose/FunCaptcha, Akamai bot-manager.
+  if (document.querySelector([
+    'iframe[src*="recaptcha"]', 'iframe[src*="hcaptcha"]', 'iframe[title*="captcha" i]',
+    'iframe[src*="geo.captcha-delivery.com"]', 'iframe[src*="challenges.cloudflare.com"]',
+    'iframe[src*="arkoselabs"]', 'iframe[src*="funcaptcha"]', 'iframe[src*="/fc/"]',
+    '#px-captcha', '[id*="px-captcha"]', '[class*="datadome" i]', '[id*="datadome" i]',
+    '.cf-turnstile', '[class*="captcha" i]', '[id*="captcha" i]',
+    '[data-testid*="captcha" i]', '[aria-label*="captcha" i]', '[aria-label*="press & hold" i]'
+  ].join(', '))) return true;
   const t = (document.body && document.body.innerText || '').toLowerCase();
-  return /are you a human|verify (?:you(?:'| a)?re|that you are) (?:a )?human|i'?m not a robot|complete the (?:captcha|security check)|press (?:and|&) hold|unusual traffic|confirm you(?:'| a)?re human|enter the characters|verify your identity|security check to access/.test(t);
+  return /are you a human|verify (?:you(?:'| a)?re|that you are) (?:a )?human|i'?m not a robot|complete the (?:captcha|security check)|press (?:and|&) hold|(?:slide|drag) (?:to |the )|unusual traffic|confirm you(?:'| a)?re human|enter the characters|verify your identity|security check to access|checking your browser|activity from your (?:computer|device|network)/.test(t);
+}
+
+// Pause the bot on a CAPTCHA / bot challenge and WAIT for the human to clear it — the bot can't (and
+// shouldn't) solve these. Alerts REPEATEDLY (sound + panel) every cycle so it can't be missed, does
+// NOT reload (reloading a challenge can make it worse / reset it), and resumes the instant it's gone.
+// `tag` marks where it triggered (e.g. 'checkout'). Returns true when clear to continue, false if the
+// bot was stopped while waiting. Safe to call anywhere in the flow — it's a no-op when no challenge.
+async function awaitCaptchaClear(tag) {
+  if (!detectCaptcha()) return true;
+  const where = tag ? ' (' + tag + ')' : '';
+  log('error', '🛑 CAPTCHA / verification detected' + where + ' — SOLVE IT in the page! (alerting you)');
+  setStatus('error', '🛑 CAPTCHA — solve it!');
+  let cycles = 0;
+  while (detectCaptcha()) {
+    // Re-alert EVERY cycle so it keeps buzzing until you clear it (multi-time alert).
+    chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'captcha',
+      text: cycles === 0 ? 'A CAPTCHA/verification is blocking the bot — solve it in the page.'
+                         : 'Still waiting on the CAPTCHA — solve it! (' + (cycles * 2) + 's)' }).catch(() => {});
+    cycles++;
+    await sleep(2000);
+    const st = await wget('botRunning');
+    if (!st.botRunning) return false; // user stopped while waiting
+  }
+  log('success', 'CAPTCHA cleared — continuing');
+  chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: 'CAPTCHA cleared — resuming checkout.' }).catch(() => {});
+  return true;
+}
+
+// Detects a page-level ERROR that warrants a REFRESH (vs. a clickable button we should push
+// through): site overloaded / "something went wrong" / item-not-found pages that show up when a
+// drop site is hammered. Out-of-stock is handled separately via the DISABLED action button, so it
+// is intentionally NOT matched here. Returns a short reason string, or null if the page looks fine.
+function detectStoreError() {
+  const t = (document.body && document.body.innerText || '').toLowerCase();
+  if (!t) return null;
+  // Overload / server error pages — STRONG signals only (generic phrases like "try again" appear on
+  // normal/checkout pages and caused false refreshes away from a working checkout).
+  if (/something went wrong|we'?re having (?:some )?(?:trouble|technical) (?:issue|problem|difficult)|high (?:traffic|demand)|too many requests|temporarily unavailable|service (?:is )?unavailable|site is (?:busy|down)|server error|http 5\d\d|error 5\d\d/.test(t)) return 'site overloaded/error';
+  // Item / page not found
+  if (/this (?:item|product) is (?:no longer|not|currently un)available|sorry, this item|page (?:you'?re looking for )?(?:not found|isn'?t available)/.test(t)) return 'item not available';
+  return null;
+}
+
+// Spam-click a selector (TRUSTED click for stores that need it, else DOM) until the step ADVANCES
+// (URL changes, or the button is consumed/disabled) or a page error appears. Returns
+// 'advanced' | 'error' | 'timeout'. The DOM fallback only fires on an ENABLED button and we stop the
+// moment the button is gone/disabled — so spamming even a final "Place order" can't place a 2nd order.
+async function spamClickSel(sel, store, opts) {
+  const tries = (opts && opts.tries) || 10, gap = (opts && opts.gap) || 300;
+  const gone = (el) => !el || el.disabled || el.getAttribute('aria-disabled') === 'true';
+  const startUrl = location.href;
+  for (let i = 0; i < tries; i++) {
+    if (store.trustedClick) {
+      const ok = await trustedClickSel(sel);
+      if (!ok) { const b = document.querySelector(sel); if (b && !gone(b)) b.click(); }
+    } else {
+      const b = document.querySelector(sel); if (b && !gone(b)) b.click();
+    }
+    await sleep(gap);
+    if (location.href !== startUrl) return 'advanced';            // navigated to the next step
+    if (gone(document.querySelector(sel))) return 'advanced';     // button consumed → moved on
+    if (detectStoreError()) return 'error';                       // overload/error → caller refreshes
+  }
+  return 'timeout';
+}
+
+// Spam-click a KNOWN element until the step advances (URL changes or the element leaves the DOM /
+// disables) or a page error appears. For the Sam's / localhost phase machine, which already holds
+// the resolved button element. Stops on advance so it can't over-submit.
+async function spamClickEl(el, opts) {
+  const tries = (opts && opts.tries) || 10, gap = (opts && opts.gap) || 250;
+  const gone = (e) => !e || e.disabled || e.getAttribute('aria-disabled') === 'true' || !document.contains(e);
+  const startUrl = location.href;
+  for (let i = 0; i < tries; i++) {
+    if (gone(el)) return 'advanced';
+    el.click();
+    await sleep(gap);
+    if (location.href !== startUrl) return 'advanced';
+    if (gone(el)) return 'advanced';
+    if (detectStoreError()) return 'error';
+  }
+  return 'timeout';
+}
+
+// Target restock watcher — polls the stock API instead of reloading the page each cycle. Stays put
+// and only reloads ONCE when the item flips to IN_STOCK (so the live Buy now / Add to cart button
+// appears and the spam-click grabs it). This turns ~2s-per-reload detection into ~sub-second. Polls
+// are throttled (min 500ms) so we don't trip Target's rate limiting. Falls back to a page reload if
+// the API errors or gets throttled.
+async function watchTargetStock(tcin, interval, burst) {
+  const pollMs = Math.max(500, (burst ? 0.5 : (parseFloat(interval) || 2)) * 1000);
+  log('info', '⚡ Watching stock via API (' + tcin + ', every ' + Math.round(pollMs) + 'ms) — no reloads until it drops.');
+  for (let i = 0; ; i++) {
+    const st = await wget('botRunning');
+    if (!st.botRunning) return; // stopped by the user
+    const r = await new Promise(res => chrome.runtime.sendMessage({ type: 'STOCK_POLL', tcin }, resp => res(resp || {})));
+    const inStock = r.ok && (r.avail === 'IN_STOCK' || r.avail === 'LIMITED_STOCK' || (typeof r.qty === 'number' && r.qty > 0));
+    if (inStock) {
+      log('success', '⚡ IN STOCK (' + r.avail + (r.qty != null ? ', qty ' + r.qty : '') + ') — reloading to grab it!');
+      location.reload(); return;
+    }
+    if (!r.ok || r.status === 'ERR' || (r.status && r.status !== 200)) {
+      log('warning', '⚡ stock API ' + (r.status || 'unavailable') + ' — falling back to a page reload.');
+      await sleep(pollMs); location.reload(); return;
+    }
+    if (i % 15 === 0) log('info', '⚡ ' + tcin + ' still ' + (r.avail || 'OOS') + ' — watching…');
+    await sleep(pollMs);
+  }
+}
+
+// Reads the CURRENT Sam's page's SSR'd availability (no fetch) to decide if the MAIN product is
+// out of stock — used to avoid clicking a phantom "Add to list"/carousel Add on a Not Available item.
+// schema.org markup is for the main product only, so it's the cleanest signal.
+function samsPageOutOfStock() {
+  const html = (document.documentElement && document.documentElement.outerHTML) || '';
+  if (/schema\.org\/InStock/i.test(html)) return false;    // explicitly in stock
+  if (/schema\.org\/OutOfStock/i.test(html)) return true;   // explicitly out of stock
+  const m = html.match(/"availabilityStatus"\s*:\s*"([^"]+)"/);
+  if (m && /OUT_OF_STOCK|NOT_AVAILABLE|UNAVAILABLE/i.test(m[1])) return true;
+  return false; // unknown → let the button logic proceed (don't get stuck watching a stockable item)
+}
+
+// Stock watcher for stores that SSR availability into the page HTML (Sam's/Walmart GLASS). Instead
+// of reloading the whole page each cycle, it fetches the product URL's HTML (via background, in the
+// page context) and checks the schema.org / availabilityStatus signal, reloading ONCE only when the
+// item flips to InStock. Falls back to a normal reload on any error/throttle.
+async function watchStockHtml(url, interval, burst) {
+  const pollMs = Math.max(700, (burst ? 0.6 : (parseFloat(interval) || 2)) * 1000);
+  log('info', '⚡ Watching stock via page HTML (every ' + Math.round(pollMs) + 'ms) — no reloads until it drops.');
+  for (let i = 0; ; i++) {
+    const st = await wget('botRunning');
+    if (!st.botRunning) return; // stopped by the user
+    const r = await new Promise(res => chrome.runtime.sendMessage({ type: 'HTML_STOCK_POLL', url }, resp => res(resp || {})));
+    if (r.ok && r.inStock) {
+      log('success', '⚡ IN STOCK (' + r.status + ') — reloading to grab it!');
+      location.reload(); return;
+    }
+    if (!r.ok || r.status === 'ERR' || (typeof r.status === 'number' && r.status !== 200)) {
+      log('warning', '⚡ stock check ' + (r.status || 'failed') + ' — falling back to a page reload.');
+      await sleep(pollMs); location.reload(); return;
+    }
+    if (i % 12 === 0) log('info', '⚡ still ' + (r.status || 'OOS') + ' — watching…');
+    await sleep(pollMs);
+  }
 }
 
 // ── Generic store flow (scaffold) ──────────────────────────────────────────────
@@ -572,8 +757,20 @@ function fillGeneric(el, val) {
 // Sets a <select> quantity dropdown (Target) to qty. Native selects commit on a bubbling
 // 'change' event, which React's onChange picks up.
 async function storeSetQtySelect(S, qty) {
-  const sel = await waitForAny(S.qtySelect, 6000);
-  if (!sel) { log('warning', 'Quantity dropdown not found'); return false; }
+  // Short wait: the dropdown (if this item has one) is in the DOM almost immediately. Items that use
+  // a +/- stepper instead (e.g. some Target grocery items) don't have it, so don't burn 6s here.
+  const sel = await waitForAny(S.qtySelect, 1500);
+  if (!sel) {
+    log('warning', 'Quantity dropdown not found');
+    // Diagnostic: dump the quantity-ish controls on the page so we can pin the right selector.
+    try {
+      const els = [...document.querySelectorAll('[data-test*="qty" i],[data-test*="quantity" i],[aria-label*="quantity" i],select,input[type="number"]')].slice(0, 8);
+      log('info', els.length
+        ? 'qty controls: ' + els.map(e => '<' + e.tagName.toLowerCase() + ' data-test="' + (e.getAttribute('data-test') || '') + '" aria="' + (e.getAttribute('aria-label') || '').slice(0, 24) + '">').join('  ')
+        : 'no qty control on this page — quantity is likely set in the Buy-now checkout drawer, not the product page');
+    } catch (_) {}
+    return false;
+  }
   if (parseInt(sel.value) === qty) { log('info', 'Quantity already ' + qty); return true; }
   // Only pick a value the dropdown actually offers (Target caps at 10)
   if (!Array.from(sel.options).some(o => o.value === String(qty))) {
@@ -594,7 +791,8 @@ async function storeSetQty(S, qty) {
 }
 // Pokémon Center payment screen. Step 1 (this build): pick Credit/Debit Card and set the
 // expiry selects. Card# and CVV (secure CyberSource iframes) + Place Order come next via CDP.
-async function pokemonCheckout(S, cfg) {
+async function pokemonCheckout(store, cfg) {
+  const S = store.sel;
   setStatus('running', 'Pokémon: payment...');
 
   // The /checkout/address step (shipping) comes BEFORE payment. If the address is already
@@ -637,7 +835,7 @@ async function pokemonCheckout(S, cfg) {
     if (po) {
       // TEST MODE: everything ran for real up to here, but DON'T actually submit the order.
       // Show a big confirmation banner and stop, so you can verify the full flow safely.
-      const { botTestMode } = await wget('botTestMode');
+      const botTestMode = (cfg && cfg.testMode) || (await wget('botTestMode')).botTestMode;
       if (botTestMode) {
         log('success', '🧪 TEST MODE — found Place Order, NOT submitting. Order would go through here.');
         showBigBanner('✓ ORDER CONFIRMED', 'TEST MODE — no real order was placed');
@@ -646,6 +844,8 @@ async function pokemonCheckout(S, cfg) {
         chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
         return;
       }
+      // A bot challenge can gate the final submit — pause & alert you to clear it, then place it.
+      if (!(await awaitCaptchaClear('pokemon checkout'))) return;
       log('success', 'Placing order: "' + (po.textContent || '').trim().substring(0, 40) + '"');
       await wset({ botPhase: 'CONFIRM' });
       po.click();
@@ -773,6 +973,11 @@ async function buyNowDrawerCheckout(store, cfg) {
   await new Promise(r => chrome.runtime.sendMessage(
     { type: 'PLACE_ORDER_FRAMES', selectors: [S.placeOrder], keywords: kw, click: true }, resp => r(resp)));
 
+  // A bot challenge (press-and-hold / DataDome) often fires right after this click — pause &
+  // alert you to clear it, then resume, before we go looking for the CVV sidebar.
+  await sleep(500);
+  if (!(await awaitCaptchaClear('after place-order'))) return;
+
   // Target re-asks for the CVV even with saved payment. Fill #enter-cvv (in its iframe), poll
   // while the sidebar renders, then click Confirm → final submit (the charge).
   log('info', 'Waiting for CVV confirmation sidebar...');
@@ -822,9 +1027,7 @@ async function runStore(store, cfg, burst) {
       await buyNowDrawerCheckout(store, cfg); return;
     }
     // Set quantity ON THE PRODUCT PAGE (must happen BEFORE Buy now uses it):
-    //  • qtySelect → <select> dropdown (Target)
-    //  • qtyInc    → +/- stepper buttons
-    //  • qtyInput  → cart-page number box (Pokémon) → handled later, not here
+    //  • qtySelect → <select> dropdown (Target)   • qtyInput → cart-page box (handled later, not here)
     if (wantQty > 1) {
       if (S.qtySelect)      await storeSetQtySelect(S, wantQty);
       else if (!S.qtyInput) await storeSetQty(S, wantQty);
@@ -860,17 +1063,25 @@ async function runStore(store, cfg, burst) {
       addBtn = buyNowEl || document.querySelector(S.addToCart);
       clickSel = usingBuyNow ? S.buyNow : S.addToCart;
     }
-    // OUT OF STOCK: the "Add to cart"/"Buy now" button is present but DISABLED (greyed out). Treat
-    // that exactly like "not available" and keep refreshing — do NOT click it (a disabled click is
-    // a no-op, and proceeding would wrongly open the empty cart). When it restocks the button goes
-    // enabled and we click it.
+    // REFRESH only when the page genuinely can't proceed: a real error/overload page, OR no
+    // clickable action button (out of stock = present-but-DISABLED, or not rendered). A disabled
+    // click is a no-op and would wrongly open an empty cart, so we reload and watch for the restock.
     const isDisabled = (el) => !el || el.disabled || el.getAttribute('aria-disabled') === 'true';
-    if (!addBtn || isDisabled(addBtn)) {
+    const errNow = detectStoreError();
+    if (errNow || !addBtn || isDisabled(addBtn)) {
+      // TARGET FAST WATCH: instead of reloading the whole page (~2s) every cycle, poll Target's stock
+      // API (~150ms) and only reload ONCE when it flips to IN_STOCK — then the live button appears and
+      // the spam-click grabs it. Falls back to a normal reload on an error page or API hiccup.
+      if (store.key === 'target' && !errNow) {
+        const tcin = (location.pathname.match(/\/A-(\d+)/) || [])[1];
+        if (tcin) { await watchTargetStock(tcin, interval, burst); return; }
+      }
       const delay = burst ? 150 : interval * 1000;
-      const why = !addBtn ? 'not available' : 'out of stock';
-      log('warning', burst ? '⚡ burst reloading…' : why + ' — refreshing…');
+      const why = errNow || (!addBtn ? 'not available' : 'out of stock');
+      log('warning', (burst ? '⚡ ' : '') + why + (burst ? ' — burst reloading…' : ' — refreshing…'));
       await sleep(delay); location.reload(); return;
     }
+
     log('success', usingBuyNow ? 'Buy now — opening checkout drawer...' : 'Adding to cart...');
     if (store.trustedClick) {
       const ok = await trustedClickSel(clickSel);
@@ -922,7 +1133,7 @@ async function runStore(store, cfg, burst) {
     // TEST MODE: the item is in the cart — STOP here. Proceeding to checkout on a logged-in
     // account with saved payment can run straight through to placing a real order, so Test never
     // clicks "Check out".
-    const { botTestMode: testCart } = await wget('botTestMode');
+    const testCart = (cfg && cfg.testMode) || (await wget('botTestMode')).botTestMode;
     if (testCart) {
       log('success', '🧪 TEST MODE — item is in the cart, NOT proceeding to checkout. No order placed.');
       showBigBanner('✓ ADDED TO CART', 'TEST MODE — stopped before checkout');
@@ -936,7 +1147,7 @@ async function runStore(store, cfg, burst) {
 
   if (phase === 'CHECKOUT') {
     // Pokémon Center has its own payment screen (dropdown + secure card iframes)
-    if (store.key === 'pokemoncenter') { await pokemonCheckout(S, cfg); return; }
+    if (store.key === 'pokemoncenter') { await pokemonCheckout(store, cfg); return; }
     // Target: whether we got here via Buy now OR the cart route, finish through the SAME handler
     // (all-frames "Place your order" → CVV → Confirm) which STOPS in Test mode before submitting.
     if (store.key === 'target') { await buyNowDrawerCheckout(store, cfg); return; }
@@ -946,7 +1157,7 @@ async function runStore(store, cfg, burst) {
     const po = await waitForAny(S.placeOrder, 10000);
     if (!po) { log('warning', store.name + ': Place Order not ready — reloading...'); await sleep(1200); location.reload(); return; }
     // TEST MODE: everything ran for real, but DON'T submit — show the confirmation banner.
-    const { botTestMode } = await wget('botTestMode');
+    const botTestMode = (cfg && cfg.testMode) || (await wget('botTestMode')).botTestMode;
     if (botTestMode) {
       log('success', '🧪 TEST MODE — found Place Order, NOT submitting. Order would go through here.');
       showBigBanner('✓ ORDER CONFIRMED', 'TEST MODE — no real order was placed');
@@ -955,6 +1166,8 @@ async function runStore(store, cfg, burst) {
       chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
       return;
     }
+    // A bot challenge can gate the final submit — pause & alert to clear it, then place the order.
+    if (!(await awaitCaptchaClear('checkout'))) return;
     log('success', 'Placing order...');
     if (store.trustedClick) {
       const ok = await trustedClickSel(S.placeOrder);

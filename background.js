@@ -173,6 +173,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Target CVV-confirm sidebar (in an iframe): fill #enter-cvv, optionally click Confirm
   if (msg.type === 'TARGET_CVV') { targetCvvInFrames(sender.tab?.id, msg).then(r => sendResponse(r)); return true; }
 
+  // READ-ONLY diagnostic: probe Target's stock endpoints and auto-find the availability field.
+  if (msg.type === 'STOCK_TEST') { targetStockTest(msg).then(r => sendResponse(r)); return true; }
+
+  // Fast stock check: fetch Target's product_fulfillment_v1 (in the page context, since Target blocks
+  // the background's own fetch) and return the shipping availability. Used by the restock watcher.
+  if (msg.type === 'STOCK_POLL') { targetStockPoll(sender.tab?.id, msg.tcin).then(r => sendResponse(r)); return true; }
+
+  // Fast stock check for stores that SSR availability into the page HTML (Sam's/Walmart GLASS):
+  // fetch the product URL and read the schema.org / availabilityStatus signal. Used by the watcher.
+  if (msg.type === 'HTML_STOCK_POLL') { htmlStockPoll(sender.tab?.id, msg.url).then(r => sendResponse(r)); return true; }
+
   // NOTE: BOT_LOG / BOT_STATUS / BOT_DONE are NOT relayed here — the side panel
   // receives them directly from content.js. Relaying caused every log to appear twice.
 });
@@ -180,6 +191,53 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // Fills the CVV and clicks Place Order using the Chrome DevTools Protocol (chrome.debugger).
 // CDP dispatches REAL, trusted browser-level input — indistinguishable from a human — so
 // React Aria commits the value to its state every time (synthetic DOM events did not).
+// Detect a CAPTCHA / bot challenge in a tab (for CDP-driven flows that don't run the content-script
+// loop). Mirrors content.js detectCaptcha — covers reCAPTCHA/hCaptcha/PerimeterX press-and-hold/
+// DataDome/Cloudflare Turnstile/Arkose + text signals. Returns true if a challenge is on the page.
+async function pageHasCaptcha(tabId) {
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        if (document.querySelector([
+          'iframe[src*="recaptcha"]', 'iframe[src*="hcaptcha"]', 'iframe[title*="captcha" i]',
+          'iframe[src*="geo.captcha-delivery.com"]', 'iframe[src*="challenges.cloudflare.com"]',
+          'iframe[src*="arkoselabs"]', 'iframe[src*="funcaptcha"]',
+          '#px-captcha', '[id*="px-captcha"]', '[class*="datadome" i]', '[id*="datadome" i]',
+          '.cf-turnstile', '[class*="captcha" i]', '[id*="captcha" i]',
+          '[data-testid*="captcha" i]', '[aria-label*="press & hold" i]'
+        ].join(', '))) return true;
+        const t = (document.body && document.body.innerText || '').toLowerCase();
+        return /are you a human|verify (?:you(?:'| a)?re|that you are) (?:a )?human|i'?m not a robot|press (?:and|&) hold|(?:slide|drag) (?:to |the )|unusual traffic|confirm you(?:'| a)?re human|checking your browser|activity from your (?:computer|device|network)/.test(t);
+      }
+    });
+    return !!result;
+  } catch (_) { return false; }
+}
+
+// Pause a CDP flow on a bot challenge and WAIT for the human to clear it, alerting REPEATEDLY
+// (sound + notification) every 2s so it can't be missed. Returns true when clear to continue,
+// false if the bot was stopped while waiting. No-op when there's no challenge.
+async function awaitCaptchaClearBg(tabId, wid, tag) {
+  if (!(await pageHasCaptcha(tabId))) return true;
+  const log = (lvl, txt) => logWin(wid, lvl, txt);
+  log('error', '🛑 CAPTCHA / verification detected (' + tag + ') — SOLVE IT in the page! (alerting you)');
+  chrome.runtime.sendMessage({ type: 'BOT_STATUS', status: 'error', text: '🛑 CAPTCHA — solve it!', wid }).catch(() => {});
+  let cycles = 0;
+  while (await pageHasCaptcha(tabId)) {
+    handleAlert('captcha', cycles === 0
+      ? 'A CAPTCHA/verification is blocking the bot — solve it in the page.'
+      : 'Still waiting on the CAPTCHA — solve it! (' + (cycles * 2) + 's)');
+    cycles++;
+    await sleep(2000);
+    const { botRunning } = await wgetTab(tabId, ['botRunning']);
+    if (!botRunning) return false; // user stopped while waiting
+  }
+  log('success', 'CAPTCHA cleared — continuing');
+  handleAlert('success', 'CAPTCHA cleared — resuming checkout.');
+  return true;
+}
+
 async function samsCheckout(tabId, cvv) {
   const wid = await widForTab(tabId);
   const log = (lvl, txt) => logWin(wid, lvl, txt); // route this op's logs to its window's panel
@@ -206,6 +264,14 @@ async function samsCheckout(tabId, cvv) {
       log('info', 'No CVV field — saved card needs no CVV, placing order directly');
     }
 
+    // A bot challenge can gate the checkout page before we submit — pause & alert you to clear
+    // it (detaching the debugger so it doesn't interfere), then re-attach and continue.
+    if (await pageHasCaptcha(tabId)) {
+      try { await chrome.debugger.detach(dbg); } catch (_) {}
+      if (!(await awaitCaptchaClearBg(tabId, wid, 'sams checkout'))) return; // stopped while waiting
+      try { await chrome.debugger.attach(dbg, '1.3'); } catch (_) {}
+    }
+
     // 2. Click Place Order (real CDP click) — works whether or not a CVV was needed.
     //    If the button isn't there yet, reload and retry (keep pushing).
     const btnPt = await waitPoint(tabId, btnExpr, 12000);
@@ -218,19 +284,41 @@ async function samsCheckout(tabId, cvv) {
     await cdpClick(dbg, btnPt.x, btnPt.y);
     log('info', 'Place Order clicked via CDP');
 
-    // 3. Check the outcome. If a validation/error banner appears, the order did NOT go
-    //    through (no charge) — reload and retry. If it navigated away, it succeeded.
-    await sleep(2500);
-    const [{ result: failed }] = await chrome.scripting.executeScript({
-      target: { tabId }, world: 'MAIN',
-      func: () => /checkout|review-order/.test(location.pathname) &&
-                  /please correct the errors|enter the 3 digit|something went wrong|try again/i.test(document.body.innerText || '')
-    });
-    if (failed) {
-      log('warning', 'Order not placed (page shows an error) — reloading to retry...');
+    // Sam's sometimes throws a press-and-hold / DataDome challenge right AFTER the place-order
+    // click. Pause & alert you to clear it before we verify the order went through.
+    await sleep(600);
+    if (await pageHasCaptcha(tabId)) {
       try { await chrome.debugger.detach(dbg); } catch (_) {}
-      chrome.tabs.reload(tabId);
-      return;
+      if (!(await awaitCaptchaClearBg(tabId, wid, 'sams after place-order'))) return;
+      try { await chrome.debugger.attach(dbg, '1.3'); } catch (_) {}
+    }
+
+    // 3. VERIFY the order went through, and RE-CLICK if a drop dropped the click. Poll for the page
+    //    to leave the checkout/review path (= placed). Still on checkout with NO error → the click
+    //    didn't register → re-click. We only re-click while it's confirmed NOT submitted (still on
+    //    checkout + button present), so we can never double-order. Error banner → not placed → reload.
+    let placed = false;
+    for (let t = 0; t < 3 && !placed; t++) {
+      await sleep(2200);
+      const [{ result: state }] = await chrome.scripting.executeScript({
+        target: { tabId }, world: 'MAIN',
+        func: () => ({
+          onCheckout: /checkout|review-order/.test(location.pathname),
+          failed: /please correct the errors|enter the 3 digit|something went wrong|try again/i.test(document.body.innerText || '')
+        })
+      });
+      if (!state.onCheckout) { placed = true; break; }         // left checkout → order placed ✓
+      if (state.failed) {                                       // error banner → not placed → reload & retry
+        log('warning', 'Order not placed (page shows an error) — reloading to retry...');
+        try { await chrome.debugger.detach(dbg); } catch (_) {}
+        chrome.tabs.reload(tabId);
+        return;
+      }
+      // Still on checkout, no error → the click was dropped. Re-click ONLY if the button is still there.
+      const btnPt2 = await waitPoint(tabId, btnExpr, 800);
+      if (!btnPt2) break;
+      log('warning', 'Place Order didn’t advance — clicking it again (try ' + (t + 2) + ')...');
+      await cdpClick(dbg, btnPt2.x, btnPt2.y);
     }
   } catch (e) {
     log('error', 'CDP checkout error: ' + e.message);
@@ -617,19 +705,126 @@ function handleAlert(kind, text) {
     fail:    '❌ Order problem',
     stuck:   '⏳ Bot needs attention',
   };
+  // Any non-captcha alert (e.g. the "cleared — resuming" success) dismisses the lingering
+  // press-and-hold/captcha banner so it doesn't stay pinned on screen.
+  if (kind !== 'captcha') { try { chrome.notifications.clear('bot-captcha'); } catch (_) {} }
   try {
-    chrome.notifications.create('bot-' + kind + '-' + Date.now(), {
+    // A repeating captcha alert reuses ONE stable id so the notification refreshes in place
+    // (updated countdown text) instead of stacking dozens of banners; others stay unique.
+    const nid = kind === 'captcha' ? 'bot-captcha' : ('bot-' + kind + '-' + Date.now());
+    chrome.notifications.create(nid, {
       type: 'basic', iconUrl: ICON_DATA_URL,
       title: titles[kind] || 'SnipeBot', message: text || '',
       priority: 2, requireInteraction: kind === 'captcha',
     });
   } catch (_) {}
-  // Popup/side panel plays the sound (service workers can't play audio)
+  // Popup/side panel plays the sound (service workers can't play audio). Fired on EVERY alert,
+  // so a repeating captcha alert keeps buzzing until it's cleared.
   chrome.runtime.sendMessage({ type: 'PLAY_SOUND', kind }).catch(() => {});
 }
 
 // Pauses execution for the given number of milliseconds
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ── Target stock-API discovery (read-only) ─────────────────────────────────────
+// Recursively walks a JSON blob and collects any field that looks like a stock/availability signal
+// (key or value), so we can auto-detect Target's field name regardless of how it's nested.
+function deepFindAvailability(obj, path, out) {
+  out = out || []; path = path || '';
+  if (out.length >= 10 || !obj || typeof obj !== 'object') return out;
+  for (const k of Object.keys(obj)) {
+    const v = obj[k], p = path ? path + '.' + k : k;
+    if (typeof v === 'object' && v !== null) { deepFindAvailability(v, p, out); }
+    else if (/avail|in_stock|out_of_stock|sellable|is_out_of_stock|purchase_limit|shipping_status|inventory/i.test(k)) { out.push(p + ' = ' + JSON.stringify(v)); }
+    else if (typeof v === 'string' && /^(IN_STOCK|OUT_OF_STOCK|LIMITED_STOCK|PRE_ORDER)$|sold out|out of stock|in stock/i.test(v)) { out.push(p + ' = ' + JSON.stringify(v)); }
+  }
+  return out;
+}
+
+// Probes several candidate Target endpoints for the given TCIN and reports which returns an
+// availability field. Fetches with the user's cookies (credentials:'include') via host permissions.
+async function targetStockTest(msg) {
+  const key   = msg.key || '9f36aeafbe60771e321a7cc95a78140772ab3e96'; // Target's public web key
+  const tcin  = msg.tcin;
+  if (!tcin) return { ok: false, error: 'No TCIN — open a Target product page (…/A-<number>) first.' };
+  const store = msg.storeId || '1248';
+  const zip   = msg.zip || '';
+  const state = msg.state || '';
+  const common = 'key=' + key + '&tcin=' + tcin + '&is_bot=false&channel=WEB&page=%2Fp%2FA-' + tcin;
+  const loc = '&store_id=' + store + '&pricing_store_id=' + store + '&has_pricing_store_id=true'
+            + '&scheduled_delivery_store_id=' + store + '&required_store_id=' + store + '&has_required_store_id=true'
+            + (zip ? '&zip=' + zip : '') + (state ? '&state=' + state : '');
+  const rs = 'https://redsky.target.com/redsky_aggregations/v1/web/';
+  const candidates = [
+    rs + 'pdp_fulfillment_v1?' + common + loc,
+    rs + 'product_fulfillment_v1?' + common + loc,
+    rs + 'pdp_client_v1?' + common + loc,
+    rs + 'pdp_variation_hierarchy_v1?' + common,
+  ];
+  const results = [];
+  for (const url of candidates) {
+    const short = url.replace('https://redsky.target.com/redsky_aggregations/v1/web/', '').split('?')[0];
+    try {
+      const res = await fetch(url, { credentials: 'include' });
+      if (!res.ok) { results.push({ ep: short, status: res.status, found: [] }); continue; }
+      const json = await res.json();
+      results.push({ ep: short, status: res.status, found: deepFindAvailability(json) });
+    } catch (e) { results.push({ ep: short, status: 'ERR', found: [], error: e.message }); }
+  }
+  return { ok: true, tcin, store, results };
+}
+
+// Fast single stock check for the restock watcher. Runs the fetch inside the Target tab (MAIN world)
+// — Target blocks the background's own fetch — and returns { avail, qty }. Confirmed endpoint/field:
+//   product_fulfillment_v1 → data.product.fulfillment.shipping_options.availability_status
+async function targetStockPoll(tabId, tcin) {
+  if (!tabId || !tcin) return { ok: false };
+  try {
+    const [out] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [tcin],
+      func: async (tcin) => {
+        const key = '9f36aeafbe60771e321a7cc95a78140772ab3e96';
+        const url = 'https://redsky.target.com/redsky_aggregations/v1/web/product_fulfillment_v1?key=' + key +
+                    '&tcin=' + tcin + '&is_bot=false&channel=WEB&page=%2Fp%2FA-' + tcin;
+        try {
+          const res = await fetch(url, { credentials: 'include' });
+          if (!res.ok) return { status: res.status };
+          const j = await res.json();
+          const so = (j && j.data && j.data.product && j.data.product.fulfillment && j.data.product.fulfillment.shipping_options) || {};
+          return { status: 200, avail: so.availability_status || null, qty: so.available_to_promise_quantity };
+        } catch (e) { return { status: 'ERR', error: e.message }; }
+      }
+    });
+    return { ok: true, ...(out && out.result || {}) };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// Stock check via the product page HTML (Sam's/Walmart GLASS SSR the availability into the page).
+// Fetches the URL in the tab's page context and reads the main product's schema.org availability
+// (falling back to the first availabilityStatus). Returns { inStock, status }.
+async function htmlStockPoll(tabId, url) {
+  if (!tabId || !url) return { ok: false };
+  try {
+    const [out] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [url],
+      func: async (url) => {
+        try {
+          const res = await fetch(url, { credentials: 'include' });
+          if (!res.ok) return { status: res.status };
+          const t = await res.text();
+          // schema.org markup is for the MAIN product only → cleanest signal.
+          if (/schema\.org\/InStock/i.test(t))    return { status: 'InStock', inStock: true };
+          if (/schema\.org\/OutOfStock/i.test(t)) return { status: 'OutOfStock', inStock: false };
+          // Fallback: first availabilityStatus in the SSR'd data.
+          const m = t.match(/"availabilityStatus"\s*:\s*"([^"]+)"/);
+          const s = m ? m[1] : null;
+          return { status: s || 'unknown', inStock: s ? /IN_STOCK|LIMITED/i.test(s) : false };
+        } catch (e) { return { status: 'ERR', error: e.message }; }
+      }
+    });
+    return { ok: true, ...(out && out.result || {}) };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
 
 // Helper — sends a log message to the popup's activity log
 // level controls the color: 'info' (blue), 'success' (green), 'warning' (yellow), 'error' (red)

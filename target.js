@@ -13,8 +13,9 @@ window.__STORES.target = {
   itemUrl:   (id) => 'https://www.target.com/p/-/A-' + encodeURIComponent(id),
 
   sel: {
-    // Product-page quantity DROPDOWN (1–10). Class hash changes, so match the module prefix.
-    qtySelect:  'select[class*="styles_select__"]',
+    // Product-page quantity DROPDOWN (1–10). Class hash changes, so match the module prefix; also
+    // match common data-test/id/aria/name variants in case this item's dropdown differs.
+    qtySelect:  'select[class*="styles_select__"], select[data-test*="qty" i], select[data-test*="quantity" i], select[id*="quantity" i], select[aria-label*="uantity"], select[name*="quant" i]',
     // "Buy now" skips the cart and goes straight to checkout — fastest path for a drop.
     buyNow:     '[data-test="buy-now-button"]',
     // Add to cart / Preorder (Target uses data-test="orderPickupButton" or "preorderButton";

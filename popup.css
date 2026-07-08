@@ -247,6 +247,8 @@ body {
 }
 .speed-test-btn:hover { background: #e6f2f9; }
 .speed-test-btn:disabled { opacity: .5; cursor: default; }
+.speed-test-btn.tracking { background: #c0392b; color: white; border-color: #c0392b; }
+.speed-test-btn.tracking:hover { background: #a93226; }
 
 /* ACTIVITY LOG — takes remaining space and scrolls internally; min-height:0 lets it
    shrink so the form above and the buttons below always stay fully visible */

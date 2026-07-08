@@ -139,13 +139,22 @@ async function waitForViewCart(botConfig, isSams) {
   if (viewCartBtn) {
     log('success', 'Found View Cart: "' + viewCartBtn.textContent.trim().split('\n')[0].substring(0, 40) + '"');
     log('info', 'Clicking View Cart...');
+    const beforeUrl = location.href;
     viewCartBtn.click();
-    await chrome.storage.local.set({ botPhase: 'CART', addAttempts: 0 }); // reset on success
+    await wset({ botPhase: 'CART', addAttempts: 0 }); // reset on success (per-window)
+    // The mini-cart "View Cart" sometimes doesn't route (SPA flyout). If we're still on the same
+    // page a moment later, go to /cart directly so the flow actually reaches the CART step (where
+    // the quantity is set and checkout is clicked) instead of stalling here.
+    await sleep(1200);
+    if (location.href === beforeUrl && !/\/cart\b/.test(location.pathname)) {
+      log('info', 'View Cart didn’t navigate — opening /cart directly…');
+      location.href = new URL('/cart', location.origin).href;
+    }
   } else {
     // Keep trying indefinitely — under a heavy drop the confirmation can be slow, and you'd
     // rather keep pushing than give up. (Press Stop to end it; it checks botRunning first.)
-    const { addAttempts = 0 } = await chrome.storage.local.get('addAttempts');
-    await chrome.storage.local.set({ addAttempts: addAttempts + 1 });
+    const { addAttempts = 0 } = await wget('addAttempts');
+    await wset({ addAttempts: addAttempts + 1 });
     log('warning', 'View Cart not found (try ' + (addAttempts + 1) + ') — reloading and retrying...');
     location.reload();
   }
@@ -180,9 +189,19 @@ async function fillSamsPayment(cfg) {
     '[data-automation-id="place-order-button"], [data-testid="place-order-button"]', patientTimeout(12000));
 
   if (placeOrderReady) {
+    // TEST MODE: payment is ready and the NEXT step places the real order — STOP here. Never submit.
+    const botTestMode = (cfg && cfg.testMode) || (await wget('botTestMode')).botTestMode;
+    if (botTestMode) {
+      log('success', '🧪 TEST MODE — payment ready, NOT placing the order. No order placed.');
+      showBigBanner('✓ ORDER CONFIRMED', 'TEST MODE — no real order was placed');
+      setStatus('done', '🧪 Test passed — order NOT placed');
+      await wset({ botRunning: false, botPhase: 'IDLE' });
+      chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+      return false;
+    }
     log('success', 'Payment ready — submitting (CVV filled only if required)...');
     chrome.runtime.sendMessage({ type: 'SAMS_CHECKOUT', cvv: String(cfg.cvv) });
-    await chrome.storage.local.set({ botPhase: 'CONFIRM' });
+    await wset({ botPhase: 'CONFIRM' });
     return false; // background handles CVV (if needed) + Place Order
   }
 

@@ -54,6 +54,26 @@ function wget(keys) {
 function wset(obj)    { const o = {}; for (const key in obj) o[nsk(key)] = obj[key]; return chrome.storage.local.set(o); }
 function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return chrome.storage.local.remove(arr.map(nsk)); }
 
+// ── Per-window form values (Quantity & Max Price) ───────────────────────────────
+// These are saved/restored PER WINDOW (under w<wid>:ui:<field>), so running several bots doesn't
+// make Quantity / Max Price snap to whatever you last typed in any one window. They override the
+// shared per-profile config when the form loads, and persist as you type.
+const PW_UI_FIELDS = ['quantity', 'maxPrice'];
+async function applyPerWindowUI() {
+  if (MY_WID == null) return;
+  const keys = PW_UI_FIELDS.map(f => 'w' + MY_WID + ':ui:' + f);
+  const res = await chrome.storage.local.get(keys);
+  PW_UI_FIELDS.forEach((f, i) => {
+    const v = res[keys[i]];
+    const el = document.getElementById(f);
+    if (el && v != null && v !== '') el.value = v;
+  });
+}
+PW_UI_FIELDS.forEach(f => {
+  const el = document.getElementById(f);
+  if (el) el.addEventListener('input', () => { if (MY_WID != null) chrome.storage.local.set({ ['w' + MY_WID + ':ui:' + f]: el.value }); });
+});
+
 // Per-store navigation (the popup needs the URLs; content.js has the selectors).
 const STORE_NAV = {
   sams:          { name: "Sam's Bot",      search: q => 'https://www.samsclub.com/s/' + encodeURIComponent(q),               item: id => 'https://www.samsclub.com/ip/' + encodeURIComponent(id) },
@@ -78,11 +98,11 @@ async function deriveKey(pin, saltBytes) {
     base, { name: 'AES-GCM', length: 256 }, true /* extractable, to cache in session */, ['encrypt', 'decrypt']);
 }
 
-// ── 2-hour unlock window ───────────────────────────────────────────────────────
+// ── 12-hour unlock window ──────────────────────────────────────────────────────
 // Cache the key with an expiry so reopening the panel (or reloading the extension)
-// within 2 hours skips the PIN. Stored in local so it survives a reset; auto-deleted
-// when it expires. (Tradeoff: the key sits cached for up to 2h — bounded exposure.)
-const UNLOCK_HOURS = 2;
+// within 12 hours skips the PIN. Stored in local so it survives a reset; auto-deleted
+// when it expires. (Tradeoff: the key sits cached for up to 12h — bounded exposure.)
+const UNLOCK_HOURS = 12;
 async function cacheKey() {
   try {
     const raw = await crypto.subtle.exportKey('raw', cryptoKey);
@@ -309,21 +329,62 @@ async function loadProfileConfig(profile) {
     await chrome.storage.local.set({ botConfigShared: await encryptObj(cryptoKey, sharedCfg) });
   }
   writeForm(cfg);
+  await applyPerWindowUI(); // Quantity & Max Price are per-window — override the shared values
 }
 
 // ── Profile switcher (top tabs) ────────────────────────────────────────────────
 document.querySelectorAll('.profile-tab').forEach(tab => {
   tab.addEventListener('click', async () => {
     if (tab.dataset.profile === activeProfile) return;
-    await saveProfileConfig(activeProfile);
-    activeProfile = tab.dataset.profile;
-    chrome.storage.local.set({ lastProfile: activeProfile }); // reopen on this store next time
-    document.querySelectorAll('.profile-tab').forEach(t => t.classList.remove('active'));
-    tab.classList.add('active');
-    await loadProfileConfig(activeProfile);
-    updateStartLabel();
-    addLog('info', 'Switched to ' + profileLabel(activeProfile));
+    try { await saveProfileConfig(activeProfile); } catch (_) {} // persist the current store's form first
+    // HARD RESET on store switch — stop THIS window's bot, WIPE its run-state (incl. the Test flag),
+    // detach any stale debugger, and reload the panel. Without this, a previous store's run (or a
+    // leftover botTestMode) could bleed into the next store and, worst case, make a Test run place a
+    // REAL order. Reloading also clears any stale in-memory state (timers/hotkeys/log).
+    chrome.storage.local.set({ lastProfile: tab.dataset.profile }); // reopen on the new store after reload
+    await wset({ botRunning: false, botPhase: 'IDLE', botTestMode: false });
+    await wremove(['botConfig', 'burstUntil', 'queueSince', 'currentTabId']);
+    chrome.runtime.sendMessage({ type: 'STOP_BOT', wid: MY_WID }).catch(() => {});
+    isReloading = true;          // tell the unload handler NOT to run its own stop again
+    location.reload();           // clean slate
   });
+});
+
+// LIGHT profile switch (no panel reload) — used for the automatic tab-follow below. Persists the
+// current form, swaps the profile, reloads its config, and clears the stale Test flag for safety.
+async function switchProfileLight(profile) {
+  if (profile === activeProfile) return;
+  try { await saveProfileConfig(activeProfile); } catch (_) {}
+  activeProfile = profile;
+  chrome.storage.local.set({ lastProfile: profile });
+  await wset({ botTestMode: false }); // belt-and-suspenders; cfg.testMode is the real per-run guard
+  document.querySelectorAll('.profile-tab').forEach(t => t.classList.toggle('active', t.dataset.profile === profile));
+  await loadProfileConfig(profile);
+  updateStartLabel();
+  addLog('info', 'Switched to ' + profileLabel(profile) + ' (matches this tab).');
+}
+
+// Detect which store profile a URL belongs to (or null).
+function profileForUrl(url) {
+  const h = (url || '').toLowerCase();
+  return /samsclub\.com/.test(h)      ? 'sams'
+       : /target\.com/.test(h)        ? 'target'
+       : /walmart\.com/.test(h)       ? 'walmart'
+       : /bestbuy\.com/.test(h)       ? 'bestbuy'
+       : /pokemoncenter\.com/.test(h) ? 'pokemoncenter' : null;
+}
+
+// Follow the tab: when you switch to a different tab in THIS window, auto-select the store that
+// matches it. Skipped while a bot is running (so it never switches out from under a live run).
+chrome.tabs.onActivated.addListener(async (info) => {
+  if (MY_WID == null || info.windowId !== MY_WID) return; // only our window, once we know which it is
+  const { botRunning } = await wget('botRunning');
+  if (botRunning) return;
+  try {
+    const tab = await chrome.tabs.get(info.tabId);
+    const p = profileForUrl(tab.url);
+    if (p && STORE_NAV[p] && p !== activeProfile) await switchProfileLight(p);
+  } catch (_) {}
 });
 
 // ── Sub-tab switching (Item / Address / Payment) ───────────────────────────────
@@ -362,6 +423,105 @@ document.getElementById('saveBtn').addEventListener('click', saveConfig);
 document.getElementById('clearBtn').addEventListener('click', clearLog);
 document.getElementById('closeBtn').addEventListener('click', () => window.close());
 document.getElementById('speedTestBtn').addEventListener('click', testLoadSpeed);
+document.getElementById('stockTestBtn').addEventListener('click', findStockApi);
+document.getElementById('trackBtn').addEventListener('click', toggleClickTracker);
+
+// Click-tracker toggle: registers track.js on the current store's DOMAIN (so it follows you across
+// the checkout pages) and logs the CODE of every button/link you click. Turn ON, do a manual
+// checkout during a drop, then paste the log so a store (Walmart/Best Buy/…) can be tuned.
+let clickTrackOn = false;
+async function toggleClickTracker() {
+  const btn = document.getElementById('trackBtn');
+  if (!clickTrackOn) {
+    try {
+      await chrome.scripting.unregisterContentScripts({ ids: ['click-track'] }).catch(() => {});
+      // ALL sites, all frames — so it follows you anywhere (Discord web, a store, whatever) and into iframes.
+      await chrome.scripting.registerContentScripts([{ id: 'click-track', js: ['track.js'], matches: ['*://*/*'], runAt: 'document_start', allFrames: true }]);
+      // Apply to the current tab now (no reload needed) if it's a web page.
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab && /^https?:\/\//.test(tab.url || '')) await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['track.js'] }).catch(() => {});
+      clickTrackOn = true; chrome.storage.local.set({ clickTrackOn: true });
+      btn.textContent = '👁 ON'; btn.classList.add('tracking');
+      addLog('success', '👁 Tracking ON (all sites) — clicks, press-holds (⏳), drags (✋), tab switches, and page loads are logged. Turn OFF when done, then paste the log.');
+    } catch (e) { addLog('error', '👁 ' + e.message); }
+  } else {
+    await chrome.scripting.unregisterContentScripts({ ids: ['click-track'] }).catch(() => {});
+    clickTrackOn = false; chrome.storage.local.set({ clickTrackOn: false });
+    btn.textContent = '👁 Track'; btn.classList.remove('tracking');
+    addLog('warning', '👁 Tracking OFF.');
+  }
+}
+// While tracking: also log tab switches and page navigations (the whole browser flow, not just clicks).
+chrome.tabs.onActivated.addListener(async (info) => {
+  if (!clickTrackOn) return;
+  try { const t = await chrome.tabs.get(info.tabId); addLog('info', '🔀 tab → ' + (t.title || t.url || '').replace(/^https?:\/\//, '').slice(0, 60)); } catch (_) {}
+});
+chrome.tabs.onUpdated.addListener((tabId, ch, tab) => {
+  if (!clickTrackOn || ch.status !== 'complete') return;
+  addLog('info', '🌐 loaded → ' + (tab.url || '').replace(/^https?:\/\//, '').slice(0, 72));
+});
+// Restore the toggle's look on panel load (the registered tracker survives a panel reload).
+(async () => {
+  try {
+    const regs = await chrome.scripting.getRegisteredContentScripts({ ids: ['click-track'] });
+    if (regs && regs.length) { clickTrackOn = true; const b = document.getElementById('trackBtn'); if (b) { b.textContent = '👁 ON'; b.classList.add('tracking'); } }
+  } catch (_) {}
+})();
+
+// Universal stock-API sniffer. Registers a document_start network hook on the CURRENT store site,
+// reloads the page so the stock request fires WITH the hook active, then reports which request
+// carried the availability data (URL + a sample of the response). Read-only diagnostic used to wire
+// the fast stock-watcher for a new store — paste the results and I'll build that store's watcher.
+async function findStockApi() {
+  const btn = document.getElementById('stockTestBtn');
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !/^https?:\/\//.test(tab.url || '')) { addLog('error', '⚡ Open the store PRODUCT page in this tab first.'); return; }
+  let origin; try { origin = new URL(tab.url).origin; } catch (_) { addLog('error', '⚡ Bad tab URL.'); return; }
+  btn.disabled = true; btn.textContent = '⚡ …';
+  addLog('info', '⚡ Sniffing the stock API — installing a network monitor + reloading the page…');
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: ['stock-sniff'] }).catch(() => {});
+    await chrome.scripting.registerContentScripts([{
+      id: 'stock-sniff', js: ['sniff.js'], matches: [origin + '/*'], runAt: 'document_start', world: 'MAIN'
+    }]);
+    await chrome.tabs.reload(tab.id);
+    await new Promise(r => setTimeout(r, 5500)); // let the page + its stock calls load with the hook on
+    const [out] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id }, world: 'MAIN',
+      func: () => { try { return sessionStorage.getItem('__botStockSniff'); } catch (_) { return null; } }
+    });
+    let hits = []; try { hits = JSON.parse((out && out.result) || '[]'); } catch (_) {}
+    if (!hits.length) { addLog('warning', '⚡ No stock-looking request captured — the page may load stock differently. Tell me and we’ll try DevTools for this store.'); return; }
+    const seen = new Set();
+    for (const h of hits) {
+      const short = h.url.replace(/^https?:\/\//, '').split('?')[0];
+      if (seen.has(short)) continue; seen.add(short);
+      addLog('success', '⚡ ' + short);
+      addLog('info', '   ' + (h.sample || '').replace(/\s+/g, ' ').slice(0, 160));
+    }
+    // Also scan the page HTML — Walmart/Sam's (GLASS) SERVER-RENDER availability into the page (no
+    // separate XHR), so the stock field lives in the HTML itself, not a caught request.
+    try {
+      const [scan] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, world: 'MAIN',
+        func: () => {
+          const html = (document.documentElement && document.documentElement.outerHTML) || '';
+          const out = [], seen = new Set();
+          const re = /"[a-zA-Z_]*availab[a-zA-Z_]*"\s*:\s*("[^"]{0,30}"|true|false|\d+)|"(?:stockStatus|onlineStatus|inventoryStatus)"\s*:\s*"[^"]{0,24}"|"orderLimit"\s*:\s*\d+|OUT_OF_STOCK|IN_STOCK/g;
+          let m; while ((m = re.exec(html)) && out.length < 10) { const s = m[0].replace(/\s+/g, ''); if (!seen.has(s)) { seen.add(s); out.push(s); } }
+          return out;
+        }
+      });
+      const fields = (scan && scan.result) || [];
+      if (fields.length) addLog('success', '⚡ (in page HTML) ' + fields.join('  ·  '));
+    } catch (_) {}
+    addLog('info', '⚡ Paste these lines to me — I’ll build the watcher for this store.');
+  } catch (e) { addLog('error', '⚡ ' + e.message); }
+  finally {
+    await chrome.scripting.unregisterContentScripts({ ids: ['stock-sniff'] }).catch(() => {});
+    btn.disabled = false; btn.textContent = '⚡ API';
+  }
+}
 
 // ── Keyboard shortcuts (GLOBAL) ────────────────────────────────────────────────
 // Uses Chrome's commands API (manifest "commands") so the keys fire ANYWHERE in Chrome — the user
@@ -524,7 +684,7 @@ setInterval(() => {
 // the log). Flagged so the unload handler below does NOT stop the running bot on our own reload.
 // The armed drop + running state are persisted in storage, so they survive this reload.
 let isReloading = false;
-chrome.tabs.onCreated.addListener(() => { isReloading = true; location.reload(); });
+chrome.tabs.onCreated.addListener(() => { if (clickTrackOn) return; isReloading = true; location.reload(); }); // don't wipe the log while tracking
 
 // On genuine panel close: stop the bot + wipe the temporary plaintext config. On our own reload
 // (new-tab refresh), do NEITHER — the bot keeps running, its config stays, and the arm persists.
@@ -761,11 +921,35 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
     document.querySelectorAll('.profile-tab').forEach(t => t.classList.toggle('active', t.dataset.profile === activeProfile));
   }
 
+  // 1b) …but if THIS tab is on a known store site, auto-select THAT store's profile — so opening the
+  // sidebar on target.com picks 🎯 Target, samsclub.com picks 🏪 Sam's, etc. (avoids the "wrong store
+  // tab" footgun). Overrides the last-used profile above.
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const host = (tab && tab.url || '').toLowerCase();
+    const siteProfile =
+      /samsclub\.com/.test(host)      ? 'sams' :
+      /target\.com/.test(host)        ? 'target' :
+      /walmart\.com/.test(host)       ? 'walmart' :
+      /bestbuy\.com/.test(host)       ? 'bestbuy' :
+      /pokemoncenter\.com/.test(host) ? 'pokemoncenter' : null;
+    if (siteProfile && STORE_NAV[siteProfile] && siteProfile !== activeProfile) {
+      activeProfile = siteProfile;
+      document.querySelectorAll('.profile-tab').forEach(t => t.classList.toggle('active', t.dataset.profile === activeProfile));
+      addLog('info', 'Auto-selected ' + profileLabel(activeProfile) + ' (matches this tab).');
+    }
+  } catch (_) {}
+
   const { pinSalt, botRunning, pinLockUntil = 0 } = await wget(['pinSalt', 'botRunning', 'pinLockUntil']);
   if (pinSalt) {
-    // Within the 2-hour window? Skip the PIN using the cached key.
+    // Within the unlock window? Skip the PIN using the cached key.
     if (await tryRestoreKey()) {
       await loadProfileConfig(activeProfile);
+    } else if (botRunning) {
+      // A bot is ALREADY running in this window — don't block the panel with a PIN prompt (e.g. when
+      // the panel auto-reloads on a new tab and the cached key isn't available). The bot keeps
+      // running on its captured config; the form just stays empty until you unlock to edit it.
+      addLog('info', '🔓 Bot running — PIN not required while it’s active.');
     } else {
       showLock('unlock');         // PIN expired/never entered — require it
       if (pinLockUntil && Date.now() < pinLockUntil) showLockedCountdown(pinLockUntil);
@@ -775,6 +959,7 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
     const legacy = await chrome.storage.local.get('botConfig_' + activeProfile);
     const cfg = legacy['botConfig_' + activeProfile];
     if (cfg) writeForm(cfg); else clearForm();
+    await applyPerWindowUI(); // Quantity & Max Price are per-window
   }
   if (botRunning) setRunningUI(true);
   updateStartLabel();
@@ -800,6 +985,16 @@ chrome.runtime.onMessage.addListener(msg => {
   // Per-window routing: a message tagged with a wid belongs to THAT window's panel only. Untagged
   // messages (background-origin, or the localhost Sam's flow) are shown everywhere as before.
   if (msg.wid != null && msg.wid !== MY_WID) return;
+  if (msg.type === 'TRACK') {
+    // Log the interacted element's CODE so it can be copied out to tune a store. `kind` is the
+    // gesture (CLICK / HOLD / DRAG); `extra` carries hold time or drag distance+direction.
+    const icon = msg.kind === 'DRAG' ? '✋' : (msg.kind === 'HOLD' ? '⏳' : '👆');
+    const label = (msg.kind || 'CLICK').toLowerCase();
+    const ex = msg.extra ? ' (' + msg.extra + ')' : '';
+    addLog('info', icon + ' ' + label + ex + ' @' + (msg.path || '') + (msg.text ? '  "' + msg.text + '"' : ''));
+    addLog('success', '   ' + (msg.html || msg.tag || ''));
+    return;
+  }
   if (msg.type === 'BOT_LOG')    addLog(msg.level, msg.text);
   if (msg.type === 'BOT_STATUS') setStatus(msg.status, msg.text);
   if (msg.type === 'BOT_QUEUE') {
@@ -929,6 +1124,10 @@ async function toggleBot(testMode = false) {
 
     // Persist the encrypted copy, and a TEMPORARY plaintext copy the bot reads during the run.
     await saveProfileConfig(activeProfile);
+    // Embed the Test flag INSIDE the run config so it's captured atomically with this run and can't
+    // go stale relative to a separate key — the checkout guards read cfg.testMode as the source of
+    // truth, so a Test run can never be mistaken for a real one.
+    cfg.testMode = !!testMode;
     // Fresh run flags: qtyDone (quantity), samsFellBack (SKU fallback), addAttempts (stuck guard)
     await wset({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0, pokePlaceRetries: 0, botTestMode: !!testMode, botRunToken: Date.now() });
     if (testMode) addLog('info', '🧪 TEST MODE: full flow will run but the order will NOT be submitted.');
@@ -996,6 +1195,6 @@ function addLog(level, text) {
   const t = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
   e.textContent = '[' + t + '] ' + text;
   log.prepend(e);
-  while (log.children.length > 50) log.removeChild(log.lastChild);
+  while (log.children.length > 200) log.removeChild(log.lastChild); // hold plenty for click-tracking
 }
 function clearLog() { document.getElementById('log').innerHTML = ''; }
