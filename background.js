@@ -90,7 +90,7 @@ async function injectBot(tabId, url) {
 chrome.webNavigation.onDOMContentLoaded.addListener(async (d) => {
   if (d.frameId !== 0) return; // main frame only
   const { botRunning, botConfig, currentTabId } = await wgetTab(d.tabId, ['botRunning', 'botConfig', 'currentTabId']);
-  if (!botRunning || !(botConfig?.useCurrentTab || botConfig?.samsSearch)) return;
+  if (!botRunning || !(botConfig?.useCurrentTab || botConfig?.samsSearch || botConfig?.watchlist?.length)) return;
   if (d.tabId !== currentTabId) return;
   await injectBot(d.tabId, d.url);
 });
@@ -99,7 +99,7 @@ chrome.webNavigation.onDOMContentLoaded.addListener(async (d) => {
 chrome.webNavigation.onHistoryStateUpdated.addListener(async (d) => {
   if (d.frameId !== 0) return;
   const { botRunning, botConfig, currentTabId } = await wgetTab(d.tabId, ['botRunning', 'botConfig', 'currentTabId']);
-  if (!botRunning || !(botConfig?.useCurrentTab || botConfig?.samsSearch)) return;
+  if (!botRunning || !(botConfig?.useCurrentTab || botConfig?.samsSearch || botConfig?.watchlist?.length)) return;
   if (d.tabId !== currentTabId) return;
   await injectBot(d.tabId, d.url);
 });
@@ -108,7 +108,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(async (d) => {
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
   const { botRunning, botConfig, currentTabId } = await wgetTab(tabId, ['botRunning', 'botConfig', 'currentTabId']);
-  if (!botRunning || !(botConfig?.useCurrentTab || botConfig?.samsSearch)) return;
+  if (!botRunning || !(botConfig?.useCurrentTab || botConfig?.samsSearch || botConfig?.watchlist?.length)) return;
   if (tabId !== currentTabId) return;
   await injectBot(tabId, tab?.url || '');
 });

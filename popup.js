@@ -1,5 +1,6 @@
 // All config field IDs — used to save/restore form values
 const FIELDS = ['siteUrl','useCurrentTab','itemName','itemSku','searchType','quantity','maxPrice','refreshInterval',
+                'watchlist',
                 'firstName','lastName','email','address','city','state','zip',
                 'cardNumber','cardName','expiry','cvv','stopOnSuccess'];
 
@@ -40,7 +41,7 @@ async function assignBotNumber(wid) {
 const NS_ON = true;
 const PW_KEYS = new Set(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'currentTabId',
   'botTestMode', 'botRunToken', 'burstUntil', 'queueSince', 'qtyDone', 'samsFellBack', 'addAttempts',
-  'pokePlaceRetries', 'armState']);
+  'pokePlaceRetries', 'armState', 'watchIndex']);
 const nsk = (key) => (NS_ON && MY_WID != null && PW_KEYS.has(key)) ? ('w' + MY_WID + ':' + key) : key;
 // Storage wrappers that auto-namespace ONLY per-window keys (global keys pass through unchanged),
 // so a mixed get([...global, ...perWindow]) Just Works and returns the ORIGINAL key names.
@@ -150,6 +151,16 @@ function writeForm(cfg) {
   document.getElementById('nameGroup').style.display = type === 'name' ? '' : 'none';
   document.getElementById('skuGroup').style.display  = type === 'sku'  ? '' : 'none';
 }
+// Parse the watchlist textarea into de-duped Walmart item IDs (from /ip/<id> links or bare IDs).
+function parseWatchlist(text) {
+  if (!text) return [];
+  const ids = String(text).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean).map(line => {
+    const m = line.match(/\/ip\/(?:[^\/]+\/)?(\d{5,})/) || line.match(/\b(\d{6,})\b/);
+    return m ? m[1] : null;
+  }).filter(Boolean);
+  return ids.filter((id, i) => ids.indexOf(id) === i);
+}
+
 function clearForm() {
   writeForm({ siteUrl: 'http://localhost:3000', quantity: '1', maxPrice: '999', refreshInterval: '2',
               stopOnSuccess: true, useCurrentTab: false, searchType: 'name' });
@@ -330,6 +341,13 @@ async function loadProfileConfig(profile) {
   }
   writeForm(cfg);
   await applyPerWindowUI(); // Quantity & Max Price are per-window — override the shared values
+  applyWatchlistVisibility();
+}
+
+// The drop watchlist only applies to Walmart — show its field only on that profile.
+function applyWatchlistVisibility() {
+  const g = document.getElementById('watchGroup');
+  if (g) g.style.display = (activeProfile === 'walmart') ? '' : 'none';
 }
 
 // ── Profile switcher (top tabs) ────────────────────────────────────────────────
@@ -387,6 +405,18 @@ chrome.tabs.onActivated.addListener(async (info) => {
   } catch (_) {}
 });
 
+// Follow the NAVIGATION too: when a click sends THIS window's active tab to a store (e.g. clicking a
+// Discord/store link, which onActivated alone misses because the URL loads after activation), switch
+// the profile as soon as the new URL is known. Same guards: only our window, only when not running.
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (!changeInfo.url && changeInfo.status !== 'complete') return; // only on a URL change / load
+  if (MY_WID == null || !tab || tab.windowId !== MY_WID || !tab.active) return; // active tab, our window
+  const { botRunning } = await wget('botRunning');
+  if (botRunning) return;
+  const p = profileForUrl(changeInfo.url || tab.url);
+  if (p && STORE_NAV[p] && p !== activeProfile) { try { await switchProfileLight(p); } catch (_) {} }
+});
+
 // ── Sub-tab switching (Item / Address / Payment) ───────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -429,44 +459,65 @@ document.getElementById('trackBtn').addEventListener('click', toggleClickTracker
 // Click-tracker toggle: registers track.js on the current store's DOMAIN (so it follows you across
 // the checkout pages) and logs the CODE of every button/link you click. Turn ON, do a manual
 // checkout during a drop, then paste the log so a store (Walmart/Best Buy/…) can be tuned.
+// clickTrackOn is THIS window's own toggle — each bot tracks (and displays) independently. The
+// content-script registration itself is browser-wide (can't be window-scoped), so it's shared and
+// ref-counted: registered while ANY window is tracking, removed only when the LAST one turns off.
 let clickTrackOn = false;
+const trackKey = () => 'w' + MY_WID + ':clickTrackOn';
+async function anyWindowTracking() {
+  const all = await chrome.storage.local.get(null);
+  return Object.keys(all).some(k => /^w\d+:clickTrackOn$/.test(k) && all[k]);
+}
 async function toggleClickTracker() {
   const btn = document.getElementById('trackBtn');
   if (!clickTrackOn) {
     try {
-      await chrome.scripting.unregisterContentScripts({ ids: ['click-track'] }).catch(() => {});
-      // ALL sites, all frames — so it follows you anywhere (Discord web, a store, whatever) and into iframes.
-      await chrome.scripting.registerContentScripts([{ id: 'click-track', js: ['track.js'], matches: ['*://*/*'], runAt: 'document_start', allFrames: true }]);
-      // Apply to the current tab now (no reload needed) if it's a web page.
+      clickTrackOn = true;
+      if (MY_WID != null) await chrome.storage.local.set({ [trackKey()]: true });
+      // Register the shared tracker on ALL sites/frames if it isn't already (idempotent).
+      const regs = await chrome.scripting.getRegisteredContentScripts({ ids: ['click-track'] }).catch(() => []);
+      if (!regs || !regs.length) {
+        await chrome.scripting.registerContentScripts([{ id: 'click-track', js: ['track.js'], matches: ['*://*/*'], runAt: 'document_start', allFrames: true }]);
+      }
+      // Apply to THIS window's current tab now (no reload needed) if it's a web page.
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (tab && /^https?:\/\//.test(tab.url || '')) await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['track.js'] }).catch(() => {});
-      clickTrackOn = true; chrome.storage.local.set({ clickTrackOn: true });
       btn.textContent = '👁 ON'; btn.classList.add('tracking');
-      addLog('success', '👁 Tracking ON (all sites) — clicks, press-holds (⏳), drags (✋), tab switches, and page loads are logged. Turn OFF when done, then paste the log.');
-    } catch (e) { addLog('error', '👁 ' + e.message); }
+      addLog('success', '👁 Tracking ON (this bot) — clicks, press-holds (⏳), drags (✋), tab switches, and page loads in THIS window are logged. Turn OFF when done, then paste the log.');
+    } catch (e) { clickTrackOn = false; addLog('error', '👁 ' + e.message); }
   } else {
-    await chrome.scripting.unregisterContentScripts({ ids: ['click-track'] }).catch(() => {});
-    clickTrackOn = false; chrome.storage.local.set({ clickTrackOn: false });
+    clickTrackOn = false;
+    if (MY_WID != null) await chrome.storage.local.set({ [trackKey()]: false });
+    // Only remove the shared tracker once NO window still wants it.
+    if (!(await anyWindowTracking())) await chrome.scripting.unregisterContentScripts({ ids: ['click-track'] }).catch(() => {});
     btn.textContent = '👁 Track'; btn.classList.remove('tracking');
-    addLog('warning', '👁 Tracking OFF.');
+    addLog('warning', '👁 Tracking OFF (this bot).');
   }
 }
-// While tracking: also log tab switches and page navigations (the whole browser flow, not just clicks).
+// While tracking: also log tab switches and page navigations (the whole browser flow, not just
+// clicks) — but ONLY for THIS window's tabs, so each bot's track log stays independent.
 chrome.tabs.onActivated.addListener(async (info) => {
-  if (!clickTrackOn) return;
+  if (!clickTrackOn || MY_WID == null || info.windowId !== MY_WID) return;
   try { const t = await chrome.tabs.get(info.tabId); addLog('info', '🔀 tab → ' + (t.title || t.url || '').replace(/^https?:\/\//, '').slice(0, 60)); } catch (_) {}
 });
 chrome.tabs.onUpdated.addListener((tabId, ch, tab) => {
   if (!clickTrackOn || ch.status !== 'complete') return;
+  if (MY_WID == null || (tab && tab.windowId !== MY_WID)) return; // only this window's tabs
   addLog('info', '🌐 loaded → ' + (tab.url || '').replace(/^https?:\/\//, '').slice(0, 72));
 });
-// Restore the toggle's look on panel load (the registered tracker survives a panel reload).
-(async () => {
+// Restore THIS window's tracker toggle on panel load — see restoreTrackToggle(), called from init
+// once MY_WID is known (the per-window flag isn't readable before then).
+async function restoreTrackToggle() {
+  if (MY_WID == null) return;
   try {
-    const regs = await chrome.scripting.getRegisteredContentScripts({ ids: ['click-track'] });
-    if (regs && regs.length) { clickTrackOn = true; const b = document.getElementById('trackBtn'); if (b) { b.textContent = '👁 ON'; b.classList.add('tracking'); } }
+    const k = trackKey();
+    if ((await chrome.storage.local.get(k))[k]) {
+      clickTrackOn = true;
+      const b = document.getElementById('trackBtn');
+      if (b) { b.textContent = '👁 ON'; b.classList.add('tracking'); }
+    }
   } catch (_) {}
-})();
+}
 
 // Universal stock-API sniffer. Registers a document_start network hook on the CURRENT store site,
 // reloads the page so the stock request fires WITH the hook active, then reports which request
@@ -912,6 +963,7 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
     addLog('info', '🤖 Bot ' + MY_BOT_NUM + ' — panel ready');
     const sub = document.querySelector('.subtitle');
     if (sub) sub.textContent = 'Bot ' + MY_BOT_NUM;
+    await restoreTrackToggle(); // reflect THIS window's own tracker toggle (per-bot)
   } catch (e) { addLog('error', 'Could not get window id: ' + e.message); }
 
   // 1) Reopen on the store you were last using
@@ -939,6 +991,7 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
       addLog('info', 'Auto-selected ' + profileLabel(activeProfile) + ' (matches this tab).');
     }
   } catch (_) {}
+  applyWatchlistVisibility();
 
   const { pinSalt, botRunning, pinLockUntil = 0 } = await wget(['pinSalt', 'botRunning', 'pinLockUntil']);
   if (pinSalt) {
@@ -981,11 +1034,15 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
 })();
 
 // ── Messages from content script ───────────────────────────────────────────────
-chrome.runtime.onMessage.addListener(msg => {
+chrome.runtime.onMessage.addListener((msg, sender) => {
   // Per-window routing: a message tagged with a wid belongs to THAT window's panel only. Untagged
   // messages (background-origin, or the localhost Sam's flow) are shown everywhere as before.
   if (msg.wid != null && msg.wid !== MY_WID) return;
   if (msg.type === 'TRACK') {
+    // Tracker output belongs ONLY to the panel of the window where the interaction happened —
+    // the source tab's window (from sender.tab) tells us which. So each bot has its own track log.
+    if (!clickTrackOn) return; // this bot's tracker is OFF — don't show (shared script runs browser-wide)
+    if (sender && sender.tab && MY_WID != null && sender.tab.windowId !== MY_WID) return;
     // Log the interacted element's CODE so it can be copied out to tune a store. `kind` is the
     // gesture (CLICK / HOLD / DRAG); `extra` carries hold time or drag distance+direction.
     const icon = msg.kind === 'DRAG' ? '✋' : (msg.kind === 'HOLD' ? '⏳' : '👆');
@@ -1018,7 +1075,9 @@ function startQueueTimer(since, info) {
   const elapsed = document.getElementById('qElapsed');
   const est     = document.getElementById('qEst');
   elapsed.classList.add('active');
-  est.textContent = (info && info.est) ? info.est : (info && info.pos) ? ('#' + info.pos) : 'in line';
+  // Prefer showing your POSITION (#ticket) — with the ETA appended when we have both (Walmart).
+  est.textContent = (info && info.pos) ? ('#' + info.pos + (info.est ? ' · ' + info.est : ''))
+                  : (info && info.est) ? info.est : 'in line';
   if (queueTick) clearInterval(queueTick);
   const tick = () => { elapsed.textContent = mmss(Math.max(0, Math.floor((Date.now() - since) / 1000))); };
   tick(); queueTick = setInterval(tick, 1000);
@@ -1104,14 +1163,27 @@ async function toggleBot(testMode = false) {
     const cfg = readForm();
     const searchType = cfg.searchType || 'name';
     const identifier = searchType === 'sku' ? cfg.itemSku : cfg.itemName;
-    if (!cfg.useCurrentTab && !identifier) {
+
+    // Walmart drop watchlist: cycle multiple drop links and auto-enter the first queue that opens.
+    // Use the STABLE walmart.com/ip/<id> links (the same every drop) — NOT the buff.ly short links,
+    // which change per drop and carry no item ID.
+    const rawWatch = (activeProfile === 'walmart') ? (cfg.watchlist || '').trim() : '';
+    const watchIds = rawWatch ? parseWatchlist(rawWatch) : [];
+    const watchMode = watchIds.length > 0;
+    if (rawWatch && !watchMode) {
+      addLog('error', '👁 Watchlist has text but no Walmart item IDs found — paste walmart.com/ip/<id> links or bare IDs (buff.ly short links won\'t work).');
+      return;
+    }
+    if (watchMode) cfg.watchlist = watchIds; else delete cfg.watchlist;
+
+    if (!cfg.useCurrentTab && !watchMode && !identifier) {
       addLog('error', searchType === 'sku' ? 'Enter a SKU first!' : 'Enter an item name first!');
       return;
     }
 
-    // Store "search & navigate" mode: a store profile with "use current tab" UNCHECKED.
+    // Store "search & navigate" mode: a store profile with "use current tab" UNCHECKED (not watchlist).
     const navStore = STORE_NAV[activeProfile];
-    const samsSearchMode = !!navStore && !cfg.useCurrentTab;
+    const samsSearchMode = !!navStore && !cfg.useCurrentTab && !watchMode;
     if (samsSearchMode) cfg.samsSearch = true; // background uses this to inject on navigation
 
     addLog('info', cfg.useCurrentTab ? 'Using current tab' : 'Search type: ' + searchType + ' | Value: "' + identifier + '"');
@@ -1129,12 +1201,28 @@ async function toggleBot(testMode = false) {
     // truth, so a Test run can never be mistaken for a real one.
     cfg.testMode = !!testMode;
     // Fresh run flags: qtyDone (quantity), samsFellBack (SKU fallback), addAttempts (stuck guard)
-    await wset({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0, pokePlaceRetries: 0, botTestMode: !!testMode, botRunToken: Date.now() });
+    await wset({ botRunning: true, botPhase: 'SEARCH', botConfig: cfg, activeProfile, qtyDone: false, samsFellBack: false, addAttempts: 0, pokePlaceRetries: 0, botTestMode: !!testMode, botRunToken: Date.now(), watchIndex: 0 });
     if (testMode) addLog('info', '🧪 TEST MODE: full flow will run but the order will NOT be submitted.');
     setRunningUI(true);
 
     const siteUrl = (cfg.siteUrl || 'http://localhost:3000').replace(/\/$/, '');
-    if (cfg.useCurrentTab) {
+    if (watchMode) {
+      // Watchlist: drive THIS window's active tab through the drop links; the bot rotates to the
+      // next item when one is out of stock, and locks in when a queue opens (auto-enters it).
+      const url = STORE_NAV.walmart.item(watchIds[0]);
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab) { addLog('error', 'No active tab — open a Walmart tab in this window, then Start.'); setRunningUI(false); return; }
+      await wset({ currentTabId: tab.id, watchIndex: 0 });
+      // If we're ALREADY on the first item's page, a same-URL tabs.update won't reload it (so the
+      // bot would never inject) — force injection directly. Otherwise navigate (injects on load).
+      const onFirst = /\/ip\//.test(tab.url || '') && (tab.url || '').includes(String(watchIds[0]));
+      if (onFirst) {
+        chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
+      } else {
+        await chrome.tabs.update(tab.id, { url, active: true });
+      }
+      addLog('success', '👁 Watchlist: monitoring ' + watchIds.length + ' items — starting with #' + watchIds[0] + (onFirst ? ' (injecting here)' : ''));
+    } else if (cfg.useCurrentTab) {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab) { addLog('error', 'No active tab found — click the store tab, then Start.'); setRunningUI(false); return; }
       const okPage = /^https?:\/\//.test(tab.url || '');

@@ -203,11 +203,12 @@ body {
   font-size: 10px; font-weight: 700; color: #555;
   text-transform: uppercase; letter-spacing: .3px;
 }
-.form-group input, .form-group select {
+.form-group input, .form-group select, .form-group textarea {
   padding: 6px 9px; border: 1px solid #ddd; border-radius: 4px;
   font-size: 13px; width: 100%; transition: border-color .15s;
 }
-.form-group input:focus { outline: none; border-color: #0067A0; }
+.form-group input:focus, .form-group textarea:focus { outline: none; border-color: #0067A0; }
+.form-group textarea { resize: vertical; font-family: inherit; line-height: 1.4; }
 
 /* Two-column row for city/state/zip and expiry/cvv */
 .form-row { display: flex; gap: 10px; }

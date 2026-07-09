@@ -12,20 +12,80 @@
 // WAIT (not reload — reloading can lose your place in line) until it clears.
 function detectQueue() {
   const url = (location.href || '').toLowerCase();
+  // Walmart's drop waiting room is walmart.com/qp?qpdata={"queued":true,...} — match it explicitly.
+  if (/[\/.]qp\?|qpdata=/.test(url)) return true;
   if (/queue|waitingroom|waiting-room|\/qit\/|queue-it|holding|throttle/.test(url)) return true;
   const t = (document.body && document.body.innerText || '').toLowerCase();
-  return /waiting room|you are (now )?in line|you're in line|in the queue|your (place|spot|turn) in line|high demand|estimated wait|please wait while|number in line|currently in line|hold tight|you are in the queue/.test(t);
+  return /waiting room|hold my (spot|place)|you are (now )?in line|you're in line|in the queue|your (place|spot|turn) in line|high demand|estimated wait|please wait while|number in line|currently in line|hold tight|you are in the queue/.test(t);
 }
 
-// Reads the queue page's own "estimated wait" and "position in line" if shown.
+// Walmart encodes its drop-queue state in the URL: walmart.com/qp?qpdata=<url-encoded JSON>.
+// Decode it so we can read the queue token / position without scraping the page. Handles single or
+// double URL-encoding and returns the parsed object (or null).
+function decodeQpData() {
+  try {
+    const m = (location.href || '').match(/[?&]qpdata=([^&#]+)/);
+    if (!m) return null;
+    let raw = m[1];
+    for (let i = 0; i < 3; i++) {
+      try { return JSON.parse(decodeURIComponent(raw)); }
+      catch (_) { try { const d = decodeURIComponent(raw); if (d === raw) break; raw = d; } catch (_) { break; } }
+    }
+    return null;
+  } catch (_) { return null; }
+}
+
+// Parses Walmart's decoded qpdata into the fields we care about. Confirmed shape:
+//   ticket: <your position in line>   state: "pending" | "valid" (valid = YOUR TURN, CTA→"Buy")
+//   itemId, expectedTurnTimeUnixTimestamp (ms epoch of your expected turn),
+//   admissionLikelihood ("likely"/"unlikely"/…), customMetadata.item.{name,currentPrice,itemURL}
+function readWalmartQueue() {
+  const qp = decodeQpData();
+  if (!qp) return null;
+  const meta = (qp.customMetadata) || {};
+  const item = (meta.item) || {};
+  // qpdata is form-encoded, so spaces arrive as "+" — restore them in display strings.
+  const unplus = (s) => (typeof s === 'string') ? s.replace(/\+/g, ' ') : null;
+  return {
+    ticket:     (qp.ticket != null) ? String(qp.ticket) : null,   // position in line
+    state:      qp.state || null,                                  // pending | valid
+    yourTurn:   qp.state === 'valid',
+    itemName:   unplus(item.name),
+    itemId:     qp.itemId || item.itemID || null,
+    price:      item.currentPrice || null,
+    likelihood: meta.admissionLikelihood || null,
+    turnAt:     qp.expectedTurnTimeUnixTimestamp || null,          // ms epoch
+    queueId:    qp.queue || null,
+  };
+}
+
+// Formats a future epoch-ms as a short "~Xm"/"~Xs" ETA relative to now (or null).
+function etaFromEpoch(ms) {
+  if (!ms) return null;
+  const secs = Math.round((ms - Date.now()) / 1000);
+  if (secs <= 0) return 'now';
+  if (secs < 90) return '~' + secs + 's';
+  return '~' + Math.round(secs / 60) + 'm';
+}
+
+// Reads the queue's "estimated wait" and "position in line" — from the decoded Walmart qpdata URL
+// first (most reliable: ticket = position, expectedTurnTime = ETA), then falling back to on-page
+// text. Returns { est, pos, qp } where qp is the parsed Walmart queue object (or null).
 function readQueueInfo() {
   const t = (document.body && document.body.innerText) || '';
-  const est = (t.match(/estimated wait[^0-9]*([0-9]+\s*(?:min|minute|sec|second|hour)[a-z]*)/i) ||
-               t.match(/wait(?:ing)? time[^0-9]*([0-9]+\s*(?:min|minute|sec|second)[a-z]*)/i) ||
-               t.match(/about\s*([0-9]+\s*(?:min|minute|sec|second)[a-z]*)/i))?.[1];
-  const pos = (t.match(/(?:position|number)\s*(?:in line)?[^0-9]*([0-9][0-9,]{2,})/i) ||
-               t.match(/you are[^0-9]*([0-9][0-9,]{2,})(?:st|nd|rd|th)?\s*in line/i))?.[1];
-  return { est: est ? est.replace(/\s+/g, '') : null, pos: pos || null };
+  let est = (t.match(/estimated wait[^0-9]*([0-9]+\s*(?:min|minute|sec|second|hour)[a-z]*)/i) ||
+             t.match(/wait(?:ing)? time[^0-9]*([0-9]+\s*(?:min|minute|sec|second)[a-z]*)/i) ||
+             t.match(/about\s*([0-9]+\s*(?:min|minute|sec|second)[a-z]*)/i))?.[1];
+  let pos = (t.match(/(?:position|number)\s*(?:in line)?[^0-9]*([0-9][0-9,]{2,})/i) ||
+             t.match(/you are[^0-9]*([0-9][0-9,]{2,})(?:st|nd|rd|th)?\s*in line/i))?.[1];
+  // Walmart: the position lives in the qpdata URL (ticket), not the page text — prefer it.
+  const qp = readWalmartQueue();
+  if (qp) {
+    if (qp.ticket != null) pos = qp.ticket;
+    const eta = etaFromEpoch(qp.turnAt);
+    if (eta && !est) est = eta;
+  }
+  return { est: est ? String(est).replace(/\s+/g, '') : null, pos: pos || null, qp: qp || null };
 }
 
 // Reads a post-queue "complete your purchase within MM:SS" / "time remaining" countdown.

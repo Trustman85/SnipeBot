@@ -50,6 +50,11 @@
 
   window.addEventListener('pointerdown', function (e) {
     down = { x: e.clientX, y: e.clientY, t: Date.now(), el: e.target };
+    // Emit the element CODE immediately on PRESS. A click that NAVIGATES (e.g. Walmart's "Hold my
+    // spot and Keep shopping") unloads the page before pointerup's message can be delivered — so
+    // capturing on down makes the code survive the navigation. pointerup below only ADDS a line if
+    // the gesture turns out to be a hold or a drag (with its duration/distance).
+    emit('CLICK', e.target, '');
   }, true);
 
   window.addEventListener('pointerup', function (e) {
@@ -66,9 +71,8 @@
       emit('DRAG', el, dist + 'px ' + dir + ' / ' + held + 'ms');
     } else if (held >= HOLD_MS) {
       emit('HOLD', el, held + 'ms');
-    } else {
-      emit('CLICK', el, '');
     }
+    // A plain quick click was already logged on pointerdown — don't double-log it here.
   }, true);
 
   // If the pointer leaves the window mid-press, don't leak the gesture into the next one.

@@ -9,7 +9,7 @@
 var NS_ON = true;
 var PW_KEYS = new Set(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'currentTabId',
   'botTestMode', 'botRunToken', 'burstUntil', 'queueSince', 'qtyDone', 'samsFellBack', 'addAttempts',
-  'pokePlaceRetries', 'armState']);
+  'pokePlaceRetries', 'armState', 'watchIndex']);
 function _wid() { return (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null; }
 function nsk(key) { return (NS_ON && _wid() != null && PW_KEYS.has(key)) ? ('w' + _wid() + ':' + key) : key; }
 // Wrappers that auto-namespace ONLY per-window keys (global keys pass through); return original names.
@@ -64,24 +64,55 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
     // If the site put us in a waiting line, WAIT it out — do NOT reload (that can lose
     // your place). Track elapsed time, the queue's est-wait/position, and report to the panel.
     if (isStore && detectQueue()) {
-      // Persist the queue start time so "time in line" survives queue-page reloads
-      let qs = (await wget('queueSince')).queueSince;
-      if (!qs) { qs = Date.now(); await wset({ queueSince: qs }); }
-      log('warning', '⏳ In high-demand queue — waiting in line (will not reload)...');
-      setStatus('running', 'Waiting in queue (high demand)...');
-      chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'in', since: qs, info: readQueueInfo() }).catch(() => {});
-
-      let waited = 0;
-      while (detectQueue()) {
+      // Walmart: the qpdata URL carries your exact position (ticket #), the item, your odds, an ETA,
+      // and whether it's your turn (state=valid). Surface it so you can see where you stand per item.
+      const wq = (typeof readWalmartQueue === 'function') ? readWalmartQueue() : null;
+      if (wq && wq.yourTurn) {
+        setStep('🎉 Your turn', (wq.itemName || wq.itemId || 'item') + ' — proceeding to buy!', 'done');
+        chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: 'Walmart: it\'s your turn — ' + (wq.itemName || 'item') }).catch(() => {});
+        await wremove('queueSince');
+        chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'out' }).catch(() => {});
+        // NOT a blocking queue anymore — fall through to the buy flow below.
+      } else {
+        // Persist the queue start time so "time in line" survives queue-page reloads
+        let qs = (await wget('queueSince')).queueSince;
+        if (!qs) { qs = Date.now(); await wset({ queueSince: qs }); }
+        if (wq) {
+          setStep('🎟️ In line', '#' + (wq.ticket || '?') + ' for "' + (wq.itemName || wq.itemId || 'item') + '"' +
+            (wq.likelihood ? ' · odds: ' + wq.likelihood : '') +
+            (etaFromEpoch(wq.turnAt) ? ' · turn ' + etaFromEpoch(wq.turnAt) : ''));
+        } else {
+          setStep('⏳ In queue', 'high demand — waiting in line (will not reload)');
+        }
         chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'in', since: qs, info: readQueueInfo() }).catch(() => {});
-        await sleep(3000); waited += 3;
-        if (waited % 15 === 0) log('info', 'Still in queue... (' + Math.round((Date.now() - qs) / 1000) + 's in line)');
-        const st = await wget('botRunning');
-        if (!st.botRunning) return; // user stopped
+
+        let waited = 0, held = false, lastPos = wq && wq.ticket;
+        while (detectQueue()) {
+          // Your turn can flip mid-wait (state → valid): stop waiting and go buy.
+          const now = (typeof readWalmartQueue === 'function') ? readWalmartQueue() : null;
+          if (now && now.yourTurn) {
+            setStep('🎉 Your turn', (now.itemName || now.itemId || 'item') + ' — proceeding to buy!', 'done');
+            chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: 'Walmart: it\'s your turn — ' + (now.itemName || 'item') }).catch(() => {});
+            break;
+          }
+          // Log position changes so you can watch it move up the line (per item).
+          if (now && now.ticket && now.ticket !== lastPos) {
+            log('info', '🎟️ Position now #' + now.ticket + (etaFromEpoch(now.turnAt) ? ' · turn ' + etaFromEpoch(now.turnAt) : ''));
+            lastPos = now.ticket;
+          }
+          // Walmart's queue page has a "Hold my spot and Keep shopping" button that SECURES your
+          // place in line — unlike a passive Queue-it room, you must CLICK it. Do so once, then wait.
+          if (!held && await clickQueueHoldSpot(store)) { held = true; await sleep(1500); continue; }
+          chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'in', since: qs, info: readQueueInfo() }).catch(() => {});
+          await sleep(3000); waited += 3;
+          if (waited % 15 === 0) log('info', 'Still in queue... (' + Math.round((Date.now() - qs) / 1000) + 's in line)');
+          const st = await wget('botRunning');
+          if (!st.botRunning) return; // user stopped
+        }
+        await wremove('queueSince');
+        chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'out' }).catch(() => {});
+        log('success', 'Queue cleared after ' + Math.round((Date.now() - qs) / 1000) + 's — continuing');
       }
-      await wremove('queueSince');
-      chrome.runtime.sendMessage({ type: 'BOT_QUEUE', state: 'out' }).catch(() => {});
-      log('success', 'Queue cleared after ' + Math.round((Date.now() - qs) / 1000) + 's — continuing');
     }
 
     // Report any post-queue "complete checkout within MM:SS" window to the panel
@@ -598,6 +629,28 @@ async function awaitCaptchaClear(tag) {
   return true;
 }
 
+// Walmart's drop queue shows a "Hold my spot and Keep shopping" button that SECURES your place in
+// line (then returns you to browsing). Unlike a passive queue, you must CLICK it. Matched by TEXT —
+// the data-dca-aid on it is per-session, not stable. Clicks once; returns true if it clicked.
+async function clickQueueHoldSpot(store) {
+  const cands = Array.from(document.querySelectorAll('button, [role="button"], a'));
+  const btn = cands.find(function (b) {
+    const t = (b.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    return /hold my (spot|place)|hold your (spot|place)/.test(t) && !b.disabled && b.offsetParent !== null;
+  });
+  if (!btn) return false;
+  log('success', '🎟️ Queue: clicking "' + (btn.textContent || '').trim().slice(0, 45) + '" to hold your spot...');
+  // Prefer a TRUSTED (CDP) click when the store needs one; the per-session data-dca-aid gives a
+  // stable enough selector for THIS click. Fall back to a normal DOM click.
+  const aid = btn.getAttribute && btn.getAttribute('data-dca-aid');
+  if (store && store.trustedClick && aid) {
+    const ok = await trustedClickSel('button[data-dca-aid="' + aid + '"]');
+    if (ok) return true;
+  }
+  try { btn.click(); } catch (_) {}
+  return true;
+}
+
 // Detects a page-level ERROR that warrants a REFRESH (vs. a clickable button we should push
 // through): site overloaded / "something went wrong" / item-not-found pages that show up when a
 // drop site is hammered. Out-of-stock is handled separately via the DISABLED action button, so it
@@ -995,11 +1048,54 @@ async function buyNowDrawerCheckout(store, cfg) {
     { type: 'TARGET_CVV', cvv: cfg.cvv, confirm: true }, resp => r(resp)));
 }
 
+// Reads the buy-box SELLER on a Walmart product page. Returns 'walmart' (1st-party retail),
+// 'other:<name>' (3rd-party marketplace seller), or null if it can't be read from the page.
+function walmartSeller() {
+  const scan = (s) => {
+    s = (s || '').toLowerCase().replace(/\s+/g, ' ');
+    const m = s.match(/sold (?:and shipped )?by\s*:?\s*([a-z0-9 .,'&\-]{2,40})/);
+    if (!m) return null;
+    return /walmart/.test(m[1]) ? 'walmart' : ('other:' + m[1].trim().replace(/[.,]+$/, ''));
+  };
+  // Targeted seller elements first (more reliable than scanning the whole page).
+  const sel = '[data-testid*="seller" i],[data-automation-id*="seller" i],[link-identifier*="seller" i],[aria-label*="sold" i],a[href*="/seller/"],a[href*="sold-and-shipped"]';
+  for (const n of document.querySelectorAll(sel)) {
+    const r = scan(n.textContent) || scan(n.getAttribute && n.getAttribute('aria-label'));
+    if (r) return r;
+  }
+  // Fallback: the buy box / page text ("Sold and shipped by …").
+  return scan(document.body && document.body.innerText);
+}
+
+// Walmart retail-only guard. The SELLER is the decider: buy only a 1st-party "Sold by Walmart" offer,
+// and refuse any 3rd-party marketplace seller (the inflated $200+ resell listings). This means you do
+// NOT have to set a price per item. Returns a REASON string if we should NOT buy, or null if it's a
+// Walmart retail offer (or the seller can't be read — the retail drop routes through the /qp queue
+// anyway, so we don't block on an unreadable seller).
+function walmartRetailReject(cfg) {
+  const seller = walmartSeller();
+  if (seller && seller.indexOf('other:') === 0)
+    return 'sold by "' + seller.slice(6).slice(0, 28) + '" — 3rd-party marketplace seller, not Walmart';
+  if (seller === 'walmart') log('success', '✅ Sold by Walmart — retail offer, OK to buy.');
+  else log('info', '⚠️ Seller not shown on this page — allowing (retail drops route through the queue).');
+  // OPTIONAL extra cap: only if you ALSO set a Max Price, reject a price above it.
+  const max = parseFloat((cfg && cfg.maxPrice) || '0');
+  if (max > 0) {
+    const el = document.querySelector('[itemprop="price"]');
+    const price = el ? (parseFloat(el.getAttribute('content') || (el.textContent || '').replace(/[^0-9.]/g, '')) || 0) : 0;
+    if (price > 0 && price > max) return 'price $' + price + ' over your Max Price $' + max;
+  }
+  return null;
+}
+
 async function runStore(store, cfg, burst) {
   const S = store.sel;
   const phase = store.detectPhase(location.href) || 'SEARCH';
-  log('info', '── ' + phase + ' ──');
-  setStatus('running', store.name + ': ' + phase);
+  // Named steps for the checkout side so the status bar reads clearly. SEARCH is left to its own
+  // handler below (watchlist sets a "Watching" step; single-item just searches) to avoid log spam.
+  var PHASE_STEP = { RESULTS: '🔍 Search results', CART: '🛒 In cart', CHECKOUT: '💳 Checkout', CONFIRM: '✅ Order placed' };
+  if (PHASE_STEP[phase]) setStep(PHASE_STEP[phase]);
+  else { log('info', '── ' + phase + ' ──'); setStatus('running', store.name + ': ' + phase); }
 
   if (phase === 'RESULTS') {
     const want = (cfg.itemName || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2);
@@ -1039,7 +1135,16 @@ async function runStore(store, cfg, burst) {
     const tcin = (location.pathname.match(/\/A-(\d+)/) || [])[1];
     const mainSel = tcin ? '#addToCartButtonOrTextIdFor' + tcin : null;
     const actionSel = (canBuyNow ? S.buyNow + ', ' : '') + S.addToCart;
-    await waitForAnyState(mainSel || actionSel, burst ? 700 : 8000);
+    // In watchlist mode we're scanning many items, so don't burn 8s per out-of-stock item — a live
+    // item redirects to /qp (caught earlier by detectQueue), so a slow-to-render add button here
+    // means it's not live; bail sooner and rotate to the next item.
+    const watchlistMode = store.key === 'walmart' && Array.isArray(cfg.watchlist) && cfg.watchlist.length > 1;
+    if (watchlistMode) {
+      let wi = (await wget('watchIndex')).watchIndex; if (typeof wi !== 'number') wi = 0;
+      const itemId = location.pathname.replace(/\/+$/, '').split('/').pop();
+      setStatus('running', '👁 STEP: Watching for drop — #' + itemId + ' (' + (wi + 1) + '/' + cfg.watchlist.length + ')');
+    }
+    await waitForAnyState(mainSel || actionSel, burst ? 700 : (watchlistMode ? 3500 : 8000));
 
     // Resolve the action button + a UNIQUE selector to click. For Target, anchor on the MAIN
     // product button (its id is "addToCartButtonOrTextIdFor<TCIN>"), so a "Buy now"/"Add to cart"
@@ -1076,13 +1181,57 @@ async function runStore(store, cfg, burst) {
         const tcin = (location.pathname.match(/\/A-(\d+)/) || [])[1];
         if (tcin) { await watchTargetStock(tcin, interval, burst); return; }
       }
-      const delay = burst ? 150 : interval * 1000;
-      const why = errNow || (!addBtn ? 'not available' : 'out of stock');
-      log('warning', (burst ? '⚡ ' : '') + why + (burst ? ' — burst reloading…' : ' — refreshing…'));
-      await sleep(delay); location.reload(); return;
+      // WALMART: reloading the item page bounces you back into the /qp queue (loses your spot), so
+      // do NOT reload — wait IN-PLACE for the Add to cart button to become buyable, then fall
+      // through and click it. Reload only as a last resort if it never enables.
+      const watchlist = (store.key === 'walmart' && Array.isArray(cfg.watchlist)) ? cfg.watchlist : null;
+      if (watchlist && watchlist.length > 1) {
+        // WATCHLIST MODE: this drop item isn't live yet — rotate to the NEXT item in the list.
+        // Any non-buyable state means "not live, check the next one": out-of-stock, a disabled
+        // button, OR an "item not available" page (which detectStoreError flags as errNow — that's
+        // the normal pre-drop state here, not a transient error to retry). When one IS live it
+        // redirects to /qp, which the queue block above auto-enters, so rotation stops naturally.
+        let idx = (await wget('watchIndex')).watchIndex; if (typeof idx !== 'number') idx = 0;
+        const next = (idx + 1) % watchlist.length;
+        await wset({ watchIndex: next });
+        log('info', '👁 Watchlist: #' + (watchlist[idx] || '?') + ' not live — next #' + watchlist[next] + ' (' + (next + 1) + '/' + watchlist.length + ')');
+        await sleep(Math.max(1500, interval * 1000)); // gentle pace so we don't trip anti-bot
+        location.href = store.itemUrl(watchlist[next]); return;
+      }
+      if (store.key === 'walmart' && !errNow) {
+        log('info', 'Walmart: waiting in place for the item to become buyable (no reload — keeps your queue spot)...');
+        const el = await waitForAny(S.addToCart, burst ? 60000 : 120000);
+        if (el) { addBtn = el; clickSel = S.addToCart; usingBuyNow = false; }
+        else { log('warning', 'Walmart: still not buyable after waiting — reloading as a last resort.'); await sleep(interval * 1000); location.reload(); return; }
+      } else {
+        const delay = burst ? 150 : interval * 1000;
+        const why = errNow || (!addBtn ? 'not available' : 'out of stock');
+        log('warning', (burst ? '⚡ ' : '') + why + (burst ? ' — burst reloading…' : ' — refreshing…'));
+        await sleep(delay); location.reload(); return;
+      }
     }
 
-    log('success', usingBuyNow ? 'Buy now — opening checkout drawer...' : 'Adding to cart...');
+    // WALMART retail-only guard: a buyable button here might be an over-priced 3rd-party offer, NOT
+    // the cheap retail drop. If so, DON'T buy — keep waiting for the retail drop (arrives via the /qp
+    // queue at the retail price). Watchlist → rotate to next item; single → reload to keep watching.
+    if (store.key === 'walmart') {
+      const reject = walmartRetailReject(cfg);
+      if (reject) {
+        log('warning', '⛔ Not buying — ' + reject + '. Waiting for the retail drop.');
+        setStatus('running', '⛔ 3rd-party/over-price — waiting for retail');
+        const wl = Array.isArray(cfg.watchlist) ? cfg.watchlist : null;
+        if (wl && wl.length > 1) {
+          let idx = (await wget('watchIndex')).watchIndex; if (typeof idx !== 'number') idx = 0;
+          const next = (idx + 1) % wl.length;
+          await wset({ watchIndex: next });
+          await sleep(Math.max(1500, interval * 1000));
+          location.href = store.itemUrl(wl[next]); return;
+        }
+        await sleep(Math.max(1500, interval * 1000)); location.reload(); return;
+      }
+    }
+
+    setStep(usingBuyNow ? '🛒 Buy now' : '🛒 Adding to cart', usingBuyNow ? 'opening checkout drawer' : '');
     if (store.trustedClick) {
       const ok = await trustedClickSel(clickSel);
       if (!ok) { log('warning', 'Trusted click failed — falling back to DOM click'); addBtn.click(); }
@@ -1142,7 +1291,7 @@ async function runStore(store, cfg, burst) {
       chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
       return;
     }
-    log('success', 'Proceeding to checkout...'); co.click(); return;
+    setStep('💳 Checkout', 'proceeding to checkout'); co.click(); return;
   }
 
   if (phase === 'CHECKOUT') {
@@ -1168,7 +1317,7 @@ async function runStore(store, cfg, burst) {
     }
     // A bot challenge can gate the final submit — pause & alert to clear it, then place the order.
     if (!(await awaitCaptchaClear('checkout'))) return;
-    log('success', 'Placing order...');
+    setStep('✅ Placing order');
     if (store.trustedClick) {
       const ok = await trustedClickSel(S.placeOrder);
       if (!ok) po.click();
@@ -1258,6 +1407,14 @@ function log(level, text) {
 function setStatus(state, text) {
   const wid = (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null;
   chrome.runtime.sendMessage({ type: 'BOT_STATUS', status: state, text, wid }).catch(() => {});
+}
+
+// Named steps — surfaced in the status bar AND logged as "▶ STEP: …", so it's always clear which
+// step the bot is on at any moment (watching → in line → your turn → cart → checkout → placed).
+function setStep(name, extra, state) {
+  const full = name + (extra ? ' — ' + extra : '');
+  log('info', '▶ STEP: ' + full);
+  setStatus(state || 'running', full);
 }
 
 // Big full-screen confirmation banner drawn ON the page (used by Test mode). Self-contained

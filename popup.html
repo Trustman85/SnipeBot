@@ -98,6 +98,13 @@
       <span class="field-hint">Available SKUs: product-001, product-002</span>
     </div>
     <input type="hidden" id="searchType" value="name">
+    <!-- Walmart drop watchlist: paste the drop links/IDs ahead of time; the bot watches all of them
+         and auto-enters the queue of whichever opens first. Shown only for the Walmart profile. -->
+    <div class="form-group" id="watchGroup" style="display:none">
+      <label>👁 Drop watchlist — one walmart.com/ip/… link or item ID per line</label>
+      <textarea id="watchlist" rows="5" placeholder="https://www.walmart.com/ip/20278470684&#10;19965460207&#10;19594412970"></textarea>
+      <span class="field-hint">Use the stable /ip/&lt;id&gt; links (NOT buff.ly — those change each drop). Bot cycles all items and jumps into the first queue that opens.</span>
+    </div>
     <div class="form-group"><label>Quantity (how many to add)</label><input type="number" id="quantity" placeholder="1" value="1" min="1" max="20"></div>
     <div class="form-group"><label>Max Price ($)</label><input type="number" id="maxPrice" placeholder="999" value="999" min="0"></div>
     <div class="form-group">
