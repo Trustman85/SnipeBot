@@ -27,7 +27,24 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
 (async () => {
   try {
     const { botRunning, botPhase, botConfig, activeProfile, burstUntil, botRunToken, windowNames } = await wget(['botRunning', 'botPhase', 'botConfig', 'activeProfile', 'burstUntil', 'botRunToken', 'windowNames']);
-    if (!botRunning || !botConfig) return;
+    // Step telemetry — proves the content script executed and reports the state it read. Tagged with
+    // THIS tab's window id so it lands ONLY in the owning window's panel (per-window activity log).
+    chrome.runtime.sendMessage({ type: 'BOT_LOG', level: 'info', wid: _wid(),
+      text: '🔬 content ran @' + location.pathname.slice(0, 40) + ' | wid=' + _wid() +
+            ' running=' + !!botRunning + ' cfg=' + !!botConfig + ' token=' + botRunToken +
+            ' lastTok=' + (window.__botRunToken || 'none') }).catch(() => {});
+    if (!botRunning || !botConfig) {
+      // If this injection came from an EXPLICIT Start (background stamped __BOT_EXPLICIT) yet the
+      // run state is invisible from this tab, say so in the panel — the classic cause is a
+      // window-id mismatch between the panel and this tab, and silence here made it undebuggable.
+      if (window.__BOT_EXPLICIT && Date.now() - window.__BOT_EXPLICIT < 8000) {
+        window.__BOT_EXPLICIT = 0;
+        chrome.runtime.sendMessage({ type: 'BOT_LOG', level: 'error', wid: _wid(),
+          text: '⚠️ Injected on Start but found no run state in this tab (wid=' + _wid() +
+                ', running=' + !!botRunning + ', config=' + !!botConfig + ') — reopen the sidebar and tell the dev.' }).catch(() => {});
+      }
+      return;
+    }
     // Which window/bot is this tab part of? Background stamped window.__BOT_WID before injecting us;
     // map it to the friendly "Bot N" label so the log clearly says which bot a tab belongs to.
     const myWid  = (typeof window.__BOT_WID === 'number') ? window.__BOT_WID : null;
@@ -769,6 +786,73 @@ async function watchStockHtml(url, interval, burst) {
   }
 }
 
+// WALMART watchlist watcher — polls EVERY drop item's availability via a same-origin HTML fetch
+// (background, in the page's context — DataDome tolerates that like a normal page request) WITHOUT
+// navigating. The tab stays on the current item; we navigate ONLY when a DIFFERENT item flips to a
+// live RETAIL offer. Falls back to page rotation if the fetch is blocked/errors across a full pass.
+async function watchWalmartList(list, interval, burst, store, cfg) {
+  const pollMs = Math.max(700, (burst ? 0.6 : (parseFloat(interval) || 2)) * 1000);
+  log('info', '⚡ Watchlist: monitoring ' + list.length + ' items via background stock checks (no page reloads).');
+  // The item this tab is CURRENTLY on — never "navigate" to it (that just reloads the same page in a
+  // loop). Its own retail-guard already ran and sent us here to watch.
+  const hereId = (location.pathname.match(/\/ip\/(?:.*\/)?(\d{6,})/) || [])[1] || null;
+  let errStreak = 0;
+  for (let cycle = 0; ; cycle++) {
+    for (let j = 0; j < list.length; j++) {
+      const st = await wget('botRunning');
+      if (!st.botRunning) return; // stopped by the user
+      const id = list[j];
+      const url = store.itemUrl(id);
+      const r = await new Promise(res => chrome.runtime.sendMessage({ type: 'HTML_STOCK_POLL', url, mode: 'walmart' }, resp => res(resp || {})));
+      if (r.ok && r.inStock && String(id) !== String(hereId)) {
+        // A DIFFERENT item went live (retail) — go to it (routes into /qp / buy flow).
+        log('success', '⚡ #' + id + ' is LIVE (' + r.status + ') — navigating to grab it!');
+        await wset({ watchIndex: j });
+        location.href = url; return;
+      }
+      if (!r.ok || r.status === 'ERR') {
+        if (++errStreak >= list.length) {
+          log('warning', '⚡ Stock fetch blocked — falling back to page rotation.');
+          let idx = (await wget('watchIndex')).watchIndex; if (typeof idx !== 'number') idx = 0;
+          const next = (idx + 1) % list.length;
+          await wset({ watchIndex: next });
+          await sleep(Math.max(1500, interval * 1000));
+          location.href = store.itemUrl(list[next]); return;
+        }
+      } else errStreak = 0;
+      setStep('👁 Watching', list.length + ' items — #' + id + ' ' + (r.status || 'OOS') + ' (no reloads)');
+      await sleep(pollMs);
+    }
+    if (cycle % 5 === 0) log('info', '👁 Watchlist: all ' + list.length + ' still OOS — watching…');
+  }
+}
+
+// WALMART single-item watcher — same idea as the watchlist one but for ONE item (use-current-tab
+// or a 1-item watchlist). Polls THIS item's availability via a same-origin HTML fetch WITHOUT
+// reloading the page ("item not available — refreshing…" is what we're replacing), and reloads
+// ONCE only when a genuine RETAIL offer is live (not the permanent 3rd-party $200 listing).
+async function watchWalmartItem(url, interval, burst, store, cfg) {
+  const pollMs = Math.max(700, (burst ? 0.6 : (parseFloat(interval) || 2)) * 1000);
+  log('info', '⚡ Watching this item in the background — no page reloads until the retail drop is live.');
+  let errStreak = 0;
+  for (let i = 0; ; i++) {
+    const st = await wget('botRunning');
+    if (!st.botRunning) return; // stopped by the user
+    const r = await new Promise(res => chrome.runtime.sendMessage({ type: 'HTML_STOCK_POLL', url, mode: 'walmart' }, resp => res(resp || {})));
+    if (r.ok && r.inStock) { // inStock here already REQUIRES the retail-seller signal (background.js)
+      log('success', '⚡ Retail offer is LIVE — reloading to grab it!');
+      location.reload(); return;
+    }
+    if (!r.ok || r.status === 'ERR') {
+      if (++errStreak >= 4) { log('warning', '⚡ Stock fetch blocked — falling back to a page reload.'); await sleep(pollMs); location.reload(); return; }
+    } else errStreak = 0;
+    const state = r.busy ? 'page busy — retrying' : (!r.avail ? 'not available' : (r.retail ? 'in stock (retail!)' : 'in stock — 3rd-party only'));
+    setStep('👁 Watching', 'in background — ' + state + ' (no reloads)');
+    if (i % 12 === 0) log('info', '👁 still watching — ' + state + '…');
+    await sleep(pollMs);
+  }
+}
+
 // ── Generic store flow (scaffold) ──────────────────────────────────────────────
 // Drives Target/Walmart/Best Buy/Pokémon Center from their adapter config. This is a
 // best-effort starting point — each store's selectors/CVV handling need real-HTML tuning.
@@ -797,8 +881,30 @@ function waitForAnyState(selectorList, timeout = 5000) {
 }
 // Real browser-level click via CDP (background). For buttons gated on trusted events
 // (Target's Buy now / Place your order ignore a scripted .click()). Returns true on success.
+// TIMEOUT-guarded: the background reply can be lost if the service worker cycles or chrome.debugger
+// hangs — without a timeout the await here freezes the WHOLE buy flow right at "Buy now" (exactly
+// the "item live but bot froze, never clicked Buy now" symptom). On no-reply we retry once, then
+// give up so the caller can fall back instead of hanging forever.
 async function trustedClickSel(selector) {
-  return await new Promise(res => chrome.runtime.sendMessage({ type: 'CDP_CLICK', selector }, r => res(!!r)));
+  const attempt = () => new Promise(res => {
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; res(v); } };
+    try { chrome.runtime.sendMessage({ type: 'CDP_CLICK', selector }, r => fin(!!r)); } catch (_) { fin(false); }
+    setTimeout(() => fin(null), 7000); // null = no reply (worker/CDP hung)
+  });
+  let r = await attempt();
+  if (r === null) { log('warning', 'Trusted click got no reply — retrying once…'); r = await attempt(); }
+  return r === true;
+}
+// sendMessage to background with a hard timeout, so a cycled/hung service worker (which never calls
+// sendResponse) can NEVER freeze the buy flow. Returns `fallback` if no reply arrives in `ms`.
+function bgSend(msg, ms, fallback) {
+  return new Promise(res => {
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; res(v); } };
+    try { chrome.runtime.sendMessage(msg, r => fin(r === undefined ? fallback : r)); } catch (_) { fin(fallback); }
+    setTimeout(() => fin(fallback), ms || 8000);
+  });
 }
 function fillGeneric(el, val) {
   el.focus();
@@ -981,6 +1087,21 @@ async function pokemonCheckout(store, cfg) {
   log('error', 'Card rejected even at ' + MAX_SPEED + 'ms — check the number.');
 }
 
+// Target drop failure popups (confirmed by the click tracker during a real drop): a modal with only
+// "Close" (on the product page, after a Buy-now click fails) or "Ok" (on /checkout/buy-now/checkout
+// when the order can't proceed). A human dismisses them and retries — this clicks the first visible
+// one and returns its label (null if none).
+function dismissTargetModal() {
+  for (const b of document.querySelectorAll('button')) {
+    const t = (b.textContent || '').trim().toLowerCase();
+    if ((t === 'close' || t === 'ok') && b.offsetParent !== null && !b.disabled && b.getAttribute('aria-disabled') !== 'true') {
+      b.click();
+      return t;
+    }
+  }
+  return null;
+}
+
 // Target's "Buy now" opens the checkout as a DRAWER on the same product URL (no navigation),
 // so we finish the order right here instead of waiting for a CHECKOUT page that never loads.
 // Waits for the Total to populate, fills CVV if asked, then submits (or, in Test mode, shows
@@ -997,8 +1118,7 @@ async function buyNowDrawerCheckout(store, cfg) {
   const kw = ['place your order', 'place order', 'placeorder', 'submit order'];
   let res = { found: false };
   for (let i = 0; i < 20; i++) {
-    res = await new Promise(r => chrome.runtime.sendMessage(
-      { type: 'PLACE_ORDER_FRAMES', selectors: [S.placeOrder], keywords: kw, click: false }, resp => r(resp || { found: false })));
+    res = await bgSend({ type: 'PLACE_ORDER_FRAMES', selectors: [S.placeOrder], keywords: kw, click: false }, 6000, { found: false });
     if (res.found) break;
     await sleep(300);
   }
@@ -1023,8 +1143,7 @@ async function buyNowDrawerCheckout(store, cfg) {
   // ── REAL run only beyond this point ──────────────────────────────────────────────
   // Click "Place your order", which opens the "Confirm your CVV" sidebar.
   log('success', 'Clicking "Place your order"...');
-  await new Promise(r => chrome.runtime.sendMessage(
-    { type: 'PLACE_ORDER_FRAMES', selectors: [S.placeOrder], keywords: kw, click: true }, resp => r(resp)));
+  await bgSend({ type: 'PLACE_ORDER_FRAMES', selectors: [S.placeOrder], keywords: kw, click: true }, 8000, { found: false });
 
   // A bot challenge (press-and-hold / DataDome) often fires right after this click — pause &
   // alert you to clear it, then resume, before we go looking for the CVV sidebar.
@@ -1036,16 +1155,14 @@ async function buyNowDrawerCheckout(store, cfg) {
   log('info', 'Waiting for CVV confirmation sidebar...');
   let cvvRes = { found: false };
   for (let i = 0; i < 20; i++) {
-    cvvRes = await new Promise(r => chrome.runtime.sendMessage(
-      { type: 'TARGET_CVV', cvv: cfg.cvv, confirm: false }, resp => r(resp || { found: false })));
+    cvvRes = await bgSend({ type: 'TARGET_CVV', cvv: cfg.cvv, confirm: false }, 6000, { found: false });
     if (cvvRes.found) break;
     await sleep(300);
   }
   if (!cvvRes.found) { log('warning', 'Target: CVV sidebar not found — stopping before order.'); return; }
   log('success', 'CVV entered — confirming order...');
   await wset({ botPhase: 'CONFIRM' });
-  await new Promise(r => chrome.runtime.sendMessage(
-    { type: 'TARGET_CVV', cvv: cfg.cvv, confirm: true }, resp => r(resp)));
+  await bgSend({ type: 'TARGET_CVV', cvv: cfg.cvv, confirm: true }, 8000, { found: false });
 }
 
 // Reads the buy-box SELLER on a Walmart product page. Returns 'walmart' (1st-party retail),
@@ -1122,6 +1239,30 @@ async function runStore(store, cfg, burst) {
       log('info', 'Checkout drawer already open — placing order...');
       await buyNowDrawerCheckout(store, cfg); return;
     }
+    // TARGET: Buy now sometimes NAVIGATES to /checkout/buy-now/checkout instead of opening the
+    // drawer. During a drop an "Ok" error popup can block that page (capture: Ok → bounced back to
+    // the item → Buy now again). So here: Place-order appears → finish checkout; "Ok"/"Close" popup
+    // → dismiss it (Target bounces us back to the item, where the buy loop re-runs); neither → wait.
+    if (store.key === 'target' && /\/checkout/.test(location.pathname)) {
+      const poKw = ['place your order', 'place order', 'placeorder', 'submit order'];
+      log('info', 'Target checkout page — waiting for "Place your order" (or an error popup)...');
+      for (let i = 0; i < 25; i++) {
+        const st = await wget('botRunning');
+        if (!st.botRunning) return;
+        const po = await bgSend({ type: 'PLACE_ORDER_FRAMES', selectors: [S.placeOrder], keywords: poKw, click: false }, 4000, { found: false });
+        if (po.found) { await buyNowDrawerCheckout(store, cfg); return; }
+        // Same grace as the drawer: give the checkout page ~7s to render Place-order before
+        // treating a "Close"/"Ok" as the failure popup (dismissing early kills a loading page).
+        if (i >= 14) {
+          const dis = dismissTargetModal();
+          if (dis) { log('warning', '🧹 Checkout popup — clicked "' + dis + '" (bounces back to the item; bot retries there).'); return; }
+        }
+        setStep('💳 Checkout', 'waiting for Place your order (' + (i + 1) + ')');
+        await sleep(500);
+      }
+      log('warning', 'Target checkout: nothing actionable appeared — reloading.');
+      location.reload(); return;
+    }
     // Set quantity ON THE PRODUCT PAGE (must happen BEFORE Buy now uses it):
     //  • qtySelect → <select> dropdown (Target)   • qtyInput → cart-page box (handled later, not here)
     if (wantQty > 1) {
@@ -1186,24 +1327,18 @@ async function runStore(store, cfg, burst) {
       // through and click it. Reload only as a last resort if it never enables.
       const watchlist = (store.key === 'walmart' && Array.isArray(cfg.watchlist)) ? cfg.watchlist : null;
       if (watchlist && watchlist.length > 1) {
-        // WATCHLIST MODE: this drop item isn't live yet — rotate to the NEXT item in the list.
-        // Any non-buyable state means "not live, check the next one": out-of-stock, a disabled
-        // button, OR an "item not available" page (which detectStoreError flags as errNow — that's
-        // the normal pre-drop state here, not a transient error to retry). When one IS live it
-        // redirects to /qp, which the queue block above auto-enters, so rotation stops naturally.
-        let idx = (await wget('watchIndex')).watchIndex; if (typeof idx !== 'number') idx = 0;
-        const next = (idx + 1) % watchlist.length;
-        await wset({ watchIndex: next });
-        log('info', '👁 Watchlist: #' + (watchlist[idx] || '?') + ' not live — next #' + watchlist[next] + ' (' + (next + 1) + '/' + watchlist.length + ')');
-        await sleep(Math.max(1500, interval * 1000)); // gentle pace so we don't trip anti-bot
-        location.href = store.itemUrl(watchlist[next]); return;
+        // WATCHLIST MODE: watch ALL drop items in the BACKGROUND (same-origin HTML fetch reading
+        // availabilityStatus) WITHOUT navigating — the tab stays put and we only navigate to an
+        // item the instant a RETAIL offer goes live. Falls back to rotation if the fetch is blocked.
+        await watchWalmartList(watchlist, interval, burst, store, cfg); return;
       }
-      if (store.key === 'walmart' && !errNow) {
-        log('info', 'Walmart: waiting in place for the item to become buyable (no reload — keeps your queue spot)...');
-        const el = await waitForAny(S.addToCart, burst ? 60000 : 120000);
-        if (el) { addBtn = el; clickSel = S.addToCart; usingBuyNow = false; }
-        else { log('warning', 'Walmart: still not buyable after waiting — reloading as a last resort.'); await sleep(interval * 1000); location.reload(); return; }
-      } else {
+      // WALMART single item: watch in the BACKGROUND (same-origin HTML poll) instead of reloading
+      // the page every cycle. Covers BOTH "item not available" (errNow — the normal pre-drop state)
+      // and out-of-stock. Reloads only when the retail offer is live; never bounces a /qp queue spot.
+      if (store.key === 'walmart') {
+        await watchWalmartItem(location.href.split('#')[0], interval, burst, store, cfg); return;
+      }
+      {
         const delay = burst ? 150 : interval * 1000;
         const why = errNow || (!addBtn ? 'not available' : 'out of stock');
         log('warning', (burst ? '⚡ ' : '') + why + (burst ? ' — burst reloading…' : ' — refreshing…'));
@@ -1227,7 +1362,9 @@ async function runStore(store, cfg, burst) {
           await sleep(Math.max(1500, interval * 1000));
           location.href = store.itemUrl(wl[next]); return;
         }
-        await sleep(Math.max(1500, interval * 1000)); location.reload(); return;
+        // Single item: don't reload-loop on the 3rd-party offer — watch in the background and only
+        // reload when a retail offer appears.
+        await watchWalmartItem(location.href.split('#')[0], interval, burst, store, cfg); return;
       }
     }
 
@@ -1239,7 +1376,49 @@ async function runStore(store, cfg, burst) {
       addBtn.click();
     }
     await sleep(900);
-    if (usingBuyNow) {
+    if (usingBuyNow && store.key === 'target') {
+      // TARGET DROP PERSISTENCE — do what a human does (confirmed by the click tracker during a
+      // real drop): "Buy now" flickers enabled/disabled and EATS clicks for ~30-60s before the
+      // drawer opens. One click is never enough. So loop: check WHAT STEP we're on each cycle —
+      // drawer open ("Place your order" exists in any frame) → go check out; Buy now still on the
+      // page and enabled → CLICK IT AGAIN; disabled → wait for the flicker back to enabled.
+      const poKw = ['place your order', 'place order', 'placeorder', 'submit order'];
+      const drawerOpen = () => bgSend({ type: 'PLACE_ORDER_FRAMES', selectors: [S.placeOrder], keywords: poKw, click: false }, 4000, { found: false });
+      let opened = false, lastClick = Date.now(); // the initial click just happened above
+      for (let t = 0; t < 50; t++) {                       // ~60s of persistence
+        const st = await wget('botRunning');
+        if (!st.botRunning) return;                        // user stopped
+        const po = await drawerOpen();
+        if (po.found) { opened = true; break; }            // step advanced → drawer is open
+        // GRACE WINDOW: the REAL checkout drawer takes a few seconds to render "Place your order"
+        // after a click — and it has its own "Close" button, so dismissing during this window was
+        // CLOSING the good drawer. 7.3s matches the ORIGINAL pre-persistence wait (900ms post-click
+        // + 400ms settle + 20×300ms poll), which worked. Only after that is "Close"/"Ok" a failure.
+        if (Date.now() - lastClick < 7300) {
+          setStep('🛒 Buy now', 'drawer opening — waiting for it to load…');
+          await sleep(500); continue;
+        }
+        // Still no Place-order well after the click → whatever "Close"/"Ok" is showing is the
+        // FAILURE popup from the capture — dismiss it and retry, like a human.
+        const dis = dismissTargetModal();
+        if (dis) { log('info', '🧹 Dismissed "' + dis + '" popup — retrying Buy now'); await sleep(250); }
+        const btn = document.querySelector(clickSel);
+        if (!btn) { opened = true; break; }                // button gone → page moved on; let checkout look
+        const enabled = !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
+        if (enabled) {
+          if (t % 5 === 0) log('info', '🛒 Buy now still here — clicking again (try ' + (t + 1) + ')');
+          setStep('🛒 Buy now', 'drawer not open yet — re-clicking (' + (t + 1) + ')');
+          if (store.trustedClick) { const ok = await trustedClickSel(clickSel); if (!ok) btn.click(); }
+          else btn.click();
+          lastClick = Date.now();
+        } else {
+          setStep('🛒 Buy now', 'button disabled — waiting for it to re-enable (' + (t + 1) + ')');
+        }
+        await sleep(650);
+      }
+      if (!opened) { log('warning', 'Buy-now drawer never opened after persistent clicking — reloading to retry.'); await sleep(400); location.reload(); return; }
+      await buyNowDrawerCheckout(store, cfg);
+    } else if (usingBuyNow) {
       // Buy now opens a checkout drawer on THIS same page — finish the order inline.
       await buyNowDrawerCheckout(store, cfg);
     } else {
@@ -1272,7 +1451,7 @@ async function runStore(store, cfg, burst) {
         log('info', 'Quantity already ' + qin.value);
       } else {
         log('info', 'Setting cart quantity to ' + wantQty + '...');
-        await new Promise(res => chrome.runtime.sendMessage({ type: 'STORE_SET_QTY', selector: S.qtyInput, value: wantQty }, () => res()));
+        await bgSend({ type: 'STORE_SET_QTY', selector: S.qtyInput, value: wantQty }, 6000, null);
         // no extra pause — the CDP set already commits the change
       }
     }

@@ -61,27 +61,51 @@ async function anyBotRunning() {
   return false;
 }
 
+// Reject a promise if it doesn't settle within ms — so a hung chrome.scripting call can't freeze
+// the whole injection chain (Walmart frames navigating out from under executeScript hang otherwise).
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error((label || 'op') + ' timed out after ' + ms + 'ms')), ms)),
+  ]);
+}
+
 // Single injection gate — ALL injection (initial from popup + re-injection on
 // navigation) goes through here, so the dedup tracker covers every path.
-async function injectBot(tabId, url) {
+async function injectBot(tabId, url, force) {
   const now = Date.now();
-  // Skip a repeat injection of the same URL into the SAME tab within 3s (SPA firing complete repeatedly)
+  // Resolve THIS tab's window id FIRST so every log below is tagged for the owning window's panel
+  // (per-window activity log — mirrors the "Bot N" numbering). logWin(wid,…) filters to that panel.
+  let wid = null, gotTab = false;
+  try { wid = (await chrome.tabs.get(tabId)).windowId; gotTab = true; } catch (_) {}
+  const ilog = (lvl, txt) => logWin(wid, lvl, txt);
+  ilog('info', '🔧 inj enter tab=' + tabId + ' force=' + !!force); // TEMP step telemetry
+  // Skip a repeat injection of the same URL into the SAME tab within 3s (SPA firing complete
+  // repeatedly). `force` bypasses this: an explicit user Start must NEVER be swallowed.
   const prev = lastInjected[tabId];
-  if (url && prev && url === prev.url && now - prev.at < 3000) return;
+  if (!force && url && prev && url === prev.url && now - prev.at < 3000) { ilog('info', '🔧 inj DEDUP-skip'); return; }
   lastInjected[tabId] = { url: url || '', at: now };
+  ilog('info', '🔧 inj wid=' + wid + ' gotTab=' + gotTab);
   // Stamp THIS tab's browser-window id into the content-script world FIRST, so content.js knows
-  // which window it belongs to without having to guess (foundation for per-window bots). It lands
-  // in the same isolated world the files use, so content.js can read window.__BOT_WID. A failure
-  // here must NOT block the real injection, so it's wrapped defensively.
-  let wid = null;
-  try { wid = (await chrome.tabs.get(tabId)).windowId; } catch (_) {}
+  // which window it belongs to without having to guess. A failure here must NOT block injection.
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, args: [wid], func: (w) => { window.__BOT_WID = w; } });
-  } catch (_) {}
+    // Also mark explicit (user-Start) injections so content.js can report LOUDLY if it then finds
+    // no run state. TIMEOUT-guarded: on a navigating page executeScript can HANG against a frame
+    // being torn down; a timeout lets us bail and the webNavigation re-injection retries.
+    await withTimeout(chrome.scripting.executeScript({ target: { tabId }, args: [wid, !!force],
+      func: (w, ex) => { window.__BOT_WID = w; if (ex) window.__BOT_EXPLICIT = Date.now(); } }), 2500, 'stamp');
+    ilog('info', '🔧 inj stamp OK');
+  } catch (e) { ilog('error', '🔧 inj stamp FAILED: ' + (e && e.message || e)); }
   // content.js guards itself by URL, so no external flag reset is needed.
   // Store adapter files load before content.js so their registry + helpers are in scope.
-  await chrome.scripting.executeScript({ target: { tabId },
-    files: ['stores.js', 'sams.js', 'target.js', 'walmart.js', 'bestbuy.js', 'pokemoncenter.js', 'content.js'] });
+  ilog('info', '🔧 inj injecting files…');
+  try {
+    await withTimeout(chrome.scripting.executeScript({ target: { tabId },
+      files: ['stores.js', 'sams.js', 'target.js', 'walmart.js', 'bestbuy.js', 'pokemoncenter.js', 'content.js'] }), 4000, 'files');
+    ilog('info', '🔧 inj files OK');
+  } catch (e) {
+    ilog('error', '⚠️ Could not inject into tab ' + tabId + ' (wid=' + wid + '): ' + (e && e.message || e));
+  }
 }
 
 // PRIMARY (fast): inject as soon as the DOM is parsed — well before the page finishes
@@ -147,7 +171,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Popup requested initial injection into the current tab — routed through the same dedup gate.
   // Clear any stale debugger attachment first so it can't block page clicks this run. Also ensure
   // the keepalive alarm is running so the worker survives the whole run (not just the localhost flow).
-  if (msg.type === 'INJECT_BOT') { chrome.alarms.create('keepalive', { periodInMinutes: 0.4 }); detachAllDebuggers().then(() => injectBot(msg.tabId, msg.url)); }
+  if (msg.type === 'INJECT_BOT') {
+    chrome.alarms.create('keepalive', { periodInMinutes: 0.4 });
+    // Await the chain and RETURN TRUE so the MV3 service worker stays alive until injection
+    // finishes (a fire-and-forget promise gets dropped when the worker idles → injectBot never ran).
+    (async () => {
+      const wid = await widForTab(msg.tabId); // tag this run's marker for the owning window's panel
+      logWin(wid, 'info', '🛠️ inject build v3');
+      try { await injectBot(msg.tabId, msg.url, true); }
+      catch (e) { logWin(wid, 'error', '⚠️ inject threw for tab ' + msg.tabId + ': ' + (e && e.message || e)); }
+      try { await detachAllDebuggers(); } catch (_) {}
+      try { sendResponse && sendResponse(true); } catch (_) {}
+    })();
+    return true; // keep the worker alive until injection completes
+  }
 
   // Popup is starting a fresh run — detach any stale debugger so it can't block this run
   if (msg.type === 'RESET_BOT') detachAllDebuggers();
@@ -182,7 +219,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Fast stock check for stores that SSR availability into the page HTML (Sam's/Walmart GLASS):
   // fetch the product URL and read the schema.org / availabilityStatus signal. Used by the watcher.
-  if (msg.type === 'HTML_STOCK_POLL') { htmlStockPoll(sender.tab?.id, msg.url).then(r => sendResponse(r)); return true; }
+  if (msg.type === 'HTML_STOCK_POLL') { htmlStockPoll(sender.tab?.id, msg.url, msg.mode).then(r => sendResponse(r)); return true; }
 
   // NOTE: BOT_LOG / BOT_STATUS / BOT_DONE are NOT relayed here — the side panel
   // receives them directly from content.js. Relaying caused every log to appear twice.
@@ -548,7 +585,9 @@ async function cdpClickSelector(tabId, selector) {
   const log = (lvl, txt) => logWin(wid, lvl, txt); // route this op's logs to its window's panel
   const dbg = { tabId };
   try {
-    await chrome.debugger.attach(dbg, '1.3');
+    // TIMEOUT the attach: chrome.debugger.attach can HANG (another debugger/DevTools attached, or the
+    // tab busy) and would never return — freezing the whole Buy-now click. Bail so we can retry.
+    await withTimeout(chrome.debugger.attach(dbg, '1.3'), 4000, 'debugger.attach');
     // Step 1: scroll the VISIBLE match into view if needed (instant, 'nearest' = minimal movement
     // so the page doesn't jump). There can be hidden/duplicate copies, so pick the visible one.
     await chrome.scripting.executeScript({
@@ -802,16 +841,37 @@ async function targetStockPoll(tabId, tcin) {
 // Stock check via the product page HTML (Sam's/Walmart GLASS SSR the availability into the page).
 // Fetches the URL in the tab's page context and reads the main product's schema.org availability
 // (falling back to the first availabilityStatus). Returns { inStock, status }.
-async function htmlStockPoll(tabId, url) {
+async function htmlStockPoll(tabId, url, mode) {
   if (!tabId || !url) return { ok: false };
   try {
-    const [out] = await chrome.scripting.executeScript({
-      target: { tabId }, world: 'MAIN', args: [url],
-      func: async (url) => {
+    // TIMEOUT the MAIN-world poll: right after switching back to a Walmart tab its main thread is
+    // JAMMED for ~20-40s (anti-bot JS + /ip→seort redirect), and this executeScript HANGS — which
+    // froze the whole watcher on its first poll (no 👁 updates, looked dead). On timeout return a
+    // benign "busy" (ok:true, NOT an error) so the watch loop keeps ticking until the page frees up.
+    const [out] = await withTimeout(chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args: [url, mode || ''],
+      func: async (url, mode) => {
         try {
           const res = await fetch(url, { credentials: 'include' });
           if (!res.ok) return { status: res.status };
           const t = await res.text();
+          // WALMART: do NOT trust schema.org here — PDP pages embed "customers also bought"
+          // carousels whose in-stock items carry their own schema.org/InStock markup (false
+          // positives). The MAIN product's PDP data is SSR'd FIRST, so the first availabilityStatus
+          // in the payload is the item we're watching.
+          if (mode === 'walmart') {
+            const m = t.match(/"availabilityStatus"\s*:\s*"([^"]+)"/);
+            const s = m ? m[1] : null;
+            const avail = s ? /IN_STOCK|LIMITED/i.test(s) : false;
+            // availabilityStatus alone is useless for these drops: the item carries a permanent
+            // 3rd-party ~$200 offer, so it reads IN_STOCK forever. The RETAIL drop is what we want,
+            // and the decider is the SELLER — only navigate when a 1st-party offer is present.
+            // Keep these OFFER-scoped so page boilerplate can't false-positive.
+            const retail = /sold (?:and shipped )?by\s*:?\s*walmart/i.test(t)
+              || /"sellerType"\s*:\s*"(?:INTERNAL|1P|FIRST_PARTY)"/i.test(t)
+              || /"sellerId"\s*:\s*"F55CDC31AB754BB68FE0B39041159D63"/i.test(t); // Walmart.com's 1P seller id
+            return { status: (s || 'unknown') + (retail ? ' +retail' : ''), inStock: avail && retail, avail, retail };
+          }
           // schema.org markup is for the MAIN product only → cleanest signal.
           if (/schema\.org\/InStock/i.test(t))    return { status: 'InStock', inStock: true };
           if (/schema\.org\/OutOfStock/i.test(t)) return { status: 'OutOfStock', inStock: false };
@@ -821,9 +881,14 @@ async function htmlStockPoll(tabId, url) {
           return { status: s || 'unknown', inStock: s ? /IN_STOCK|LIMITED/i.test(s) : false };
         } catch (e) { return { status: 'ERR', error: e.message }; }
       }
-    });
+    }), 6000, 'poll');
     return { ok: true, ...(out && out.result || {}) };
-  } catch (e) { return { ok: false, error: e.message }; }
+  } catch (e) {
+    // Timeout = the page's main thread is busy, NOT a real failure — report "busy" so the watcher
+    // keeps looping quietly (an error would trigger its reload/rotation fallback).
+    if (/timed out/.test(e && e.message || '')) return { ok: true, status: 'busy', inStock: false, avail: false, retail: false, busy: true };
+    return { ok: false, error: e.message };
+  }
 }
 
 // Helper — sends a log message to the popup's activity log

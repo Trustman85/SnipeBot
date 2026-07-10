@@ -14,6 +14,28 @@ let lockMode  = 'unlock'; // 'unlock' (PIN exists) or 'create' (first-time PIN s
 let MY_WID = null;
 let MY_BOT_NUM = null;    // friendly "Bot N" label for this window (raw window id is unreadable)
 
+// Resolve THIS panel's window id ONCE at open, when the window is focused and the answer is
+// reliable. We then PIN it (MY_WID) and never re-resolve mid-session — re-resolving via
+// currentWindow/getCurrent from a side panel DRIFTS to the last-focused window.
+async function resolveMyWid() {
+  try { const win = await chrome.windows.getCurrent(); if (win && win.id != null) return win.id; } catch (_) {}
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab && typeof tab.windowId === 'number') return tab.windowId;
+  } catch (_) {}
+  return null;
+}
+
+// The active tab IN OUR pinned window. Always scope by windowId: MY_WID, never `currentWindow`
+// (which drifts to whatever window is focused) — so the bot always injects into the tab the panel
+// actually belongs to, regardless of focus.
+async function activeTabInMyWindow() {
+  if (MY_WID != null) {
+    try { const [t] = await chrome.tabs.query({ active: true, windowId: MY_WID }); if (t) return t; } catch (_) {}
+  }
+  try { const [t] = await chrome.tabs.query({ active: true, currentWindow: true }); return t || null; } catch (_) { return null; }
+}
+
 // Maps this window's id to a small, stable, human-friendly number using a shared registry in
 // storage. Reuses numbers freed by closed windows so labels stay small (Bot 1, Bot 2, ...).
 async function assignBotNumber(wid) {
@@ -957,8 +979,7 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
   // 0) Identify which browser window this panel belongs to (basis for per-window bots), and map
   //    the raw window id to a friendly "Bot N" label.
   try {
-    const win = await chrome.windows.getCurrent();
-    MY_WID = win && win.id;
+    MY_WID = await resolveMyWid();
     MY_BOT_NUM = await assignBotNumber(MY_WID);
     addLog('info', '🤖 Bot ' + MY_BOT_NUM + ' — panel ready');
     const sub = document.querySelector('.subtitle');
@@ -1167,13 +1188,18 @@ async function toggleBot(testMode = false) {
     // Walmart drop watchlist: cycle multiple drop links and auto-enter the first queue that opens.
     // Use the STABLE walmart.com/ip/<id> links (the same every drop) — NOT the buff.ly short links,
     // which change per drop and carry no item ID.
-    const rawWatch = (activeProfile === 'walmart') ? (cfg.watchlist || '').trim() : '';
+    // "Use current tab" WINS over the watchlist: checked = run on the page you're on;
+    // unchecked = cycle the drop watchlist.
+    const rawWatch = (activeProfile === 'walmart' && !cfg.useCurrentTab) ? (cfg.watchlist || '').trim() : '';
     const watchIds = rawWatch ? parseWatchlist(rawWatch) : [];
     const watchMode = watchIds.length > 0;
     if (rawWatch && !watchMode) {
       addLog('error', '👁 Watchlist has text but no Walmart item IDs found — paste walmart.com/ip/<id> links or bare IDs (buff.ly short links won\'t work).');
       return;
     }
+    // Tell the user the watchlist is being skipped so a checked box never LOOKS like a broken watchlist.
+    if (activeProfile === 'walmart' && cfg.useCurrentTab && (cfg.watchlist || '').trim())
+      addLog('info', '👁 Watchlist ignored — "Use current tab" is checked (uncheck it to run the watchlist).');
     if (watchMode) cfg.watchlist = watchIds; else delete cfg.watchlist;
 
     if (!cfg.useCurrentTab && !watchMode && !identifier) {
@@ -1210,7 +1236,7 @@ async function toggleBot(testMode = false) {
       // Watchlist: drive THIS window's active tab through the drop links; the bot rotates to the
       // next item when one is out of stock, and locks in when a queue opens (auto-enters it).
       const url = STORE_NAV.walmart.item(watchIds[0]);
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = await activeTabInMyWindow();
       if (!tab) { addLog('error', 'No active tab — open a Walmart tab in this window, then Start.'); setRunningUI(false); return; }
       await wset({ currentTabId: tab.id, watchIndex: 0 });
       // If we're ALREADY on the first item's page, a same-URL tabs.update won't reload it (so the
@@ -1223,7 +1249,7 @@ async function toggleBot(testMode = false) {
       }
       addLog('success', '👁 Watchlist: monitoring ' + watchIds.length + ' items — starting with #' + watchIds[0] + (onFirst ? ' (injecting here)' : ''));
     } else if (cfg.useCurrentTab) {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = await activeTabInMyWindow();
       if (!tab) { addLog('error', 'No active tab found — click the store tab, then Start.'); setRunningUI(false); return; }
       const okPage = /^https?:\/\//.test(tab.url || '');
       if (!okPage) { addLog('error', 'Current tab is "' + (tab.url || 'blank') + '" — open the STORE PAGE in this tab, then Start.'); setRunningUI(false); return; }
@@ -1234,7 +1260,7 @@ async function toggleBot(testMode = false) {
       // By Item #/SKU → direct product URL; By Name → store search results
       const url = searchType === 'sku' ? navStore.item(cfg.itemSku) : navStore.search(cfg.itemName);
       addLog('info', 'Opening ' + navStore.name + ': ' + url);
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = await activeTabInMyWindow();
       await wset({ currentTabId: tab.id });
       await chrome.tabs.update(tab.id, { url, active: true });
       addLog('success', searchType === 'sku' ? 'Going to item…' : 'Searching ' + navStore.name + '…');
