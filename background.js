@@ -20,9 +20,60 @@ chrome.runtime.onStartup.addListener(() => stopBot());
 // Keep the service worker alive while bot is running so it can re-inject content.js on page reloads.
 // Chrome kills idle service workers after ~30s — this alarm fires every 25s to prevent that.
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  // Watchlist auto-restart after a successful checkout (content scheduled it, we survive sleep)
+  if (alarm.name.startsWith('rewatch:w')) {
+    const wid = Number(alarm.name.slice(9));
+    chrome.alarms.clear('rewatchtick:w' + wid);
+    chrome.storage.local.remove('rewatchAt:w' + wid);
+    resumeWatchlist(wid); return;
+  }
+  // Per-minute countdown so the log shows the restart approaching instead of going silent
+  if (alarm.name.startsWith('rewatchtick:w')) {
+    const wid = Number(alarm.name.slice(13));
+    const key = 'rewatchAt:w' + wid;
+    const st = await chrome.storage.local.get(key);
+    const remainMs = (st[key] || 0) - Date.now();
+    if (remainMs <= 0) { chrome.alarms.clear(alarm.name); return; } // restart alarm handles the rest
+    logWin(wid, 'info', '⏰ Watchlist auto-restart in ' + Math.ceil(remainMs / 60000) + ' min…');
+    return;
+  }
   if (alarm.name !== 'keepalive') return;
   if (!(await anyBotRunning())) chrome.alarms.clear('keepalive');
 });
+
+// Restarts a window's WATCHLIST run after the post-checkout cooldown: flips its per-window state
+// back to running (fresh run token) and navigates its tab to the first watch item — from there the
+// normal injection/watch flow takes over exactly like a manual Start.
+const REWATCH_ITEM_URL = {
+  sams:          id => 'https://www.samsclub.com/ip/' + encodeURIComponent(id),
+  target:        id => 'https://www.target.com/p/-/A-' + encodeURIComponent(id),
+  walmart:       id => 'https://www.walmart.com/ip/' + encodeURIComponent(id),
+  bestbuy:       id => 'https://www.bestbuy.com/site/x/x/' + encodeURIComponent(id) + '.p?skuId=' + encodeURIComponent(id),
+  pokemoncenter: id => 'https://www.pokemoncenter.com/product/' + encodeURIComponent(id),
+};
+async function resumeWatchlist(wid) {
+  if (wid == null || isNaN(wid)) return;
+  const k = (key) => 'w' + wid + ':' + key;
+  const st = await chrome.storage.local.get([k('botRunning'), k('botConfig'), k('currentTabId'), k('activeProfile')]);
+  const cfg = st[k('botConfig')], tabId = st[k('currentTabId')], profile = st[k('activeProfile')];
+  const wl = cfg && Array.isArray(cfg.watchlist) ? cfg.watchlist : null;
+  if (!wl || !wl.length) { logWin(wid, 'warning', '⏰ Auto-restart skipped — no watchlist config left (was the panel closed?).'); return; }
+  if (st[k('botRunning')]) return; // user already restarted manually — don't double-start
+  const mkUrl = REWATCH_ITEM_URL[profile];
+  if (!mkUrl) return;
+  await chrome.storage.local.set({
+    [k('botRunning')]: true, [k('botPhase')]: 'SEARCH', [k('botRunToken')]: Date.now(),
+    [k('watchIndex')]: 0, [k('qtyDone')]: false, [k('addAttempts')]: 0,
+  });
+  chrome.alarms.create('keepalive', { periodInMinutes: 0.4 });
+  logWin(wid, 'success', '⏰ Cooldown over — auto-restarting the watchlist (' + wl.length + ' items).');
+  try {
+    if (tabId != null) await chrome.tabs.update(tabId, { url: mkUrl(wl[0]) });
+    else logWin(wid, 'warning', '⏰ No tab recorded for this run — open the store tab and press Start.');
+  } catch (e) {
+    logWin(wid, 'warning', '⏰ Auto-restart could not navigate the tab (' + (e && e.message || e) + ') — press Start manually.');
+  }
+}
 
 // Holds the reference to the OOS retry timer so we can cancel it if the user stops the bot
 let botInterval = null;
@@ -74,6 +125,9 @@ function withTimeout(promise, ms, label) {
 // navigation) goes through here, so the dedup tracker covers every path.
 async function injectBot(tabId, url, force) {
   const now = Date.now();
+  // walmart.com is MANIFEST-injected (Chrome injects on every document) — executeScript stalls on
+  // those tabs (stamp/files timeouts) and is never needed there. Skip to kill the error noise.
+  if (/^https?:\/\/(www\.)?walmart\.com\//i.test(url || '')) return;
   // Resolve THIS tab's window id FIRST so every log below is tagged for the owning window's panel
   // (per-window activity log — mirrors the "Bot N" numbering). logWin(wid,…) filters to that panel.
   let wid = null, gotTab = false;
@@ -154,9 +208,14 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (d) => {
 // page (not the side panel) is focused — so the user doesn't have to click the panel first after
 // opening/switching a tab. The actual actions (start/test/save) live in the panel, so we just
 // forward the command to it. Works while the panel is OPEN (sendMessage rejects harmlessly if not).
-chrome.commands.onCommand.addListener((command) => {
+chrome.commands.onCommand.addListener(async (command) => {
   const action = { 'start-bot': 'start', 'test-bot': 'test', 'save-config': 'save' }[command];
-  if (action) chrome.runtime.sendMessage({ type: 'HOTKEY', action }).catch(() => {});
+  if (!action) return;
+  // Tag the FOCUSED window so only ITS panel acts — without this every open window's bot
+  // started/stopped on one key press.
+  let wid = null;
+  try { const w = await chrome.windows.getLastFocused(); wid = w && w.id != null ? w.id : null; } catch (_) {}
+  chrome.runtime.sendMessage({ type: 'HOTKEY', action, wid }).catch(() => {});
 });
 
 // Central message listener — background script is always alive and receives messages from popup and content script
@@ -167,6 +226,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Popup sent STOP_BOT — stop just that window's bot (wid provided), else a full global stop
   if (msg.type === 'STOP_BOT') { if (msg.wid != null) stopBotWin(msg.wid); else stopBot(); }
+
+  // Content asking which window its tab belongs to — used by MANIFEST-injected content scripts
+  // (walmart.com), where no executeScript ever stamped window.__BOT_WID. sender.tab is authoritative.
+  if (msg.type === 'GET_WID') { sendResponse({ wid: sender.tab?.windowId ?? null, tabId: sender.tab?.id ?? null }); return; }
 
   // Popup requested initial injection into the current tab — routed through the same dedup gate.
   // Clear any stale debugger attachment first so it can't block page clicks this run. Also ensure
@@ -189,37 +252,60 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Popup is starting a fresh run — detach any stale debugger so it can't block this run
   if (msg.type === 'RESET_BOT') detachAllDebuggers();
 
-  // Alert the human (desktop notification + relay a sound to the popup)
-  if (msg.type === 'BOT_ALERT') handleAlert(msg.kind, msg.text);
+  // Store-switch HARD reset: mimic what a REAL sidebar close+reopen gives the worker — drop ALL
+  // in-memory per-tab state (injection dedup tracking) and stale debugger attachments, so the next
+  // Start behaves exactly like a first Start after reopening the panel.
+  if (msg.type === 'HARD_RESET') {
+    for (const t in lastInjected) delete lastInjected[t];
+    detachAllDebuggers();
+    try { sendResponse && sendResponse(true); } catch (_) {}
+    return;
+  }
+
+  // Alert the human (desktop notification + relay a sound to the popup + optional spoken line)
+  if (msg.type === 'BOT_ALERT') handleAlert(msg.kind, msg.text, msg.speak);
+
+  // Watchlist auto-restart: content asks for it right after a successful checkout. The ALARM does
+  // the waiting (survives page navigations, panel closes, and worker recycling).
+  if (msg.type === 'SCHEDULE_REWATCH' && msg.wid != null) {
+    const mins = msg.mins || 5;
+    chrome.storage.local.set({ ['rewatchAt:w' + msg.wid]: Date.now() + mins * 60000 });
+    chrome.alarms.create('rewatch:w' + msg.wid, { delayInMinutes: mins });
+    chrome.alarms.create('rewatchtick:w' + msg.wid, { periodInMinutes: 1 }); // per-minute countdown in the log
+  }
 
   // Sam's CVV + Place Order — must run in the page's MAIN world to reach React's state
   if (msg.type === 'SAMS_CHECKOUT') samsCheckout(sender.tab?.id, msg.cvv);
 
+  // NB: every promise-based handler below MUST reply on BOTH resolve and reject — a rejected
+  // promise that never calls sendResponse leaves the content script awaiting FOREVER, which is
+  // exactly the "item went live, page reloaded, bot froze mid-buy" bug (Target, 2026-07-10).
+
   // Set a React-controlled input (e.g. Pokémon Center cart quantity) via real CDP keystrokes
-  if (msg.type === 'STORE_SET_QTY') { cdpSetValue(sender.tab?.id, msg.selector, msg.value).then(() => sendResponse(true)); return true; }
+  if (msg.type === 'STORE_SET_QTY') { cdpSetValue(sender.tab?.id, msg.selector, msg.value).then(() => sendResponse(true), () => sendResponse(false)); return true; }
 
   // Pokémon Center: type card# + CVV into the secure CyberSource iframes via CDP
-  if (msg.type === 'POKE_PAY') { pokemonPay(sender.tab?.id, msg).then(() => sendResponse(true)); return true; }
+  if (msg.type === 'POKE_PAY') { pokemonPay(sender.tab?.id, msg).then(() => sendResponse(true), () => sendResponse(false)); return true; }
 
   // Real browser-level click for buttons gated on trusted events (Target Buy now / Place order)
-  if (msg.type === 'CDP_CLICK') { cdpClickSelector(sender.tab?.id, msg.selector).then(ok => sendResponse(ok)); return true; }
+  if (msg.type === 'CDP_CLICK') { cdpClickSelector(sender.tab?.id, msg.selector).then(ok => sendResponse(ok), () => sendResponse(false)); return true; }
 
   // Find (and optionally click) a button across ALL frames — for drawers rendered in an iframe
-  if (msg.type === 'PLACE_ORDER_FRAMES') { findClickInFrames(sender.tab?.id, msg).then(r => sendResponse(r)); return true; }
+  if (msg.type === 'PLACE_ORDER_FRAMES') { findClickInFrames(sender.tab?.id, msg).then(r => sendResponse(r), () => sendResponse({ found: false })); return true; }
 
   // Target CVV-confirm sidebar (in an iframe): fill #enter-cvv, optionally click Confirm
-  if (msg.type === 'TARGET_CVV') { targetCvvInFrames(sender.tab?.id, msg).then(r => sendResponse(r)); return true; }
+  if (msg.type === 'TARGET_CVV') { targetCvvInFrames(sender.tab?.id, msg).then(r => sendResponse(r), () => sendResponse({ ok: false })); return true; }
 
   // READ-ONLY diagnostic: probe Target's stock endpoints and auto-find the availability field.
-  if (msg.type === 'STOCK_TEST') { targetStockTest(msg).then(r => sendResponse(r)); return true; }
+  if (msg.type === 'STOCK_TEST') { targetStockTest(msg).then(r => sendResponse(r), e => sendResponse({ ok: false, error: String(e && e.message || e) })); return true; }
 
   // Fast stock check: fetch Target's product_fulfillment_v1 (in the page context, since Target blocks
   // the background's own fetch) and return the shipping availability. Used by the restock watcher.
-  if (msg.type === 'STOCK_POLL') { targetStockPoll(sender.tab?.id, msg.tcin).then(r => sendResponse(r)); return true; }
+  if (msg.type === 'STOCK_POLL') { targetStockPoll(sender.tab?.id, msg.tcin).then(r => sendResponse(r), () => sendResponse({ ok: false, status: 'ERR' })); return true; }
 
   // Fast stock check for stores that SSR availability into the page HTML (Sam's/Walmart GLASS):
   // fetch the product URL and read the schema.org / availabilityStatus signal. Used by the watcher.
-  if (msg.type === 'HTML_STOCK_POLL') { htmlStockPoll(sender.tab?.id, msg.url, msg.mode).then(r => sendResponse(r)); return true; }
+  if (msg.type === 'HTML_STOCK_POLL') { htmlStockPoll(sender.tab?.id, msg.url, msg.mode).then(r => sendResponse(r), () => sendResponse({ ok: false, status: 'ERR' })); return true; }
 
   // NOTE: BOT_LOG / BOT_STATUS / BOT_DONE are NOT relayed here — the side panel
   // receives them directly from content.js. Relaying caused every log to appear twice.
@@ -737,7 +823,7 @@ function stopBot() {
 // ── Alerts: desktop notification + sound relay to popup ────────────────────────
 // 1x1 transparent PNG (valid iconUrl so the notification renders without a bundled icon)
 const ICON_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-function handleAlert(kind, text) {
+function handleAlert(kind, text, speak) {
   const titles = {
     captcha: '🛑 CAPTCHA — needs you!',
     success: '🎉 Order placed!',
@@ -760,6 +846,9 @@ function handleAlert(kind, text) {
   // Popup/side panel plays the sound (service workers can't play audio). Fired on EVERY alert,
   // so a repeating captcha alert keeps buzzing until it's cleared.
   chrome.runtime.sendMessage({ type: 'PLAY_SOUND', kind }).catch(() => {});
+  // Spoken announcement (chrome.tts works from the service worker) — e.g. "Bot 1 item live".
+  // interrupt so a fresh live-call never queues behind an old one.
+  if (speak) { try { chrome.tts.speak(String(speak), { rate: 1.05, enqueue: false }); } catch (_) {} }
 }
 
 // Pauses execution for the given number of milliseconds
@@ -872,11 +961,24 @@ async function htmlStockPoll(tabId, url, mode) {
               || /"sellerId"\s*:\s*"F55CDC31AB754BB68FE0B39041159D63"/i.test(t); // Walmart.com's 1P seller id
             return { status: (s || 'unknown') + (retail ? ' +retail' : ''), inStock: avail && retail, avail, retail };
           }
+          // POKÉMON CENTER: poll either the tpci-ecommweb-api product/status endpoint (tiny JSON —
+          // preferred) or the PDP HTML. Sniffed signals: "availability":"NOT_AVAILABLE" /
+          // schema.org/OutOfStock when dead; InStock/AVAILABLE when live; PreOrder counts as
+          // BUYABLE (preorder-ready). NB: the page also ships an i18n label map with strings like
+          // "availability":"Availability" — the value alternatives below can't match those labels.
+          if (mode === 'pokemon') {
+            const live = /"availability"\s*:\s*"(?:https?:\/\/schema\.org\/)?(?:InStock|LimitedAvailability|AVAILABLE|IN_STOCK)"/i.test(t);
+            const pre  = /"availability"\s*:\s*"(?:https?:\/\/schema\.org\/)?(?:PreOrder|PRE_?ORDER)"/i.test(t) || /schema\.org\/PreOrder/i.test(t);
+            const oos  = /"availability"\s*:\s*"(?:https?:\/\/schema\.org\/)?(?:OutOfStock|SoldOut|Discontinued|NOT_AVAILABLE|OUT_OF_STOCK|UNAVAILABLE)"/i.test(t);
+            const status = live ? 'InStock' : (pre ? 'PreOrder' : (oos ? 'OutOfStock' : 'unknown'));
+            return { status, inStock: live || pre };
+          }
           // schema.org markup is for the MAIN product only → cleanest signal.
           if (/schema\.org\/InStock/i.test(t))    return { status: 'InStock', inStock: true };
           if (/schema\.org\/OutOfStock/i.test(t)) return { status: 'OutOfStock', inStock: false };
-          // Fallback: first availabilityStatus in the SSR'd data.
-          const m = t.match(/"availabilityStatus"\s*:\s*"([^"]+)"/);
+          // Fallback: first availabilityStatus (Walmart-style) or availability_status (Target-style)
+          // in the SSR'd data.
+          const m = t.match(/"availabilityStatus"\s*:\s*"([^"]+)"/) || t.match(/"availability_status"\s*:\s*"([^"]+)"/);
           const s = m ? m[1] : null;
           return { status: s || 'unknown', inStock: s ? /IN_STOCK|LIMITED/i.test(s) : false };
         } catch (e) { return { status: 'ERR', error: e.message }; }

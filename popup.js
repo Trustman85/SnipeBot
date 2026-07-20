@@ -1,5 +1,5 @@
 // All config field IDs — used to save/restore form values
-const FIELDS = ['siteUrl','useCurrentTab','itemName','itemSku','searchType','quantity','maxPrice','refreshInterval',
+const FIELDS = ['siteUrl','useCurrentTab','itemSku','searchType','quantity','maxPrice','refreshInterval',
                 'watchlist',
                 'firstName','lastName','email','address','city','state','zip',
                 'cardNumber','cardName','expiry','cvv','stopOnSuccess'];
@@ -18,13 +18,39 @@ let MY_BOT_NUM = null;    // friendly "Bot N" label for this window (raw window 
 // reliable. We then PIN it (MY_WID) and never re-resolve mid-session — re-resolving via
 // currentWindow/getCurrent from a side panel DRIFTS to the last-focused window.
 async function resolveMyWid() {
-  try { const win = await chrome.windows.getCurrent(); if (win && win.id != null) return win.id; } catch (_) {}
+  // A side panel document belongs to ONE window for its whole life, and sessionStorage survives
+  // our own location.reload() (auto-reset on store switch) but NOT a real close+reopen. So a wid
+  // this panel already resolved is strictly more reliable than re-deriving it after a programmatic
+  // reload, where getCurrent/currentWindow can drift to whatever window was last focused — the
+  // silent killer where Start writes w<X> keys but the tab reads w<Y> ("works after I reopen").
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab && typeof tab.windowId === 'number') return tab.windowId;
+    const cached = Number(sessionStorage.getItem('SNIPE_MY_WID'));
+    if (Number.isFinite(cached) && cached > 0) return cached;
   } catch (_) {}
-  return null;
+  let wid = null;
+  try { const win = await chrome.windows.getCurrent(); if (win && win.id != null) wid = win.id; } catch (_) {}
+  if (wid == null) {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab && typeof tab.windowId === 'number') wid = tab.windowId;
+    } catch (_) {}
+  }
+  if (wid != null) { try { sessionStorage.setItem('SNIPE_MY_WID', String(wid)); } catch (_) {} }
+  return wid;
 }
+
+// ── Fluid scale: the panel zooms CONTINUOUSLY with the window instead of jumping between
+// fixed-size breakpoints. Baseline = the size everything was designed at (roomy 1440p sidebar);
+// smaller windows scale everything down proportionally, clamped so text stays readable.
+function fitPanelScale() {
+  const z = Math.max(0.72, Math.min(1, window.innerHeight / 1150, window.innerWidth / 430));
+  document.body.style.zoom = String(z);
+  // zoom shrinks the rendered body below the real viewport (dead space under the Start buttons)
+  // — compensate so the layout still spans the FULL window: rendered = (innerHeight / z) × z.
+  document.body.style.height = Math.round(window.innerHeight / z) + 'px';
+}
+window.addEventListener('resize', fitPanelScale);
+fitPanelScale();
 
 // The active tab IN OUR pinned window. Always scope by windowId: MY_WID, never `currentWindow`
 // (which drifts to whatever window is focused) — so the bot always injects into the tab the panel
@@ -168,24 +194,33 @@ function writeForm(cfg) {
     if (el.type === 'checkbox') el.checked = cfg[id] ?? (id === 'stopOnSuccess');
     else el.value = cfg[id] ?? '';
   });
-  const type = cfg.searchType || 'name';
-  document.querySelectorAll('.search-type-btn').forEach(b => b.classList.toggle('active', b.dataset.type === type));
-  document.getElementById('nameGroup').style.display = type === 'name' ? '' : 'none';
-  document.getElementById('skuGroup').style.display  = type === 'sku'  ? '' : 'none';
+  // All stores are SKU/Link-only now — older saved configs may still carry searchType 'name'.
+  document.getElementById('searchType').value = 'sku';
 }
-// Parse the watchlist textarea into de-duped Walmart item IDs (from /ip/<id> links or bare IDs).
-function parseWatchlist(text) {
+// Per-store item-ID extraction from a pasted LINK or bare ID (the "SKU / Link" field and the
+// drop watchlist both accept either). Returns the id, or null if the line isn't recognizable.
+const ID_EXTRACT = {
+  sams:          s => (s.match(/\/ip\/(?:[^\/]+\/)?(\d{5,})/)  || s.match(/^(\d{5,})$/) || [])[1] || null,
+  target:        s => (s.match(/\/A-(\d{5,})/i)                || s.match(/^(\d{5,})$/) || [])[1] || null,
+  walmart:       s => (s.match(/\/ip\/(?:[^\/]+\/)?(\d{5,})/)  || s.match(/^(\d{5,})$/) || [])[1] || null,
+  bestbuy:       s => (s.match(/skuId=(\d{5,})/i) || s.match(/\/(\d{5,})\.p\b/) || s.match(/^(\d{5,})$/) || [])[1] || null,
+  pokemoncenter: s => (s.match(/\/product\/([A-Za-z0-9._-]+)/i) || (!/^https?:/i.test(s) && s.match(/^([A-Za-z0-9._-]{4,})$/)) || [])[1] || null,
+};
+const extractItemId = (line, profile) => {
+  const fn = ID_EXTRACT[profile];
+  return fn ? fn(String(line).trim()) : null;
+};
+// Parse the watchlist textarea into de-duped item IDs for the active store (links or bare IDs).
+function parseWatchlist(text, profile) {
   if (!text) return [];
-  const ids = String(text).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean).map(line => {
-    const m = line.match(/\/ip\/(?:[^\/]+\/)?(\d{5,})/) || line.match(/\b(\d{6,})\b/);
-    return m ? m[1] : null;
-  }).filter(Boolean);
+  const ids = String(text).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean)
+    .map(line => extractItemId(line, profile)).filter(Boolean);
   return ids.filter((id, i) => ids.indexOf(id) === i);
 }
 
 function clearForm() {
   writeForm({ siteUrl: 'http://localhost:3000', quantity: '1', maxPrice: '999', refreshInterval: '2',
-              stopOnSuccess: true, useCurrentTab: false, searchType: 'name' });
+              stopOnSuccess: true, useCurrentTab: false, searchType: 'sku' });
 }
 
 // ── PIN lock overlay ───────────────────────────────────────────────────────────
@@ -347,7 +382,7 @@ async function loadProfileConfig(profile) {
   const data = await chrome.storage.local.get(['botConfigEnc_' + profile, 'botConfigShared']);
   // Start from sensible defaults so a brand-new store isn't blank
   const cfg = { siteUrl: 'http://localhost:3000', quantity: '1', maxPrice: '999',
-                refreshInterval: '2', stopOnSuccess: true, useCurrentTab: false, searchType: 'name' };
+                refreshInterval: '2', stopOnSuccess: true, useCurrentTab: false, searchType: 'sku' };
   // Per-store item settings (older configs also carried address/payment — kept for migration)
   if (data['botConfigEnc_' + profile]) {
     try { Object.assign(cfg, await decryptObj(cryptoKey, data['botConfigEnc_' + profile])); } catch (_) {}
@@ -366,43 +401,54 @@ async function loadProfileConfig(profile) {
   applyWatchlistVisibility();
 }
 
-// The drop watchlist only applies to Walmart — show its field only on that profile.
+// Every store now has the SAME item section: "By SKU / Link" + the drop watchlist
+// (name search was removed everywhere). This just fills in per-store examples so the
+// placeholders/hints show the right link format for the active profile.
+const STORE_LINK_EX = {
+  sams:          { ex: 'samsclub.com/ip/…',       ph: 'https://www.samsclub.com/ip/prismatic/990466313\n990466314' },
+  target:        { ex: 'target.com/p/…/A-…',      ph: 'https://www.target.com/p/-/A-94721312\n94300072' },
+  walmart:       { ex: 'walmart.com/ip/…',        ph: 'https://www.walmart.com/ip/20278470684\n19965460207' },
+  bestbuy:       { ex: 'bestbuy.com/site/…',      ph: 'https://www.bestbuy.com/site/x/6614325.p\n6614326' },
+  pokemoncenter: { ex: 'pokemoncenter.com/product/…', ph: 'https://www.pokemoncenter.com/product/100-10086\n100-10087' },
+};
 function applyWatchlistVisibility() {
-  const g = document.getElementById('watchGroup');
-  if (g) g.style.display = (activeProfile === 'walmart') ? '' : 'none';
+  const s = STORE_LINK_EX[activeProfile] || { ex: 'product link', ph: 'one link or ID per line' };
+  const skuInput = document.getElementById('itemSku');
+  if (skuInput) skuInput.placeholder = s.ex + ' link or item ID';
+  const wl = document.getElementById('watchLabel');
+  if (wl) wl.textContent = '👁 Drop watchlist — one ' + s.ex + ' link or item ID per line';
+  const wt = document.getElementById('watchlist');
+  if (wt) wt.placeholder = s.ph;
+  const wh = document.getElementById('watchHint');
+  if (wh) wh.textContent = (activeProfile === 'walmart')
+    ? 'Use the stable /ip/<id> links (NOT buff.ly — those change each drop). Bot watches all items and jumps into the first queue that opens.'
+    : 'Bot watches all items in the background and buys the first that goes live.';
 }
 
-// ── Profile switcher (top tabs) ────────────────────────────────────────────────
-document.querySelectorAll('.profile-tab').forEach(tab => {
-  tab.addEventListener('click', async () => {
-    if (tab.dataset.profile === activeProfile) return;
-    try { await saveProfileConfig(activeProfile); } catch (_) {} // persist the current store's form first
-    // HARD RESET on store switch — stop THIS window's bot, WIPE its run-state (incl. the Test flag),
-    // detach any stale debugger, and reload the panel. Without this, a previous store's run (or a
-    // leftover botTestMode) could bleed into the next store and, worst case, make a Test run place a
-    // REAL order. Reloading also clears any stale in-memory state (timers/hotkeys/log).
-    chrome.storage.local.set({ lastProfile: tab.dataset.profile }); // reopen on the new store after reload
-    await wset({ botRunning: false, botPhase: 'IDLE', botTestMode: false });
-    await wremove(['botConfig', 'burstUntil', 'queueSince', 'currentTabId']);
-    chrome.runtime.sendMessage({ type: 'STOP_BOT', wid: MY_WID }).catch(() => {});
-    isReloading = true;          // tell the unload handler NOT to run its own stop again
-    location.reload();           // clean slate
-  });
-});
-
-// LIGHT profile switch (no panel reload) — used for the automatic tab-follow below. Persists the
-// current form, swaps the profile, reloads its config, and clears the stale Test flag for safety.
-async function switchProfileLight(profile) {
+// ── Profile switcher ───────────────────────────────────────────────────────────
+// HARD RESET on EVERY store switch (tab click AND auto-follow) — the panel behaves as if it was
+// closed and reopened: stop THIS window's bot, WIPE its run-state (incl. the Test flag), detach
+// any stale debugger, and reload the panel. Without this, a previous store's run (or a leftover
+// botTestMode) could bleed into the next store — the classic "bot bugs out after switching, works
+// after I reopen the sidebar" — and, worst case, make a Test run place a REAL order.
+async function hardSwitchProfile(profile) {
   if (profile === activeProfile) return;
-  try { await saveProfileConfig(activeProfile); } catch (_) {}
-  activeProfile = profile;
-  chrome.storage.local.set({ lastProfile: profile });
-  await wset({ botTestMode: false }); // belt-and-suspenders; cfg.testMode is the real per-run guard
-  document.querySelectorAll('.profile-tab').forEach(t => t.classList.toggle('active', t.dataset.profile === profile));
-  await loadProfileConfig(profile);
-  updateStartLabel();
-  addLog('info', 'Switched to ' + profileLabel(profile) + ' (matches this tab).');
+  try { await saveProfileConfig(activeProfile); } catch (_) {} // persist the current store's form first
+  // Reopen on the new store after reload. Namespaced per window (each window's panel remembers its
+  // OWN store); the un-namespaced key stays as a fallback for fresh windows.
+  chrome.storage.local.set({ ['lastProfile:w' + MY_WID]: profile, lastProfile: profile });
+  await wset({ botRunning: false, botPhase: 'IDLE', botTestMode: false });
+  await wremove(['botConfig', 'burstUntil', 'queueSince', 'currentTabId']);
+  chrome.runtime.sendMessage({ type: 'STOP_BOT', wid: MY_WID }).catch(() => {});
+  // Wipe the WORKER's in-memory state too (injection dedup, stale debuggers) — a real sidebar
+  // close+reopen effectively gets a clean worker; without this the reset wasn't equivalent.
+  await new Promise(res => { try { chrome.runtime.sendMessage({ type: 'HARD_RESET' }, () => res()); } catch (_) { res(); } setTimeout(res, 1500); });
+  isReloading = true;          // tell the unload handler NOT to run its own stop again
+  location.reload();           // clean slate — full panel re-init, like close + reopen
 }
+document.querySelectorAll('.profile-tab').forEach(tab => {
+  tab.addEventListener('click', () => hardSwitchProfile(tab.dataset.profile));
+});
 
 // Detect which store profile a URL belongs to (or null).
 function profileForUrl(url) {
@@ -423,7 +469,7 @@ chrome.tabs.onActivated.addListener(async (info) => {
   try {
     const tab = await chrome.tabs.get(info.tabId);
     const p = profileForUrl(tab.url);
-    if (p && STORE_NAV[p] && p !== activeProfile) await switchProfileLight(p);
+    if (p && STORE_NAV[p] && p !== activeProfile) await hardSwitchProfile(p);
   } catch (_) {}
 });
 
@@ -436,7 +482,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   const { botRunning } = await wget('botRunning');
   if (botRunning) return;
   const p = profileForUrl(changeInfo.url || tab.url);
-  if (p && STORE_NAV[p] && p !== activeProfile) { try { await switchProfileLight(p); } catch (_) {} }
+  if (p && STORE_NAV[p] && p !== activeProfile) { try { await hardSwitchProfile(p); } catch (_) {} }
 });
 
 // ── Sub-tab switching (Item / Address / Payment) ───────────────────────────────
@@ -456,23 +502,12 @@ function updateStartLabel() {
   btn.textContent = running ? ('⏹ Stop ' + label) : ('▶ Start ' + label);
 }
 
-// ── Search type toggle (By Name / By SKU) ─────────────────────────────────────
-document.querySelectorAll('.search-type-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.search-type-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    const type = btn.dataset.type;
-    document.getElementById('searchType').value = type;
-    document.getElementById('nameGroup').style.display = type === 'name' ? '' : 'none';
-    document.getElementById('skuGroup').style.display  = type === 'sku'  ? '' : 'none';
-  });
-});
-
 // ── Wire up buttons ────────────────────────────────────────────────────────────
 document.getElementById('startBtn').addEventListener('click', () => toggleBot(false));
 document.getElementById('testBtn').addEventListener('click', () => toggleBot(true));
 document.getElementById('saveBtn').addEventListener('click', saveConfig);
 document.getElementById('clearBtn').addEventListener('click', clearLog);
+document.getElementById('copyLogBtn').addEventListener('click', copyLog);
 document.getElementById('closeBtn').addEventListener('click', () => window.close());
 document.getElementById('speedTestBtn').addEventListener('click', testLoadSpeed);
 document.getElementById('stockTestBtn').addEventListener('click', findStockApi);
@@ -658,8 +693,10 @@ document.getElementById('hotkeyChange').addEventListener('click', () => {
 });
 
 // Global command relayed from the background service worker (fires even when a web page is focused).
+// Only OUR window's hotkey acts here — background tags the focused window's id (msg.wid); without
+// the filter one key press started/stopped EVERY open window's bot.
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === 'HOTKEY') dispatchHotkey(msg.action);
+  if (msg && msg.type === 'HOTKEY' && (msg.wid == null || msg.wid === MY_WID)) dispatchHotkey(msg.action);
 });
 
 // Panel-focused fallback: match the same Chrome-assigned combo via keydown.
@@ -933,42 +970,15 @@ dropTimeEl.addEventListener('blur', () => {
 document.getElementById('leadSec').addEventListener('change', () => { if (dropInterval) armFromFields(); });
 document.getElementById('armTest').addEventListener('change', () => { if (dropInterval) armFromFields(); });
 
-// ── Auto-detect item name/SKU from current tab ───────────────────────────────
+// ── Auto-detect item ID from the current tab's URL (fills the SKU / Link field) ──
 document.getElementById('useCurrentTab').addEventListener('change', async function () {
   if (!this.checked) return;
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => {
-        const params = new URLSearchParams(window.location.search);
-        if (params.get('id')) return { type: 'sku', value: params.get('id') };
-        if (params.get('search')) return { type: 'name', value: params.get('search') };
-        const name = (
-          document.querySelector('h1')?.textContent?.trim() ||
-          document.querySelector('[class*="product-title"]')?.textContent?.trim() ||
-          document.querySelector('[class*="product-name"]')?.textContent?.trim() ||
-          document.title.split('–')[0].split('|')[0].split('-')[0].trim()
-        );
-        return { type: 'name', value: name };
-      }
-    });
-    const { type, value } = result?.result || {};
-    if (!value) { addLog('warning', 'Could not detect item on this page'); return; }
-    if (type === 'sku') {
-      document.getElementById('itemSku').value = value;
-      document.getElementById('searchType').value = 'sku';
-      document.querySelectorAll('.search-type-btn').forEach(b => b.classList.toggle('active', b.dataset.type === 'sku'));
-      document.getElementById('nameGroup').style.display = 'none';
-      document.getElementById('skuGroup').style.display  = '';
-    } else {
-      document.getElementById('itemName').value = value;
-      document.getElementById('searchType').value = 'name';
-      document.querySelectorAll('.search-type-btn').forEach(b => b.classList.toggle('active', b.dataset.type === 'name'));
-      document.getElementById('nameGroup').style.display = '';
-      document.getElementById('skuGroup').style.display  = 'none';
-    }
-    addLog('info', 'Detected ' + type.toUpperCase() + ': "' + value + '"');
+    const [tab] = await chrome.tabs.query({ active: true, windowId: MY_WID });
+    const id = extractItemId(tab && tab.url || '', activeProfile);
+    if (!id) { addLog('warning', 'Could not detect an item ID from this tab\'s URL'); return; }
+    document.getElementById('itemSku').value = id;
+    addLog('info', 'Detected item ID: "' + id + '"');
   } catch (e) {
     addLog('warning', 'Could not auto-detect item');
   }
@@ -981,14 +991,15 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
   try {
     MY_WID = await resolveMyWid();
     MY_BOT_NUM = await assignBotNumber(MY_WID);
-    addLog('info', '🤖 Bot ' + MY_BOT_NUM + ' — panel ready');
+    addLog('info', '🤖 Bot ' + MY_BOT_NUM + ' — panel ready (v' + chrome.runtime.getManifest().version + ') [w' + MY_WID + ']');
     const sub = document.querySelector('.subtitle');
     if (sub) sub.textContent = 'Bot ' + MY_BOT_NUM;
     await restoreTrackToggle(); // reflect THIS window's own tracker toggle (per-bot)
   } catch (e) { addLog('error', 'Could not get window id: ' + e.message); }
 
-  // 1) Reopen on the store you were last using
-  const { lastProfile } = await chrome.storage.local.get('lastProfile');
+  // 1) Reopen on the store THIS WINDOW was last using (per-window key; global as fallback)
+  const lpAll = await chrome.storage.local.get(['lastProfile:w' + MY_WID, 'lastProfile']);
+  const lastProfile = lpAll['lastProfile:w' + MY_WID] || lpAll.lastProfile;
   if (lastProfile && STORE_NAV[lastProfile]) {
     activeProfile = lastProfile;
     document.querySelectorAll('.profile-tab').forEach(t => t.classList.toggle('active', t.dataset.profile === activeProfile));
@@ -1182,28 +1193,34 @@ async function toggleBot(testMode = false) {
     if (!cryptoKey) { showLock('create'); return; }
 
     const cfg = readForm();
-    const searchType = cfg.searchType || 'name';
-    const identifier = searchType === 'sku' ? cfg.itemSku : cfg.itemName;
 
-    // Walmart drop watchlist: cycle multiple drop links and auto-enter the first queue that opens.
-    // Use the STABLE walmart.com/ip/<id> links (the same every drop) — NOT the buff.ly short links,
-    // which change per drop and carry no item ID.
+    // Drop watchlist (all stores): watch multiple drop links and grab the first that goes live.
+    // For Walmart use the STABLE walmart.com/ip/<id> links (the same every drop) — NOT the buff.ly
+    // short links, which change per drop and carry no item ID.
     // "Use current tab" WINS over the watchlist: checked = run on the page you're on;
     // unchecked = cycle the drop watchlist.
-    const rawWatch = (activeProfile === 'walmart' && !cfg.useCurrentTab) ? (cfg.watchlist || '').trim() : '';
-    const watchIds = rawWatch ? parseWatchlist(rawWatch) : [];
-    const watchMode = watchIds.length > 0;
+    const rawWatch = !cfg.useCurrentTab ? (cfg.watchlist || '').trim() : '';
+    const watchIds = rawWatch ? parseWatchlist(rawWatch, activeProfile) : [];
+    let watchMode = watchIds.length > 0;
+    // Sam's still runs the legacy (non-adapter) flow which can't rotate a watchlist — fall back to
+    // watching the FIRST item via the normal single-SKU path so Start still does something sane.
+    if (watchMode && activeProfile === 'sams') {
+      if (watchIds.length > 1) addLog('warning', "👁 Sam's watchlist is single-item for now — using the first item only.");
+      cfg.itemSku = watchIds[0];
+      watchMode = false;
+    }
     if (rawWatch && !watchMode) {
-      addLog('error', '👁 Watchlist has text but no Walmart item IDs found — paste walmart.com/ip/<id> links or bare IDs (buff.ly short links won\'t work).');
+      addLog('error', '👁 Watchlist has text but no ' + profileLabel(activeProfile).replace(' Bot', '') + ' item IDs found — paste product links or bare IDs (short links won\'t work).');
       return;
     }
     // Tell the user the watchlist is being skipped so a checked box never LOOKS like a broken watchlist.
-    if (activeProfile === 'walmart' && cfg.useCurrentTab && (cfg.watchlist || '').trim())
+    if (cfg.useCurrentTab && (cfg.watchlist || '').trim())
       addLog('info', '👁 Watchlist ignored — "Use current tab" is checked (uncheck it to run the watchlist).');
     if (watchMode) cfg.watchlist = watchIds; else delete cfg.watchlist;
 
+    const identifier = (cfg.itemSku || '').trim();
     if (!cfg.useCurrentTab && !watchMode && !identifier) {
-      addLog('error', searchType === 'sku' ? 'Enter a SKU first!' : 'Enter an item name first!');
+      addLog('error', 'Enter a SKU / link first (or fill the drop watchlist)!');
       return;
     }
 
@@ -1212,7 +1229,7 @@ async function toggleBot(testMode = false) {
     const samsSearchMode = !!navStore && !cfg.useCurrentTab && !watchMode;
     if (samsSearchMode) cfg.samsSearch = true; // background uses this to inject on navigation
 
-    addLog('info', cfg.useCurrentTab ? 'Using current tab' : 'Search type: ' + searchType + ' | Value: "' + identifier + '"');
+    addLog('info', cfg.useCurrentTab ? 'Using current tab' : (watchMode ? 'Watchlist: ' + watchIds.length + ' items' : 'SKU / Link: "' + identifier + '"'));
 
     // HARD RESET: wipe any leftover state from a previous (possibly stuck) run so a new
     // run never inherits stale pointers/flags. Background detaches any stale debugger.
@@ -1231,18 +1248,25 @@ async function toggleBot(testMode = false) {
     if (testMode) addLog('info', '🧪 TEST MODE: full flow will run but the order will NOT be submitted.');
     setRunningUI(true);
 
-    const siteUrl = (cfg.siteUrl || 'http://localhost:3000').replace(/\/$/, '');
     if (watchMode) {
       // Watchlist: drive THIS window's active tab through the drop links; the bot rotates to the
-      // next item when one is out of stock, and locks in when a queue opens (auto-enters it).
-      const url = STORE_NAV.walmart.item(watchIds[0]);
+      // next item when one is out of stock, and locks in when one goes live.
+      const url = navStore.item(watchIds[0]);
       const tab = await activeTabInMyWindow();
-      if (!tab) { addLog('error', 'No active tab — open a Walmart tab in this window, then Start.'); setRunningUI(false); return; }
+      if (!tab) { addLog('error', 'No active tab — open a store tab in this window, then Start.'); setRunningUI(false); return; }
       await wset({ currentTabId: tab.id, watchIndex: 0 });
       // If we're ALREADY on the first item's page, a same-URL tabs.update won't reload it (so the
-      // bot would never inject) — force injection directly. Otherwise navigate (injects on load).
-      const onFirst = /\/ip\//.test(tab.url || '') && (tab.url || '').includes(String(watchIds[0]));
-      if (onFirst) {
+      // bot would never inject). Walmart: RELOAD — executeScript stalls on walmart tabs, so the
+      // bot rides the manifest content script, which only runs on a fresh document. Other stores:
+      // force executeScript injection directly.
+      const onFirst = (tab.url || '').includes(String(watchIds[0]));
+      if (onFirst && activeProfile === 'walmart') {
+        try {
+          await chrome.tabs.reload(tab.id);
+          addLog('info', '🔄 Reload requested for tab ' + tab.id + ' (w' + tab.windowId + ') @ ' + (tab.url || '').replace(/^https?:\/\/(www\.)?/, '').slice(0, 45));
+        } catch (e) { addLog('error', '🔄 tabs.reload FAILED: ' + (e && e.message || e)); }
+        addLog('info', '⏳ Reloading the Walmart page — the bot loads WITH the page. First load after a store switch can take 30-60s (anti-bot slow-load); leave it running.');
+      } else if (onFirst) {
         chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
       } else {
         await chrome.tabs.update(tab.id, { url, active: true });
@@ -1254,29 +1278,27 @@ async function toggleBot(testMode = false) {
       const okPage = /^https?:\/\//.test(tab.url || '');
       if (!okPage) { addLog('error', 'Current tab is "' + (tab.url || 'blank') + '" — open the STORE PAGE in this tab, then Start.'); setRunningUI(false); return; }
       await wset({ currentTabId: tab.id });
-      chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
+      // Walmart: reload so the MANIFEST content script injects on the fresh document —
+      // executeScript stalls on walmart tabs (stamp/files timeouts, bot never runs).
+      if (activeProfile === 'walmart') {
+        try {
+          await chrome.tabs.reload(tab.id);
+          addLog('info', '🔄 Reload requested for tab ' + tab.id + ' (w' + tab.windowId + ') @ ' + (tab.url || '').replace(/^https?:\/\/(www\.)?/, '').slice(0, 45));
+        } catch (e) { addLog('error', '🔄 tabs.reload FAILED: ' + (e && e.message || e)); }
+        addLog('info', '⏳ Reloading the Walmart page — the bot loads WITH the page. First load after a store switch can take 30-60s (anti-bot slow-load); leave it running.');
+      } else chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
       addLog('success', 'Bot injected → ' + (tab.url || '').replace(/^https?:\/\//, '').slice(0, 45));
-    } else if (samsSearchMode) {
-      // By Item #/SKU → direct product URL; By Name → store search results
-      const url = searchType === 'sku' ? navStore.item(cfg.itemSku) : navStore.search(cfg.itemName);
+    } else {
+      // SKU / Link → direct product URL. The field accepts a full store LINK (used as-is),
+      // a link the store's ID pattern recognizes (ID extracted), or a bare item ID.
+      const id = extractItemId(identifier, activeProfile);
+      const url = id ? navStore.item(id)
+        : (/^https?:\/\//i.test(identifier) ? identifier : navStore.item(identifier));
       addLog('info', 'Opening ' + navStore.name + ': ' + url);
       const tab = await activeTabInMyWindow();
       await wset({ currentTabId: tab.id });
       await chrome.tabs.update(tab.id, { url, active: true });
-      addLog('success', searchType === 'sku' ? 'Going to item…' : 'Searching ' + navStore.name + '…');
-    } else {
-      const url = searchType === 'sku'
-        ? siteUrl + '/product.html?id='     + encodeURIComponent(cfg.itemSku)
-        : siteUrl + '/product.html?search=' + encodeURIComponent(cfg.itemName);
-      addLog('info', 'Navigating to: ' + url);
-      const tabs = await chrome.tabs.query({ url: siteUrl + '/*' });
-      if (tabs.length > 0) {
-        await chrome.tabs.update(tabs[0].id, { url, active: true });
-        addLog('success', 'Tab navigated!');
-      } else {
-        await chrome.tabs.create({ url });
-        addLog('success', 'New tab opened!');
-      }
+      addLog('success', 'Going to item…');
     }
   } catch (err) {
     addLog('error', 'ERROR: ' + err.message);
@@ -1312,3 +1334,12 @@ function addLog(level, text) {
   while (log.children.length > 200) log.removeChild(log.lastChild); // hold plenty for click-tracking
 }
 function clearLog() { document.getElementById('log').innerHTML = ''; }
+// Copy the whole log (oldest → newest, i.e. reading order) to the clipboard for pasting.
+async function copyLog() {
+  const entries = Array.from(document.querySelectorAll('#log .log-entry')).map(e => e.textContent).reverse();
+  const btn = document.getElementById('copyLogBtn');
+  try {
+    await navigator.clipboard.writeText(entries.join('\n'));
+    if (btn) { btn.textContent = '✓ Copied'; setTimeout(() => { btn.textContent = 'Copy'; }, 1500); }
+  } catch (e) { addLog('error', 'Copy failed: ' + e.message); }
+}
