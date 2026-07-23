@@ -971,14 +971,25 @@ async function targetApiBuy(tabId, opts) {
         const add = await post(CART + 'cart_items?field_groups=CART,CART_ITEMS,SUMMARY&key=' + KADD, addBody);
         if (add.status < 200 || add.status >= 300) return { ok: false, step: 'add', status: add.status, body: add.body };
         // 2) PRE-CHECKOUT — acts on the session cart. Body MUST include cart_type (capture
-        // 2026-07-23: {} → 400 "cart_type must not be null"). It's also a query param, but the
-        // server validates it in the BODY.
-        const pre = await post(CART + 'pre_checkout?cart_type=REGULAR&field_groups=ADDRESSES,CART,CART_ITEMS,DELIVERY_WINDOWS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY&key=' + KCO, { cart_type: 'REGULAR' });
+        // 2026-07-23: {} → 400 "cart_type must not be null"). RACE: the add returns 201 but the
+        // cart backend can lag a few ms, so pre_checkout sometimes sees ZERO_CART_ITEM_QUANTITY
+        // ("Cart is empty") — retry a few times with a short backoff before giving up.
+        // cart_subchannel:BUYNOW is REQUIRED so pre_checkout/checkout act on the ISOLATED express
+        // cart the add created — without it they look at the empty MAIN cart → "Cart is empty"
+        // (ZERO_CART_ITEM_QUANTITY). Still retry that error a few times for the propagation race.
+        const preUrl = CART + 'pre_checkout?cart_type=REGULAR&field_groups=ADDRESSES,CART,CART_ITEMS,DELIVERY_WINDOWS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY&key=' + KCO;
+        const preBody = { cart_type: 'REGULAR', cart_subchannel: 'BUYNOW' };
+        let pre = await post(preUrl, preBody);
+        for (let a = 0; a < 4 && (pre.status < 200 || pre.status >= 300) && pre.body && pre.body.code === 'ZERO_CART_ITEM_QUANTITY'; a++) {
+          await new Promise(r => setTimeout(r, 200));
+          pre = await post(preUrl, preBody);
+        }
         if (pre.status < 200 || pre.status >= 300) return { ok: false, step: 'pre', status: pre.status, body: pre.body };
         const refId = pre.body && pre.body.reference_id, cartId = (add.body && add.body.cart_id);
         if (!o.placeOrder) return { ok: true, placed: false, cartId, refId, state: pre.body && pre.body.cart_state };
-        // 3) CHECKOUT — PLACES THE ORDER (Akamai adds sensor headers to this in-page fetch).
-        const co = await post(CART + 'checkout?cart_type=REGULAR&field_groups=ADDRESSES,CART,CART_ITEMS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY&key=' + KCO, { cart_type: 'REGULAR' });
+        // 3) CHECKOUT — PLACES THE ORDER (Akamai adds sensor headers to this in-page fetch). Same
+        // BUYNOW subchannel so it completes the express cart, not the main cart.
+        const co = await post(CART + 'checkout?cart_type=REGULAR&field_groups=ADDRESSES,CART,CART_ITEMS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY&key=' + KCO, { cart_type: 'REGULAR', cart_subchannel: 'BUYNOW' });
         const order = co.body && co.body.orders && co.body.orders[0];
         const done = co.status >= 200 && co.status < 300 && order && /COMPLETED/i.test(order.cart_state || '');
         return { ok: !!done, placed: !!done, step: 'checkout', status: co.status,

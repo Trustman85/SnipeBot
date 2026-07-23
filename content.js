@@ -839,6 +839,35 @@ function detectTargetFulfillment() {
   return null; // omit fulfillment → Target ships; pickup-only items fall back to the UI flow
 }
 
+// Runs the Target direct-API buy and handles the standard success/test/stop outcomes.
+// Returns 'placed' | 'test-stopped' | 'failed'. Used both on the initial page load AND the instant
+// the stock watcher sees the item go live (fired directly then — no page reload needed).
+async function targetApiAttempt(cfg, tcin, wantQty) {
+  if (!tcin || (cfg && cfg.apiCheckoutOff)) return 'failed';
+  const testMode = (cfg && cfg.testMode) || (await wget('botTestMode')).botTestMode;
+  setStep('⚡ API checkout', testMode ? 'add + prep (test — no order)' : 'add → prep → place order');
+  const r = await bgSend({ type: 'TARGET_API_BUY', tcin, quantity: wantQty || 1, fulfillment: detectTargetFulfillment(), placeOrder: !testMode }, 24000, { ok: false, error: 'timeout' });
+  if (r && r.ok && r.placed) {
+    const bn = window.__botNum || '?';
+    log('success', '⚡🎉 Order placed via API! order ' + r.orderId + ' (ref ' + r.refId + ')');
+    chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: 'Bot ' + bn + ' — ORDER PLACED (API)! ' + r.orderId, speak: 'Bot ' + bn + ' order placed' }).catch(() => {});
+    await markOrderDone();
+    setStatus('done', 'Order placed (API)');
+    if (cfg.stopOnSuccess) { await wset({ botRunning: false, botPhase: 'IDLE' }); chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {}); scheduleRewatch(cfg); }
+    return 'placed';
+  }
+  if (r && r.ok && !r.placed && testMode) {
+    log('success', '⚡🧪 TEST — API add+prep OK (cart ' + (r.refId || '?') + ', ' + (r.state || '') + '), did NOT place the order.');
+    showBigBanner('✓ API READY', 'TEST — added + prepped, no order placed');
+    setStatus('done', '🧪 API test passed — not ordered');
+    await wset({ botRunning: false, botPhase: 'IDLE' }); chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+    return 'test-stopped';
+  }
+  const emsg = r && r.body && (r.body.message || r.body.code) ? ' — ' + (r.body.code || '') + ' ' + (r.body.message || '') : '';
+  log('warning', '⚡ API checkout didn\'t complete (' + (r ? (r.step ? r.step + ' ' + r.status + emsg : r.error) : 'no reply') + ')');
+  return 'failed';
+}
+
 // Stamp THIS run as "order placed" so the double-order guard (top of runStore) refuses any further
 // buying until a new Start. Keyed by run token so a fresh Start (new token) clears it automatically.
 async function markOrderDone() {
@@ -850,7 +879,8 @@ async function markOrderDone() {
 // appears and the spam-click grabs it). This turns ~2s-per-reload detection into ~sub-second. Polls
 // are throttled (min 500ms) so we don't trip Target's rate limiting. Falls back to a page reload if
 // the API errors or gets throttled.
-async function watchTargetStock(tcin, interval, burst) {
+async function watchTargetStock(tcin, interval, burst, cfg) {
+  cfg = cfg || (await wget('botConfig')).botConfig || {};
   const pollMs = Math.max(500, (burst ? 0.5 : (parseFloat(interval) || 2)) * 1000);
   log('info', '⚡ Watching stock via API (' + tcin + ', every ' + Math.round(pollMs) + 'ms) — no reloads until it drops.');
   let fails = 0;
@@ -860,9 +890,16 @@ async function watchTargetStock(tcin, interval, burst) {
     const r = await bgSend({ type: 'STOCK_POLL', tcin }, 9000, {}); // timeout-guarded: a lost reply must NOT freeze the watcher
     const inStock = r.ok && (r.avail === 'IN_STOCK' || r.avail === 'LIMITED_STOCK' || (typeof r.qty === 'number' && r.qty > 0));
     if (inStock) {
-      logItemLive('IN STOCK (' + r.avail + (r.qty != null ? ', qty ' + r.qty : '') + ') — reloading to grab it!');
-      // Stamp the reason for this reload — the fresh page HOLDS for the button to enable instead
-      // of seeing "disabled" and bouncing right back into this watcher (the reload-without-buying loop).
+      logItemLive('IN STOCK (' + r.avail + (r.qty != null ? ', qty ' + r.qty : '') + ') — grabbing it!');
+      // FAST PATH: fire the direct API buy RIGHT NOW — no reload (the API doesn't touch the page),
+      // so it's the fastest possible grab. Only if that fails do we reload into the UI buy flow.
+      if (!cfg.apiCheckoutOff) {
+        const outcome = await targetApiAttempt(cfg, tcin, parseInt(cfg.quantity || '1'));
+        if (outcome === 'placed' || outcome === 'test-stopped') return;
+        log('warning', '⚡ API grab failed on live — reloading into the UI buy flow.');
+      }
+      // Fallback: reload so the UI flow's live-reload hold catches the button. Stamp the reason so
+      // the fresh page HOLDS for the button to enable instead of bouncing back into this watcher.
       try { sessionStorage.setItem('__botTgtLiveAt', String(Date.now())); } catch (_) {}
       location.reload(); return;
     }
@@ -1599,32 +1636,14 @@ async function runStore(store, cfg, burst) {
     }
 
     // ⚡ DIRECT-API CHECKOUT (Target) — fire IMMEDIATELY, before waiting for any on-page button to
-    // render (the API needs only the TCIN from the URL). This is the whole speed win: no page-load
-    // wait, no drawer. Test = add+prep only (never places). Any failure (OOS 404, etc.) falls
-    // straight through to the normal UI/stock-watch flow below, so a drop is never lost.
+    // render (the API needs only the TCIN from the URL). Doubles as the live-probe: if the item is
+    // OOS the add 4xx's and we fall through to the stock watcher below (which re-fires the API the
+    // instant it goes live — no reload). Test = add+prep only. Any failure falls to the UI flow.
     const tcinEarly = (location.pathname.match(/\/A-(\d+)/) || [])[1];
     if (store.key === 'target' && tcinEarly && !cfg.apiCheckoutOff) {
-      const testMode = (cfg && cfg.testMode) || (await wget('botTestMode')).botTestMode;
-      setStep('⚡ API checkout', testMode ? 'add + prep (test — no order)' : 'add → prep → place order');
-      const r = await bgSend({ type: 'TARGET_API_BUY', tcin: tcinEarly, quantity: wantQty, fulfillment: detectTargetFulfillment(), placeOrder: !testMode }, 24000, { ok: false, error: 'timeout' });
-      if (r && r.ok && r.placed) {
-        const bn = window.__botNum || '?';
-        log('success', '⚡🎉 Order placed via API! order ' + r.orderId + ' (ref ' + r.refId + ')');
-        chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: 'Bot ' + bn + ' — ORDER PLACED (API)! ' + r.orderId, speak: 'Bot ' + bn + ' order placed' }).catch(() => {});
-        await markOrderDone();
-        setStatus('done', 'Order placed (API)');
-        if (cfg.stopOnSuccess) { await wset({ botRunning: false, botPhase: 'IDLE' }); chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {}); scheduleRewatch(cfg); }
-        return;
-      }
-      if (r && r.ok && !r.placed && testMode) {
-        log('success', '⚡🧪 TEST — API add+prep OK (cart ' + (r.refId || '?') + ', ' + (r.state || '') + '), did NOT place the order.');
-        showBigBanner('✓ API READY', 'TEST — added + prepped, no order placed');
-        setStatus('done', '🧪 API test passed — not ordered');
-        await wset({ botRunning: false, botPhase: 'IDLE' }); chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
-        return;
-      }
-      const emsg = r && r.body && (r.body.message || r.body.code) ? ' — ' + (r.body.code || '') + ' ' + (r.body.message || '') : '';
-      log('warning', '⚡ API checkout didn\'t complete (' + (r ? (r.step ? r.step + ' ' + r.status + emsg : r.error) : 'no reply') + ') — falling back to the UI buy flow.');
+      const outcome = await targetApiAttempt(cfg, tcinEarly, wantQty);
+      if (outcome === 'placed' || outcome === 'test-stopped') return;
+      log('warning', '⚡ (falling back to the UI/stock-watch flow)');
     }
     // TARGET: Buy now sometimes NAVIGATES to /checkout/buy-now/checkout instead of opening the
     // drawer. During a drop an "Ok" error popup can block that page (capture: Ok → bounced back to
@@ -1755,7 +1774,7 @@ async function runStore(store, cfg, burst) {
       // the spam-click grabs it. Falls back to a normal reload on an error page or API hiccup.
       if (store.key === 'target' && !errNow) {
         const tcin = (location.pathname.match(/\/A-(\d+)/) || [])[1];
-        if (tcin) { await watchTargetStock(tcin, interval, burst); return; }
+        if (tcin) { await watchTargetStock(tcin, interval, burst, cfg); return; }
       }
       // WALMART single item: watch in the BACKGROUND (same-origin HTML poll) instead of reloading
       // the page every cycle. Covers BOTH "item not available" (errNow — the normal pre-drop state)
