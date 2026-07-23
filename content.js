@@ -831,6 +831,20 @@ function logItemLive(detail) {
     speak: 'Bot ' + n + ' item live' }).catch(() => {});
 }
 
+// Fulfillment for the direct-API add-to-cart. Shippable items (the drop case) need NO fulfillment
+// field — Target defaults to ship (capture: a shippable tcin's add body omitted it entirely). So
+// return null for the common case. Pickup items DO need a fulfillment block with location_id which
+// we can't reliably scrape, so leave them null too → the API add fails and it FALLS BACK to the UI.
+function detectTargetFulfillment() {
+  return null; // omit fulfillment → Target ships; pickup-only items fall back to the UI flow
+}
+
+// Stamp THIS run as "order placed" so the double-order guard (top of runStore) refuses any further
+// buying until a new Start. Keyed by run token so a fresh Start (new token) clears it automatically.
+async function markOrderDone() {
+  try { await chrome.storage.local.set({ ['w' + _wid() + ':orderDone']: window.__botRunToken }); } catch (_) {}
+}
+
 // Target restock watcher — polls the stock API instead of reloading the page each cycle. Stays put
 // and only reloads ONCE when the item flips to IN_STOCK (so the live Buy now / Add to cart button
 // appears and the spam-click grabs it). This turns ~2s-per-reload detection into ~sub-second. Polls
@@ -1508,6 +1522,21 @@ async function runStore(store, cfg, burst) {
   if (PHASE_STEP[phase]) setStep(PHASE_STEP[phase]);
   else { log('info', '── ' + phase + ' ──'); setStatus('running', store.name + ': ' + phase); }
 
+  // 🛑 HARD DOUBLE-ORDER GUARD: once THIS run has placed an order, NEVER buy again in the same run.
+  // Survives manual navigation ("Continue shopping" after the receipt), stopOnSuccess being
+  // unchecked, off-course recovery — anything. Cleared only by a new Start (new run token).
+  try {
+    const odKey = 'w' + _wid() + ':orderDone';
+    const od = (await chrome.storage.local.get(odKey))[odKey];
+    if (od != null && od === window.__botRunToken) {
+      log('success', '🛑 An order was already placed this run — not buying again. Press Start for a new order.');
+      setStatus('done', 'Order already placed this run');
+      await wset({ botRunning: false, botPhase: 'IDLE' });
+      chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+      return;
+    }
+  } catch (_) {}
+
   // 🧭 OFF-COURSE RECOVERY: remember the ITEM this run is working (per window + run token), and if
   // the site ever dumps us on a page that's part of NEITHER the item NOR the buy flow (cart/
   // checkout/confirm/queue are all recognized phases; queues are handled before we get here),
@@ -1522,6 +1551,16 @@ async function runStore(store, cfg, burst) {
     if (onItem) {
       try { chrome.storage.local.set({ [wkKey]: { url: location.href.split('#')[0], tok: window.__botRunToken } }); } catch (_) {}
     } else if (itemRe) {
+      // SAFETY: NEVER treat a post-purchase / receipt / account page as "off-course" — going back
+      // to the item there re-runs the buy and can place a SECOND order (real risk, 2026-07-23:
+      // Target's /orders/<id> confirmation fell through here). Bail out as a terminal success.
+      if (/\/order|\/receipt|\/thank|purchase-history|\/account\b/i.test(location.pathname)) {
+        log('success', '✅ On a post-order page — order looks complete; not going back to the item.');
+        setStatus('done', 'Order complete (verify the page)');
+        await markOrderDone();
+        if (cfg.stopOnSuccess) { await wset({ botRunning: false, botPhase: 'IDLE' }); chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {}); scheduleRewatch(cfg); }
+        return;
+      }
       try {
         const wk = (await chrome.storage.local.get(wkKey))[wkKey];
         if (wk && wk.url && wk.tok === window.__botRunToken) {
@@ -1557,6 +1596,35 @@ async function runStore(store, cfg, burst) {
     if (canBuyNow && await findBtn(['place your order'], 0)) {
       log('info', 'Checkout drawer already open — placing order...');
       await buyNowDrawerCheckout(store, cfg); return;
+    }
+
+    // ⚡ DIRECT-API CHECKOUT (Target) — fire IMMEDIATELY, before waiting for any on-page button to
+    // render (the API needs only the TCIN from the URL). This is the whole speed win: no page-load
+    // wait, no drawer. Test = add+prep only (never places). Any failure (OOS 404, etc.) falls
+    // straight through to the normal UI/stock-watch flow below, so a drop is never lost.
+    const tcinEarly = (location.pathname.match(/\/A-(\d+)/) || [])[1];
+    if (store.key === 'target' && tcinEarly && !cfg.apiCheckoutOff) {
+      const testMode = (cfg && cfg.testMode) || (await wget('botTestMode')).botTestMode;
+      setStep('⚡ API checkout', testMode ? 'add + prep (test — no order)' : 'add → prep → place order');
+      const r = await bgSend({ type: 'TARGET_API_BUY', tcin: tcinEarly, quantity: wantQty, fulfillment: detectTargetFulfillment(), placeOrder: !testMode }, 24000, { ok: false, error: 'timeout' });
+      if (r && r.ok && r.placed) {
+        const bn = window.__botNum || '?';
+        log('success', '⚡🎉 Order placed via API! order ' + r.orderId + ' (ref ' + r.refId + ')');
+        chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: 'Bot ' + bn + ' — ORDER PLACED (API)! ' + r.orderId, speak: 'Bot ' + bn + ' order placed' }).catch(() => {});
+        await markOrderDone();
+        setStatus('done', 'Order placed (API)');
+        if (cfg.stopOnSuccess) { await wset({ botRunning: false, botPhase: 'IDLE' }); chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {}); scheduleRewatch(cfg); }
+        return;
+      }
+      if (r && r.ok && !r.placed && testMode) {
+        log('success', '⚡🧪 TEST — API add+prep OK (cart ' + (r.refId || '?') + ', ' + (r.state || '') + '), did NOT place the order.');
+        showBigBanner('✓ API READY', 'TEST — added + prepped, no order placed');
+        setStatus('done', '🧪 API test passed — not ordered');
+        await wset({ botRunning: false, botPhase: 'IDLE' }); chrome.runtime.sendMessage({ type: 'BOT_DONE' }).catch(() => {});
+        return;
+      }
+      const emsg = r && r.body && (r.body.message || r.body.code) ? ' — ' + (r.body.code || '') + ' ' + (r.body.message || '') : '';
+      log('warning', '⚡ API checkout didn\'t complete (' + (r ? (r.step ? r.step + ' ' + r.status + emsg : r.error) : 'no reply') + ') — falling back to the UI buy flow.');
     }
     // TARGET: Buy now sometimes NAVIGATES to /checkout/buy-now/checkout instead of opening the
     // drawer. During a drop an "Ok" error popup can block that page (capture: Ok → bounced back to
@@ -1925,6 +1993,7 @@ async function runStore(store, cfg, burst) {
   if (phase === 'CONFIRM') {
     log('success', '🎉 ' + store.name + ' — order step reached (verify the page).');
     setStatus('done', 'Order step complete');
+    await markOrderDone(); // block any further buying this run (e.g. "Continue shopping" → re-buy)
     chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'success', text: store.name + ' order placed (please verify).' }).catch(() => {});
     if (cfg.stopOnSuccess) {
       await wset({ botRunning: false, botPhase: 'IDLE' });

@@ -32,7 +32,10 @@ window.__STORES.target = {
   // Which checkout step the current URL represents
   detectPhase: (url) => {
     url = url.toLowerCase();
-    if (/order-confirmation|thank|order-summary/.test(url)) return 'CONFIRM';
+    // CONFIRM = order already placed. `/orders/<id>` is Target's real post-purchase URL (capture
+    // 2026-07-23) — it was NOT matched before, so a completed order fell through to SEARCH and the
+    // off-course recovery navigated BACK to the item and clicked Buy now AGAIN (double-order risk).
+    if (/order-confirmation|thank|order-summary|\/orders?\/\d/.test(url)) return 'CONFIRM';
     if (/checkout/.test(url))                                return 'CHECKOUT';
     if (/\/cart\b/.test(url))                                return 'CART';
     if (/\/s\?|searchterm=/.test(url))                       return 'RESULTS';

@@ -537,6 +537,7 @@ document.getElementById('closeBtn').addEventListener('click', () => window.close
 document.getElementById('speedTestBtn').addEventListener('click', testLoadSpeed);
 document.getElementById('stockTestBtn').addEventListener('click', findStockApi);
 document.getElementById('trackBtn').addEventListener('click', toggleClickTracker);
+document.getElementById('capCheckoutBtn').addEventListener('click', toggleCheckoutCapture);
 
 // Click-tracker toggle: registers track.js on the current store's DOMAIN (so it follows you across
 // the checkout pages) and logs the CODE of every button/link you click. Turn ON, do a manual
@@ -653,6 +654,71 @@ async function findStockApi() {
   finally {
     await chrome.scripting.unregisterContentScripts({ ids: ['stock-sniff'] }).catch(() => {});
     btn.disabled = false; btn.textContent = '⚡ API';
+  }
+}
+
+// ── Checkout-API capture (🛒 Cap) ──────────────────────────────────────────────
+// Toggle: ON installs sniff-checkout.js on the current store (now + on every navigation) so the
+// cart/checkout POSTs are recorded across the whole manual checkout; OFF reads them back and dumps
+// them to the log. Used to build direct-API checkout for a store. State kept in sessionStorage
+// (page-side) + a panel flag so it survives the checkout's page navigations.
+let capCheckoutOn = false;
+async function toggleCheckoutCapture() {
+  const btn = document.getElementById('capCheckoutBtn');
+  const [tab] = await chrome.tabs.query({ active: true, windowId: MY_WID });
+  if (!tab || !/^https?:\/\//.test(tab.url || '')) { addLog('error', '🛒 Open the store PRODUCT page in this tab first.'); return; }
+  let origin; try { origin = new URL(tab.url).origin; } catch (_) { addLog('error', '🛒 Bad tab URL.'); return; }
+
+  if (!capCheckoutOn) {
+    try {
+      // NOTE: does NOT clear prior captures — so you can turn Cap ON→OFF to RE-DUMP the last
+      // checkout's calls (with full headers/bodies) without placing another order. Press Start to
+      // wipe old captures. Register for future navigations + inject into the current page now.
+      await chrome.scripting.unregisterContentScripts({ ids: ['checkout-sniff'] }).catch(() => {});
+      // allFrames + <all_urls> so the hook also lands inside Target's checkout IFRAME (the final
+      // place-order POST fires there, often on a different subdomain) — not just the top page.
+      await chrome.scripting.registerContentScripts([{
+        id: 'checkout-sniff', js: ['sniff-checkout.js'], matches: ['<all_urls>'], allFrames: true, runAt: 'document_start', world: 'MAIN'
+      }]);
+      await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, world: 'MAIN', files: ['sniff-checkout.js'] });
+      capCheckoutOn = true;
+      btn.textContent = '🛒 ●'; btn.classList.add('tracking');
+      addLog('success', '🛒 Checkout capture ON — now do a FULL manual checkout (add to cart → place order). Turn OFF when done to dump the API calls.');
+    } catch (e) { addLog('error', '🛒 ' + e.message); }
+    return;
+  }
+
+  // Turn OFF → read + dump. Read EVERY frame (the checkout iframe keeps its own sessionStorage)
+  // and merge, de-duped and time-ordered.
+  try {
+    const outs = await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, world: 'MAIN',
+      func: () => { try { return sessionStorage.getItem('__botCheckoutSniff'); } catch (_) { return null; } } });
+    let hits = [];
+    for (const o of (outs || [])) { try { const arr = JSON.parse((o && o.result) || '[]'); if (Array.isArray(arr)) hits = hits.concat(arr); } catch (_) {} }
+    const seen = new Set();
+    hits = hits.filter(h => { const k = h.method + ' ' + h.url + ' ' + (h.at || ''); if (seen.has(k)) return false; seen.add(k); return true; })
+               .sort((a, b) => (a.at || 0) - (b.at || 0));
+    if (!hits.length) {
+      addLog('warning', '🛒 No cart/checkout POSTs captured. Did the checkout happen in THIS tab? (Capture stays per-origin — start it on the product page and stay on the store.)');
+    } else {
+      addLog('success', '🛒 Captured ' + hits.length + ' checkout request(s) — newest last:');
+      for (const h of hits) {
+        addLog('info', '— ' + h.method + ' ' + (h.url || '').replace(/^https?:\/\//, '') + '  →  ' + h.status);
+        // Headers matter for replication (Target needs x-api-key / visitor / content-type). Skip the
+        // giant cookie header (it rides along automatically via credentials:include).
+        const hd = h.reqHeaders || {};
+        const hkeys = Object.keys(hd).filter(k => !/^cookie$/i.test(k));
+        if (hkeys.length) addLog('info', '   headers: ' + hkeys.map(k => k + '=' + String(hd[k]).slice(0, 60)).join(' | '));
+        if (h.reqBody) addLog('info', '   body: ' + String(h.reqBody).replace(/\s+/g, ' '));
+        if (h.respSample) addLog('info', '   resp: ' + String(h.respSample).replace(/\s+/g, ' ').slice(0, 200));
+      }
+      addLog('info', '🛒 Hit Copy and paste it to me — I’ll wire direct-API checkout for this store.');
+    }
+  } catch (e) { addLog('error', '🛒 ' + e.message); }
+  finally {
+    await chrome.scripting.unregisterContentScripts({ ids: ['checkout-sniff'] }).catch(() => {});
+    capCheckoutOn = false;
+    btn.textContent = '🛒 Cap'; btn.classList.remove('tracking');
   }
 }
 
@@ -1259,6 +1325,7 @@ async function toggleBot(testMode = false) {
     // HARD RESET: wipe any leftover state from a previous (possibly stuck) run so a new
     // run never inherits stale pointers/flags. Background detaches any stale debugger.
     await wremove(['currentTabId', 'queueSince']);
+    chrome.storage.local.remove(['w' + MY_WID + ':orderDone', 'w' + MY_WID + ':workingItem']).catch(() => {}); // clear last run's order/off-course flags
     stopQueueTimer(); stopCheckoutTimer();
     chrome.runtime.sendMessage({ type: 'RESET_BOT' }).catch(() => {});
 

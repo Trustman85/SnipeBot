@@ -262,6 +262,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
+  // Direct-API Target checkout — runs the add→pre_checkout→checkout POSTs in the page's MAIN world
+  // (so Akamai's fetch wrapper attaches its x-gyjwza5z sensor headers automatically). placeOrder
+  // false = add+prep only (safe, no order). Replies on both settle so a hang can't freeze the caller.
+  if (msg.type === 'TARGET_API_BUY') {
+    targetApiBuy(sender.tab?.id, msg).then(r => sendResponse(r), e => sendResponse({ ok: false, error: String(e && e.message || e) }));
+    return true;
+  }
+
   // Alert the human (desktop notification + relay a sound to the popup + optional spoken line)
   if (msg.type === 'BOT_ALERT') handleAlert(msg.kind, msg.text, msg.speak);
 
@@ -930,6 +938,58 @@ async function targetStockPoll(tabId, tcin) {
 // Stock check via the product page HTML (Sam's/Walmart GLASS SSR the availability into the page).
 // Fetches the URL in the tab's page context and reads the main product's schema.org availability
 // (falling back to the first availabilityStatus). Returns { inStock, status }.
+// Direct-API Target buy. Runs the captured 3-call checkout in the page's MAIN world so Target's
+// Akamai SDK (which wraps window.fetch) injects the x-gyjwza5z sensor headers + the session cookies
+// ride along via credentials:include. The calls are session-cart based (no ids passed between them).
+//   opts: { tcin, quantity, fulfillment, placeOrder }
+//   placeOrder=false → add+pre_checkout ONLY (never completes an order — safe for Test).
+async function targetApiBuy(tabId, opts) {
+  if (!tabId) return { ok: false, error: 'no tab' };
+  const res = await withTimeout(chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN', args: [opts || {}],
+    func: async (o) => {
+      const H = { 'Accept': 'application/json', 'Content-Type': 'application/json', 'x-application-name': 'web' };
+      const KADD = '9f36aeafbe60771e321a7cc95a78140772ab3e96'; // target.com web cart key (read live later if it rotates)
+      const KCO  = 'e59ce3b531b2c39afb2e2b8a71ff10113aac2a14'; // target.com web checkout key
+      const CART = 'https://carts.target.com/web_checkouts/v1/';
+      const post = async (url, body) => {
+        const r = await fetch(url, { method: 'POST', credentials: 'include', headers: H, body: body ? JSON.stringify(body) : undefined });
+        let j = null; try { j = await r.json(); } catch (_) {}
+        return { status: r.status, body: j };
+      };
+      try {
+        // 1) ADD TO CART. Shippable items (the drop case) send NO fulfillment field — Target
+        // defaults to ship (capture 2026-07-23: tcin 79517000 → REGULARITEM, no fulfillment).
+        // Only pickup items carry a fulfillment block (location_id), which we generally can't
+        // scrape → those fall back to the UI. cart_subchannel:BUYNOW isolates an EXPRESS cart so
+        // we buy ONLY this item, never whatever else is in the guest's main cart.
+        const addBody = {
+          cart_item: { item_channel_id: '10', tcin: String(o.tcin), quantity: o.quantity || 1 },
+          cart_type: 'REGULAR', channel_id: '10', shopping_context: 'DIGITAL', cart_subchannel: 'BUYNOW'
+        };
+        if (o.fulfillment) addBody.fulfillment = o.fulfillment;
+        const add = await post(CART + 'cart_items?field_groups=CART,CART_ITEMS,SUMMARY&key=' + KADD, addBody);
+        if (add.status < 200 || add.status >= 300) return { ok: false, step: 'add', status: add.status, body: add.body };
+        // 2) PRE-CHECKOUT — acts on the session cart. Body MUST include cart_type (capture
+        // 2026-07-23: {} → 400 "cart_type must not be null"). It's also a query param, but the
+        // server validates it in the BODY.
+        const pre = await post(CART + 'pre_checkout?cart_type=REGULAR&field_groups=ADDRESSES,CART,CART_ITEMS,DELIVERY_WINDOWS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY&key=' + KCO, { cart_type: 'REGULAR' });
+        if (pre.status < 200 || pre.status >= 300) return { ok: false, step: 'pre', status: pre.status, body: pre.body };
+        const refId = pre.body && pre.body.reference_id, cartId = (add.body && add.body.cart_id);
+        if (!o.placeOrder) return { ok: true, placed: false, cartId, refId, state: pre.body && pre.body.cart_state };
+        // 3) CHECKOUT — PLACES THE ORDER (Akamai adds sensor headers to this in-page fetch).
+        const co = await post(CART + 'checkout?cart_type=REGULAR&field_groups=ADDRESSES,CART,CART_ITEMS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY&key=' + KCO, { cart_type: 'REGULAR' });
+        const order = co.body && co.body.orders && co.body.orders[0];
+        const done = co.status >= 200 && co.status < 300 && order && /COMPLETED/i.test(order.cart_state || '');
+        return { ok: !!done, placed: !!done, step: 'checkout', status: co.status,
+                 orderId: order && order.order_id, refId: (order && order.reference_id) || refId,
+                 state: order && order.cart_state, body: done ? null : co.body };
+      } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+    }
+  }), 22000, 'target-api').catch(e => null);
+  return (res && res[0] && res[0].result) || { ok: false, error: 'no result (page busy?)' };
+}
+
 async function htmlStockPoll(tabId, url, mode) {
   if (!tabId || !url) return { ok: false };
   try {
