@@ -973,9 +973,10 @@ async function htmlStockPoll(tabId, url, mode) {
             const status = live ? 'InStock' : (pre ? 'PreOrder' : (oos ? 'OutOfStock' : 'unknown'));
             return { status, inStock: live || pre };
           }
-          // schema.org markup is for the MAIN product only → cleanest signal.
-          if (/schema\.org\/InStock/i.test(t))    return { status: 'InStock', inStock: true };
-          if (/schema\.org\/OutOfStock/i.test(t)) return { status: 'OutOfStock', inStock: false };
+          // FIRST schema.org availability only — the MAIN product's markup is SSR'd before the
+          // "customers also bought" carousels, whose in-stock items false-positive a whole-page test.
+          const av = t.match(/schema\.org\/(InStock|LimitedAvailability|PreOrder|OutOfStock|SoldOut|Discontinued)/i);
+          if (av) return { status: av[1], inStock: /InStock|LimitedAvailability|PreOrder/i.test(av[1]) };
           // Fallback: first availabilityStatus (Walmart-style) or availability_status (Target-style)
           // in the SSR'd data.
           const m = t.match(/"availabilityStatus"\s*:\s*"([^"]+)"/) || t.match(/"availability_status"\s*:\s*"([^"]+)"/);

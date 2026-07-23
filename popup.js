@@ -52,6 +52,29 @@ function fitPanelScale() {
 window.addEventListener('resize', fitPanelScale);
 fitPanelScale();
 
+// After a Walmart Start-reload, report the TAB's load state every 5s — the anti-bot slow-load
+// can stall the page 30-60s+ and the panel showed NOTHING (user kept stopping at ~10-20s thinking
+// the bot was dead). Also distinguishes the two failure modes: "still loading" = tarpit (wait);
+// "finished loading but no bot lines" = injection problem (tell the dev).
+async function monitorWalmartLoad(tabId) {
+  const t0 = Date.now();
+  for (let i = 0; i < 24; i++) {              // up to ~2 min
+    await new Promise(res => setTimeout(res, 5000));
+    try {
+      const { botRunning } = await wget('botRunning');
+      if (!botRunning) return;                 // user stopped — stop narrating
+      const tab = await chrome.tabs.get(tabId);
+      const secs = Math.round((Date.now() - t0) / 1000);
+      if (tab.status === 'loading') {
+        addLog('info', '⏳ Walmart page still loading… (' + secs + 's — anti-bot slow-load; the bot starts the moment it finishes)');
+      } else {
+        addLog('info', '🌐 Walmart page finished loading (' + secs + 's). If no bot lines follow, injection failed — copy the log.');
+        return;
+      }
+    } catch (_) { return; }                    // tab closed
+  }
+}
+
 // The active tab IN OUR pinned window. Always scope by windowId: MY_WID, never `currentWindow`
 // (which drifts to whatever window is focused) — so the bot always injects into the tab the panel
 // actually belongs to, regardless of focus.
@@ -71,11 +94,13 @@ async function assignBotNumber(wid) {
   const { windowNames = {} } = await chrome.storage.local.get('windowNames');
   // Drop entries for windows that no longer exist, so their numbers can be reused.
   for (const id of Object.keys(windowNames)) if (liveIds.length && !liveIds.includes(Number(id))) delete windowNames[id];
-  if (windowNames[wid] == null) {
-    const used = new Set(Object.values(windowNames));
-    let n = 1; while (used.has(n)) n++;       // smallest free positive integer
-    windowNames[wid] = n;
-  }
+  // RE-COMPACT on every panel open: this window re-grabs the smallest free number. Without this a
+  // window kept the "Bot 3" it was assigned while two other (since-closed) windows existed —
+  // confusing when it's the ONLY window left. Other open windows keep their numbers.
+  delete windowNames[wid];
+  const used = new Set(Object.values(windowNames));
+  let n = 1; while (used.has(n)) n++;         // smallest free positive integer
+  windowNames[wid] = n;
   await chrome.storage.local.set({ windowNames });
   return windowNames[wid];
 }
@@ -1266,6 +1291,7 @@ async function toggleBot(testMode = false) {
           addLog('info', '🔄 Reload requested for tab ' + tab.id + ' (w' + tab.windowId + ') @ ' + (tab.url || '').replace(/^https?:\/\/(www\.)?/, '').slice(0, 45));
         } catch (e) { addLog('error', '🔄 tabs.reload FAILED: ' + (e && e.message || e)); }
         addLog('info', '⏳ Reloading the Walmart page — the bot loads WITH the page. First load after a store switch can take 30-60s (anti-bot slow-load); leave it running.');
+        monitorWalmartLoad(tab.id); // fire-and-forget: narrates the load state every 5s
       } else if (onFirst) {
         chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
       } else {
@@ -1286,6 +1312,7 @@ async function toggleBot(testMode = false) {
           addLog('info', '🔄 Reload requested for tab ' + tab.id + ' (w' + tab.windowId + ') @ ' + (tab.url || '').replace(/^https?:\/\/(www\.)?/, '').slice(0, 45));
         } catch (e) { addLog('error', '🔄 tabs.reload FAILED: ' + (e && e.message || e)); }
         addLog('info', '⏳ Reloading the Walmart page — the bot loads WITH the page. First load after a store switch can take 30-60s (anti-bot slow-load); leave it running.');
+        monitorWalmartLoad(tab.id); // fire-and-forget: narrates the load state every 5s
       } else chrome.runtime.sendMessage({ type: 'INJECT_BOT', tabId: tab.id, url: tab.url });
       addLog('success', 'Bot injected → ' + (tab.url || '').replace(/^https?:\/\//, '').slice(0, 45));
     } else {

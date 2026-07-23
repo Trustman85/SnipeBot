@@ -11,12 +11,22 @@
 // Detects a high-demand "waiting room" / queue / throttle page. On these the bot must
 // WAIT (not reload — reloading can lose your place in line) until it clears.
 function detectQueue() {
-  const url = (location.href || '').toLowerCase();
-  // Walmart's drop waiting room is walmart.com/qp?qpdata={"queued":true,...} — match it explicitly.
-  if (/[\/.]qp\?|qpdata=/.test(url)) return true;
-  if (/queue|waitingroom|waiting-room|\/qit\/|queue-it|holding|throttle/.test(url)) return true;
+  // Walmart's REAL waiting room is the /qp PATH (walmart.com/qp?qpdata=...). ANCHORED checks only:
+  // normal drop-item links carry a "?potential_qpdata=..." param on a plain /ip page (capture
+  // 2026-07-23), and the old loose "qpdata=" substring test read that as "in queue" — the bot sat
+  // "waiting in line" on an ordinary item page instead of background-watching it.
+  const path = (location.pathname || '').toLowerCase();
+  if (/\/qp(?:\/|$)/.test(path)) return true;                      // the /qp waiting-room path
+  if (/[?&]qpdata=/i.test(location.search || '')) return true;     // exact qpdata param (not potential_qpdata)
+  // Generic queue hosts/paths — HOST+PATH only; query strings carry marketing junk.
+  const hp = ((location.host || '') + path).toLowerCase();
+  if (/queue|waitingroom|waiting-room|\/qit\/|queue-it|holding|throttle/.test(hp)) return true;
+  // TEXT: queue-specific wording ONLY. Deliberately DROPPED "high demand" and "please wait while"
+  // — Walmart drop-item PDPs show "high demand" as plain marketing copy (capture 2026-07-23: the
+  // bot sat "in line" on a normal item page instead of background-watching it). A real queue is
+  // caught by the /qp URL above or the explicit in-line phrases below.
   const t = (document.body && document.body.innerText || '').toLowerCase();
-  return /waiting room|hold my (spot|place)|you are (now )?in line|you're in line|in the queue|your (place|spot|turn) in line|high demand|estimated wait|please wait while|number in line|currently in line|hold tight|you are in the queue/.test(t);
+  return /waiting room|hold my (spot|place)|you are (now )?in line|you're in line|in the queue|your (place|spot|turn) in line|estimated wait time|number in line|currently in line|you are in the queue/.test(t);
 }
 
 // Walmart encodes its drop-queue state in the URL: walmart.com/qp?qpdata=<url-encoded JSON>.
@@ -134,11 +144,28 @@ function detectSamsPhase() {
   return null; // couldn't tell
 }
 
-// Sam's Club — finds a button by exact CSS selector
+// Excludes matches sitting inside a "customers also bought"-style carousel/recommendation
+// container — Sam's PDP renders those with the SAME [data-automation-id="atc"] attribute as the
+// MAIN product's Add to Cart, so a bare querySelector can pick a random related item's button
+// instead of the one for the item this run is actually on (real capture 2026-07-15: the retry
+// loop grabbed a carousel plush toy's Add button after the main one briefly wasn't first-match).
+// var (NOT const) — this file re-injects into the SAME world on SPA navigations; a top-level
+// const would throw "already declared" on the 2nd injection and abort the whole re-run.
+var SAMS_CAROUSEL_CONTAINER = '[class*="carousel" i], [class*="recommend" i], [class*="similar" i], ' +
+  '[class*="also-viewed" i], [class*="also-bought" i], [class*="you-may-also" i], ' +
+  '[data-testid*="carousel" i], [data-automation-id*="carousel" i], [data-automation-id*="recommend" i]';
+function firstMainMatch(selector) {
+  for (const el of document.querySelectorAll(selector)) {
+    if (!el.closest(SAMS_CAROUSEL_CONTAINER)) return el;
+  }
+  return null; // every match was inside a carousel — caller decides the fallback
+}
+
+// Sam's Club — finds a button by exact CSS selector (skips carousel/recommendation matches)
 function waitForSamsBtn(selector, timeout = 5000) {
   return new Promise(resolve => {
     const find = () => {
-      const el = document.querySelector(selector);
+      const el = firstMainMatch(selector);
       return (el && !el.disabled && el.getAttribute('aria-disabled') !== 'true') ? el : null;
     };
     const el = find(); if (el) return resolve(el);

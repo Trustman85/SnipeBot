@@ -667,20 +667,43 @@ async function setQuantity(qty) {
 }
 
 // Detects a CAPTCHA / "verify you are human" / bot-challenge page (cross-store)
+// True only if the element is actually RENDERED (has layout + isn't hidden). Anti-bot vendors
+// (DataDome/PerimeterX on Sam's) PRELOAD a hidden captcha container in the DOM even when there's
+// no challenge — matching that invisible placeholder caused false "CAPTCHA detected" pauses.
+function isVisibleEl(el) {
+  if (!el) return false;
+  // NB: no offsetParent test — it's ALSO null for position:fixed elements, and real challenge
+  // overlays (DataDome press-and-hold) are fixed → we'd have ignored a REAL captcha. A
+  // display:none/detached element has a 0×0 rect, so the size check below covers "hidden".
+  const r = el.getBoundingClientRect();
+  if (r.width < 8 || r.height < 8) return false;                          // zero/tiny = not shown
+  const cs = getComputedStyle(el);
+  return cs.visibility !== 'hidden' && cs.display !== 'none' && parseFloat(cs.opacity || '1') > 0.05;
+}
 function detectCaptcha() {
-  // Known anti-bot / human-verification widgets by their iframe/element fingerprints:
-  //  reCAPTCHA, hCaptcha, PerimeterX press-and-hold (#px-captcha), DataDome (geo.captcha-delivery),
-  //  Cloudflare Turnstile (challenges.cloudflare.com), Arkose/FunCaptcha, Akamai bot-manager.
+  // STRONG fingerprints — these iframes/elements only exist DURING a real challenge, so their mere
+  // presence is enough (reCAPTCHA, hCaptcha, DataDome delivery, Cloudflare Turnstile, Arkose/FunCaptcha).
   if (document.querySelector([
-    'iframe[src*="recaptcha"]', 'iframe[src*="hcaptcha"]', 'iframe[title*="captcha" i]',
+    'iframe[src*="recaptcha"]', 'iframe[src*="hcaptcha"]',
     'iframe[src*="geo.captcha-delivery.com"]', 'iframe[src*="challenges.cloudflare.com"]',
     'iframe[src*="arkoselabs"]', 'iframe[src*="funcaptcha"]', 'iframe[src*="/fc/"]',
-    '#px-captcha', '[id*="px-captcha"]', '[class*="datadome" i]', '[id*="datadome" i]',
-    '.cf-turnstile', '[class*="captcha" i]', '[id*="captcha" i]',
-    '[data-testid*="captcha" i]', '[aria-label*="captcha" i]', '[aria-label*="press & hold" i]'
+    '.cf-turnstile'
   ].join(', '))) return true;
+  // WEAK fingerprints — generic name matches (class/id/aria containing "captcha"/"press & hold").
+  // Vendors preload these HIDDEN, so require the element to be actually VISIBLE before pausing.
+  const weak = document.querySelectorAll([
+    'iframe[title*="captcha" i]', '#px-captcha', '[id*="px-captcha"]',
+    '[class*="datadome" i]', '[id*="datadome" i]', '[class*="captcha" i]', '[id*="captcha" i]',
+    '[data-testid*="captcha" i]', '[aria-label*="captcha" i]', '[aria-label*="press & hold" i]'
+  ].join(', '));
+  for (const el of weak) if (isVisibleEl(el)) return true;
+  // TEXT signals — challenge-page language ONLY. Deliberately DROPPED "press and hold" and
+  // "slide/drag to" here: those are challenge INSTRUCTIONS but also everyday PRODUCT copy (e.g.
+  // the "Zephyr" device page → false captcha). Real press-and-hold/slider challenges are already
+  // caught by their element/iframe fingerprints above (#px-captcha, geo.captcha-delivery), so
+  // nothing is lost. Kept phrases are unambiguous interstitial wording.
   const t = (document.body && document.body.innerText || '').toLowerCase();
-  return /are you a human|verify (?:you(?:'| a)?re|that you are) (?:a )?human|i'?m not a robot|complete the (?:captcha|security check)|press (?:and|&) hold|(?:slide|drag) (?:to |the )|unusual traffic|confirm you(?:'| a)?re human|enter the characters|verify your identity|security check to access|checking your browser|activity from your (?:computer|device|network)/.test(t);
+  return /are you a human|verify (?:you(?:'| a)?re|that you are) (?:a )?human|i'?m not a robot|complete the (?:captcha|security check)|unusual traffic|confirm you(?:'| a)?re human|enter the characters (?:you see|below)|security check to access|checking your browser before|activity from your (?:computer|device|network)/.test(t);
 }
 
 // Pause the bot on a CAPTCHA / bot challenge and WAIT for the human to clear it — the bot can't (and
@@ -862,11 +885,21 @@ function samsPageOutOfStock() {
 async function watchStockHtml(url, interval, burst) {
   const pollMs = Math.max(700, (burst ? 0.6 : (parseFloat(interval) || 2)) * 1000);
   log('info', '⚡ Watching stock via page HTML (every ' + Math.round(pollMs) + 'ms) — no reloads until it drops.');
+  // BASELINE GUARD (zephyr capture 2026-07-15): some unbuyable items (in-club-only) still embed
+  // schema.org/InStock in their page data — trusting it caused an ITEM LIVE→reload→ITEM LIVE loop.
+  // We're only ever HERE because the page has no working buy button, so if the very first poll
+  // already reads in-stock, that signal is meaningless for this item: record it as the baseline
+  // and fire only when the status CHANGES to an in-stock value.
+  let baseline = null;
   for (let i = 0; ; i++) {
     const st = await wget('botRunning');
     if (!st.botRunning) return; // stopped by the user
     const r = await stockPollLocal(url, ''); // in-content fetch — immune to the executeScript stall
-    if (r.ok && r.inStock) {
+    if (baseline === null && r.ok && !r.busy) {
+      baseline = r.status || '';
+      if (r.inStock) log('warning', '⚠️ Page data reads "' + baseline + '" but the item is NOT buyable — ignoring that status; will fire only when it CHANGES.');
+    }
+    if (r.ok && r.inStock && r.status !== baseline) {
       logItemLive('IN STOCK (' + r.status + ') — reloading to grab it!');
       location.reload(); return;
     }
@@ -874,7 +907,14 @@ async function watchStockHtml(url, interval, burst) {
       log('warning', '⚡ stock check ' + (r.status || 'failed') + ' — falling back to a page reload.');
       await sleep(pollMs); location.reload(); return;
     }
-    if (i % 12 === 0) log('info', '⚡ still ' + (r.status || 'OOS') + ' — watching…');
+    if (i % 12 === 0) {
+      // Honest wording: when the page CLAIMS in-stock but that's the ignored baseline (in-club-only
+      // items), "still InStock — watching" read like nonsense — say what we actually mean.
+      const state = (r.inStock && r.status === baseline)
+        ? 'not buyable (page claims ' + r.status + ')'
+        : (r.status || 'OOS');
+      log('info', '⚡ still ' + state + ' — watching…');
+    }
     await sleep(pollMs);
   }
 }
@@ -913,9 +953,15 @@ async function stockPollLocal(url, mode) {
       const oos  = /"availability"\s*:\s*"(?:https?:\/\/schema\.org\/)?(?:OutOfStock|SoldOut|Discontinued|NOT_AVAILABLE|OUT_OF_STOCK|UNAVAILABLE)"/i.test(t);
       return { ok: true, status: live ? 'InStock' : (pre ? 'PreOrder' : (oos ? 'OutOfStock' : 'unknown')), inStock: live || pre };
     }
-    // Generic: schema.org (main product only) → availabilityStatus/availability_status fallback.
-    if (/schema\.org\/InStock/i.test(t))    return { ok: true, status: 'InStock', inStock: true };
-    if (/schema\.org\/OutOfStock/i.test(t)) return { ok: true, status: 'OutOfStock', inStock: false };
+    // Generic: schema.org availability → availabilityStatus/availability_status fallback.
+    // Use the FIRST occurrence only — the MAIN product's markup is SSR'd before the
+    // "customers also bought" carousels, whose in-stock items carry their own schema.org/InStock
+    // (real false-positive on Sam's 2026-07-15: unavailable item reported "ITEM LIVE").
+    const av = t.match(/schema\.org\/(InStock|LimitedAvailability|PreOrder|OutOfStock|SoldOut|Discontinued)/i);
+    if (av) {
+      const s = av[1];
+      return { ok: true, status: s, inStock: /InStock|LimitedAvailability|PreOrder/i.test(s) };
+    }
     const m = t.match(/"availabilityStatus"\s*:\s*"([^"]+)"/) || t.match(/"availability_status"\s*:\s*"([^"]+)"/);
     const s = m ? m[1] : null;
     return { ok: true, status: s || 'unknown', inStock: s ? /IN_STOCK|LIMITED/i.test(s) : false };
