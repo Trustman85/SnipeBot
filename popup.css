@@ -238,6 +238,18 @@ body {
 
 .field-hint { font-size: 10px; color: #999; margin-top: 2px; }
 
+/* Green "active this run" indicator next to a setting's label — shown for the settings that apply
+   in the current mode (Use current tab vs Drop watchlist). Toggled by updateActiveIndicators(). */
+/* Station light — ALWAYS visible; gray = off, green (glowing) = on. */
+.active-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: #b8bcc4; vertical-align: middle; margin-right: 5px;
+  transition: background .15s, box-shadow .15s;
+}
+.active-dot.on { background: #2ecc40; box-shadow: 0 0 5px #2ecc40; }
+/* When a setting is active, tint its label green too for an at-a-glance read. */
+.checkbox-row label.lbl-on { color: #1e8e2a; font-weight: 700; }
+
 /* Auto-refresh interval + speed-test button row */
 .refresh-row { display: flex; gap: 8px; }
 .refresh-row input { flex: 1; min-width: 0; }

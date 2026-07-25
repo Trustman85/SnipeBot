@@ -9,8 +9,9 @@
   window.__botCoSniffOn = true;
   const KEY = '__botCheckoutSniff';
   // Only mutation-ish endpoints — skip the flood of analytics/beacon POSTs. GraphQL is included
-  // because Target/Walmart run cart + order mutations through it.
-  const URLRX = /cart|checkout|order|\batc\b|add[_-]?to[_-]?cart|place[_-]?order|purchase|basket|fulfillment|graphql|payment|tender|braintree|billing/i;
+  // because Target/Walmart run cart + order mutations through it. Auth/login patterns included so
+  // the sign-in request is captured too (for building API auto-login).
+  const URLRX = /cart|checkout|order|\batc\b|add[_-]?to[_-]?cart|place[_-]?order|purchase|basket|fulfillment|graphql|payment|tender|braintree|billing|login|log[_-]?on|sign[_-]?in|signin|\bauth\b|oauth|\/token|session|identity|\bciam\b|accounts?\/|credential|authenticate|logon/i;
   // Never record obvious telemetry even if the URL happens to match above.
   const SKIPRX = /analytics|beacon|metrics|telemetry|\/collect|doubleclick|googletag|newrelic|nr-data|sentry|quantummetric|criteo|forter|bluecore|tealium/i;
 

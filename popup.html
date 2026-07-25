@@ -71,6 +71,7 @@
 
   <div class="tabs">
     <button class="tab active" data-tab="item">🔍 Item</button>
+    <button class="tab" data-tab="account">🔐 Account</button>
     <button class="tab" data-tab="address">📦 Address</button>
     <button class="tab" data-tab="payment">💳 Payment</button>
   </div>
@@ -78,33 +79,32 @@
   <div class="tab-panel active" id="tab-item">
     <div class="form-group">
       <label>Site URL</label>
-      <input type="text" id="siteUrl" placeholder="http://localhost:3000" value="http://localhost:3000">
+      <input type="text" id="siteUrl" placeholder="store homepage, e.g. https://www.target.com/" value="http://localhost:3000">
     </div>
     <div class="checkbox-row">
       <input type="checkbox" id="useCurrentTab">
-      <label for="useCurrentTab">Use current tab (don't navigate)</label>
+      <label for="useCurrentTab">Use Current Tab</label>
     </div>
     <!-- Every store runs on SKU / Link + the drop watchlist (name search was removed —
          a pasted product link or ID is always more precise than a name search). -->
     <div class="form-group" id="skuGroup">
-      <label>By SKU / Link</label>
+      <label><span class="active-dot" id="dotSku" title="Active this run"></span> By SKU / Link</label>
       <input type="text" id="itemSku" placeholder="product link or item ID">
-      <span class="field-hint">Paste the item link or ID.</span>
     </div>
     <input type="hidden" id="searchType" value="sku">
     <!-- Drop watchlist: paste the drop links/IDs ahead of time; the bot watches all of them
          and grabs whichever goes live first. Label/placeholder set per store profile. -->
     <div class="form-group" id="watchGroup">
-      <label id="watchLabel">👁 Drop watchlist — one product link or item ID per line</label>
-      <textarea id="watchlist" rows="5" placeholder="paste one link or ID per line"></textarea>
-      <span class="field-hint" id="watchHint">Bot watches all items and buys the first that goes live.</span>
+      <label id="watchLabel"><span class="active-dot" id="dotWatch" title="Active this run"></span> WATCHLIST</label>
+      <span class="field-hint" id="watchNote">Add Link or Item ID per line&nbsp;/&nbsp;Amount For QTY&nbsp;/&nbsp;Max Price<br>1011483406 /1 /100</span>
+      <textarea id="watchlist" rows="5" placeholder="Example  1011483406 /1 /100&#10;1011483413 /1 /100&#10;1011209279 /1 /100"></textarea>
     </div>
-    <div class="form-group"><label>Quantity (how many to add)</label><input type="number" id="quantity" placeholder="1" value="1" min="1" max="20"></div>
-    <div class="form-group"><label>Max Price ($)</label><input type="number" id="maxPrice" placeholder="999" value="999" min="0"></div>
+    <div class="form-group"><label><span class="active-dot" id="dotQty" title="Active this run"></span> Quantity (how many to add)</label><input type="number" id="quantity" placeholder="how many to buy, e.g. 1" value="1" min="1" max="20"></div>
+    <div class="form-group"><label><span class="active-dot" id="dotMax" title="Active this run"></span> Max Price ($)</label><input type="number" id="maxPrice" placeholder="don't buy above this $, e.g. 100" value="999" min="0"></div>
     <div class="form-group">
-      <label>Auto-refresh interval (seconds — e.g. 0.5, 0.2 = 200ms)</label>
+      <label><span class="active-dot" id="dotRefresh" title="Active this run"></span> Auto-refresh interval (seconds — e.g. 0.5, 0.2 = 200ms)</label>
       <div class="refresh-row">
-        <input type="number" id="refreshInterval" placeholder="2" value="2" min="0.05" max="60" step="0.01">
+        <input type="number" id="refreshInterval" placeholder="seconds between checks, e.g. 1" value="2" min="0.05" max="60" step="0.01">
         <button id="speedTestBtn" class="speed-test-btn" title="Reload the current page a few times and measure how fast it loads">⏱ Test</button>
         <button id="stockTestBtn" class="speed-test-btn" title="Probe Target's stock API for the current product and log the availability field">⚡ API</button>
         <button id="trackBtn" class="speed-test-btn" title="Toggle click-tracking on this store: turn ON, do a manual checkout, and each button/link you click is logged with its code so it can be tuned">👁 Track</button>
@@ -112,6 +112,20 @@
       </div>
     </div>
     <div class="checkbox-row"><input type="checkbox" id="stopOnSuccess" checked><label for="stopOnSuccess">Stop bot after successful order</label></div>
+  </div>
+
+  <!-- Store account login — PER STORE (each store its own account). PIN-encrypted like payment.
+       Used for API auto-login: if the bot hits a real signed-out state mid-drop, it re-logs in
+       with these creds and continues the API checkout automatically. -->
+  <div class="tab-panel" id="tab-account">
+    <p class="field-hint" style="margin:0 0 10px">🔐 <b id="acctStoreName">This store</b> account. Saved encrypted under your PIN, never leaves this browser. Used to auto-login if you get signed out during a drop.</p>
+    <div class="form-group"><label><span class="active-dot" id="dotAcct" title="Auto-login armed this run"></span> Account Email / Username</label><input type="text" id="accountEmail" placeholder="the email you sign in with" autocomplete="off"></div>
+    <div class="form-group"><label>Account Password</label><input type="password" id="accountPass" placeholder="your store password" autocomplete="off"></div>
+    <div class="checkbox-row"><input type="checkbox" id="autoLogin" checked><label for="autoLogin">Auto-login if signed out during a run</label></div>
+    <div class="form-group">
+      <button id="capLoginBtn" class="speed-test-btn" title="Capture your real sign-in request so raw-API auto-login can be built for this store" style="width:100%">🔑 Capture my login (sign out → click → sign in → click again)</button>
+    </div>
+    <p class="demo-note">⚠️ Credentials are stored only in your browser, encrypted with your PIN.</p>
   </div>
 
   <div class="tab-panel" id="tab-address">

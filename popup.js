@@ -1,6 +1,7 @@
 // All config field IDs — used to save/restore form values
 const FIELDS = ['siteUrl','useCurrentTab','itemSku','searchType','quantity','maxPrice','refreshInterval',
                 'watchlist',
+                'accountEmail','accountPass','autoLogin',
                 'firstName','lastName','email','address','city','state','zip',
                 'cardNumber','cardName','expiry','cvv','stopOnSuccess'];
 
@@ -216,7 +217,7 @@ function writeForm(cfg) {
   FIELDS.forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
-    if (el.type === 'checkbox') el.checked = cfg[id] ?? (id === 'stopOnSuccess');
+    if (el.type === 'checkbox') el.checked = cfg[id] ?? (id === 'stopOnSuccess' || id === 'autoLogin');
     else el.value = cfg[id] ?? '';
   });
   // All stores are SKU/Link-only now — older saved configs may still carry searchType 'name'.
@@ -235,12 +236,49 @@ const extractItemId = (line, profile) => {
   const fn = ID_EXTRACT[profile];
   return fn ? fn(String(line).trim()) : null;
 };
-// Parse the watchlist textarea into de-duped item IDs for the active store (links or bare IDs).
-function parseWatchlist(text, profile) {
+// Parse one watchlist/SKU line: "<link or id> /<qty> /<maxprice>". The /qty and /maxprice are
+// OPTIONAL and order-independent-ish (first /N = qty, second /N = max price). Defaults: qty 1,
+// max price 100. Returns { id, qty, max } or null. e.g. "1011483406 /2 /150" → qty 2, max 150.
+function parseItemLine(line, profile) {
+  const nums = [];
+  const core = String(line).replace(/\/\s*(\d+(?:\.\d+)?)/g, (_, n) => { nums.push(parseFloat(n)); return ' '; }).trim();
+  const id = extractItemId(core, profile);
+  if (!id) return null;
+  return { id, qty: nums.length >= 1 ? Math.max(1, Math.round(nums[0])) : 1, max: nums.length >= 2 ? nums[1] : 100 };
+}
+// Rewrite each recognizable watchlist line to "<what you typed> /qty /maxprice", auto-filling the
+// defaults (qty 1, max 100) so the numbers are always visible next to the item. Lines without a
+// detectable id (mid-typing) are left alone. Called on blur.
+function normalizeWatchlist() {
+  const ta = document.getElementById('watchlist');
+  if (!ta) return;
+  const out = ta.value.split(/\r?\n/).map(line => {
+    const raw = line.trim();
+    if (!raw) return line;                                  // keep blank lines as-is
+    const nums = [];
+    const core = raw.replace(/\/\s*(\d+(?:\.\d+)?)/g, (_, n) => { nums.push(parseFloat(n)); return ' '; }).replace(/\s+/g, ' ').trim();
+    if (!extractItemId(core, activeProfile)) return line;   // not a valid item yet — don't touch
+    const qty = nums.length >= 1 ? Math.max(1, Math.round(nums[0])) : 1;
+    const max = nums.length >= 2 ? nums[1] : 100;
+    return core + ' /' + qty + ' /' + max;
+  });
+  const joined = out.join('\n');
+  if (joined !== ta.value) ta.value = joined;
+}
+
+// Parse the watchlist textarea into de-duped item IDs, filling qtyMap[id] and maxMap[id] from each
+// line's "/qty /maxprice" suffix (defaults qty 1 / max 100).
+function parseWatchlist(text, profile, qtyMap, maxMap) {
   if (!text) return [];
-  const ids = String(text).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean)
-    .map(line => extractItemId(line, profile)).filter(Boolean);
-  return ids.filter((id, i) => ids.indexOf(id) === i);
+  const ids = [];
+  String(text).split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean).forEach(line => {
+    const p = parseItemLine(line, profile);
+    if (!p || ids.includes(p.id)) return;
+    ids.push(p.id);
+    if (qtyMap) qtyMap[p.id] = p.qty;
+    if (maxMap) maxMap[p.id] = p.max;
+  });
+  return ids;
 }
 
 function clearForm() {
@@ -422,32 +460,52 @@ async function loadProfileConfig(profile) {
     await chrome.storage.local.set({ botConfigShared: await encryptObj(cryptoKey, sharedCfg) });
   }
   writeForm(cfg);
+  const acctName = document.getElementById('acctStoreName');
+  if (acctName) acctName.textContent = profileLabel(profile).replace(/ Bot$/, '');
   await applyPerWindowUI(); // Quantity & Max Price are per-window — override the shared values
   applyWatchlistVisibility();
+  updateActiveIndicators();
 }
 
 // Every store now has the SAME item section: "By SKU / Link" + the drop watchlist
 // (name search was removed everywhere). This just fills in per-store examples so the
 // placeholders/hints show the right link format for the active profile.
+// ex = short format hint; ph / ph2 = two example item IDs for that store (used in placeholders).
 const STORE_LINK_EX = {
-  sams:          { ex: 'samsclub.com/ip/…',       ph: 'https://www.samsclub.com/ip/prismatic/990466313\n990466314' },
-  target:        { ex: 'target.com/p/…/A-…',      ph: 'https://www.target.com/p/-/A-94721312\n94300072' },
-  walmart:       { ex: 'walmart.com/ip/…',        ph: 'https://www.walmart.com/ip/20278470684\n19965460207' },
-  bestbuy:       { ex: 'bestbuy.com/site/…',      ph: 'https://www.bestbuy.com/site/x/6614325.p\n6614326' },
-  pokemoncenter: { ex: 'pokemoncenter.com/product/…', ph: 'https://www.pokemoncenter.com/product/100-10086\n100-10087' },
+  sams:          { ex: 'samsclub.com/ip/…',        ph: '990466313',    ph2: '990466314' },
+  target:        { ex: 'target.com/p/…/A-…',       ph: '1011483406',   ph2: '1011483413' },
+  walmart:       { ex: 'walmart.com/ip/…',         ph: '20278470684',  ph2: '19965460207' },
+  bestbuy:       { ex: 'bestbuy.com/site/…',       ph: '6614325',      ph2: '6614326' },
+  pokemoncenter: { ex: 'pokemoncenter.com/product/…', ph: '100-10086', ph2: '100-10087' },
 };
+// Green "active this run" dots: light the settings that apply in the CURRENT mode so it's obvious
+// at a glance what the bot will use. Use current tab (checked) → current-tab source; unchecked →
+// watchlist if it has items, else the SKU/Link field. Quantity / Max price / Auto-seconds always
+// apply, so they're always lit.
+function updateActiveIndicators() {
+  const useCur = document.getElementById('useCurrentTab');
+  const on = (id, v) => { const e = document.getElementById(id); if (e) e.classList.toggle('on', !!v); };
+  const checked = !!(useCur && useCur.checked);
+  const hasWatch = ((document.getElementById('watchlist') || {}).value || '').trim().length > 0;
+  const watchMode = !checked && hasWatch;
+  // WATCHLIST mode = unchecked + list has items → the watchlist is the source, and qty/max are
+  // per-item. Otherwise (Use current tab OR a single SKU/Link) the By SKU/Link field is the source
+  // and the global Quantity / Max Price boxes apply. "Use current tab" fills the SKU field, so it
+  // lights By SKU/Link too.
+  on('dotWatch', watchMode);
+  on('dotSku', !watchMode);
+  on('dotQty', !watchMode);
+  on('dotMax', !watchMode);
+  on('dotRefresh', true);
+}
+
 function applyWatchlistVisibility() {
   const s = STORE_LINK_EX[activeProfile] || { ex: 'product link', ph: 'one link or ID per line' };
   const skuInput = document.getElementById('itemSku');
-  if (skuInput) skuInput.placeholder = s.ex + ' link or item ID';
-  const wl = document.getElementById('watchLabel');
-  if (wl) wl.textContent = '👁 Drop watchlist — one ' + s.ex + ' link or item ID per line';
+  if (skuInput) skuInput.placeholder = s.ex + ' link or item ID  (e.g. ' + s.ph + ' /1 /100)';
+  // Empty-box helper: the textarea placeholder shows a per-store example (only visible when blank).
   const wt = document.getElementById('watchlist');
-  if (wt) wt.placeholder = s.ph;
-  const wh = document.getElementById('watchHint');
-  if (wh) wh.textContent = (activeProfile === 'walmart')
-    ? 'Use the stable /ip/<id> links (NOT buff.ly — those change each drop). Bot watches all items and jumps into the first queue that opens.'
-    : 'Bot watches all items in the background and buys the first that goes live.';
+  if (wt) wt.placeholder = 'Example  ' + s.ph + ' /1 /100\n' + s.ph2 + ' /1 /100';
 }
 
 // ── Profile switcher ───────────────────────────────────────────────────────────
@@ -538,6 +596,15 @@ document.getElementById('speedTestBtn').addEventListener('click', testLoadSpeed)
 document.getElementById('stockTestBtn').addEventListener('click', findStockApi);
 document.getElementById('trackBtn').addEventListener('click', toggleClickTracker);
 document.getElementById('capCheckoutBtn').addEventListener('click', toggleCheckoutCapture);
+// 🔑 Capture-login reuses the SAME sniffer (it already records credential/sign-in POSTs). ON →
+// sign out then sign in → OFF dumps the login request so raw-API auto-login can be built.
+{
+  const cb = document.getElementById('capLoginBtn');
+  if (cb) cb.addEventListener('click', async () => {
+    if (!capCheckoutOn) addLog('info', '🔑 Login capture ON — now SIGN OUT, then SIGN IN normally. Turn OFF (click again) to dump your login request.');
+    await toggleCheckoutCapture();
+  });
+}
 
 // Click-tracker toggle: registers track.js on the current store's DOMAIN (so it follows you across
 // the checkout pages) and logs the CODE of every button/link you click. Turn ON, do a manual
@@ -1063,6 +1130,7 @@ document.getElementById('armTest').addEventListener('change', () => { if (dropIn
 
 // ── Auto-detect item ID from the current tab's URL (fills the SKU / Link field) ──
 document.getElementById('useCurrentTab').addEventListener('change', async function () {
+  updateActiveIndicators();
   if (!this.checked) return;
   try {
     const [tab] = await chrome.tabs.query({ active: true, windowId: MY_WID });
@@ -1074,6 +1142,11 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
     addLog('warning', 'Could not auto-detect item');
   }
 });
+
+// Watchlist typing flips the active source (watchlist vs SKU/Link) — keep the dots in sync.
+document.getElementById('watchlist').addEventListener('input', updateActiveIndicators);
+// On blur, auto-fill each item's "/qty /maxprice" defaults so the numbers show next to it.
+document.getElementById('watchlist').addEventListener('blur', normalizeWatchlist);
 
 // ── On popup open: restore last store, then unlock (cached key, or PIN) ─────────
 (async () => {
@@ -1291,7 +1364,8 @@ async function toggleBot(testMode = false) {
     // "Use current tab" WINS over the watchlist: checked = run on the page you're on;
     // unchecked = cycle the drop watchlist.
     const rawWatch = !cfg.useCurrentTab ? (cfg.watchlist || '').trim() : '';
-    const watchIds = rawWatch ? parseWatchlist(rawWatch, activeProfile) : [];
+    const watchQty = {}, watchMax = {}; // per-item qty + max price from "/2 /150" suffixes
+    const watchIds = rawWatch ? parseWatchlist(rawWatch, activeProfile, watchQty, watchMax) : [];
     let watchMode = watchIds.length > 0;
     // Sam's still runs the legacy (non-adapter) flow which can't rotate a watchlist — fall back to
     // watching the FIRST item via the normal single-SKU path so Start still does something sane.
@@ -1307,7 +1381,15 @@ async function toggleBot(testMode = false) {
     // Tell the user the watchlist is being skipped so a checked box never LOOKS like a broken watchlist.
     if (cfg.useCurrentTab && (cfg.watchlist || '').trim())
       addLog('info', '👁 Watchlist ignored — "Use current tab" is checked (uncheck it to run the watchlist).');
-    if (watchMode) cfg.watchlist = watchIds; else delete cfg.watchlist;
+    if (watchMode) { cfg.watchlist = watchIds; cfg.watchQty = watchQty; cfg.watchMax = watchMax; }
+    else { delete cfg.watchlist; delete cfg.watchQty; delete cfg.watchMax; }
+
+    // SKU/Link single item also accepts the "/qty /maxprice" suffix (default /1 /100). Parse it so
+    // the item id is clean and per-item qty/max are captured just like a watchlist line.
+    if (!watchMode && !cfg.useCurrentTab) {
+      const p = parseItemLine(cfg.itemSku || '', activeProfile);
+      if (p) { cfg.itemSku = p.id; cfg.skuQty = p.qty; cfg.skuMax = p.max; }
+    }
 
     const identifier = (cfg.itemSku || '').trim();
     if (!cfg.useCurrentTab && !watchMode && !identifier) {

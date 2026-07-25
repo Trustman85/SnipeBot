@@ -270,6 +270,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Raw-API re-login for Target (used when the bot detects a real signed-out state). Fires the
+  // credential-validation + token endpoints from the PAGE context so the Akamai fetch-wrapper
+  // attaches its sensor headers + cookies. Body shape is CONFIRMED/tuned from a 🔑 login capture.
+  if (msg.type === 'TARGET_LOGIN') {
+    targetApiLogin(sender.tab?.id, msg).then(r => sendResponse(r), e => sendResponse({ ok: false, error: String(e && e.message || e) }));
+    return true;
+  }
+
   // Alert the human (desktop notification + relay a sound to the popup + optional spoken line)
   if (msg.type === 'BOT_ALERT') handleAlert(msg.kind, msg.text, msg.speak);
 
@@ -952,10 +960,38 @@ async function targetApiBuy(tabId, opts) {
       const KADD = '9f36aeafbe60771e321a7cc95a78140772ab3e96'; // target.com web cart key (read live later if it rotates)
       const KCO  = 'e59ce3b531b2c39afb2e2b8a71ff10113aac2a14'; // target.com web checkout key
       const CART = 'https://carts.target.com/web_checkouts/v1/';
-      const post = async (url, body) => {
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      const rawPost = async (url, body) => {
         const r = await fetch(url, { method: 'POST', credentials: 'include', headers: H, body: body ? JSON.stringify(body) : undefined });
         let j = null; try { j = await r.json(); } catch (_) {}
         return { status: r.status, body: j };
+      };
+      // Refresh the logged-in session token (body {}). During a drop Target's token expires and cart
+      // calls 401 "_ERR_AUTH_DENIED" — the page silently re-validates; we must too. Uses the existing
+      // session cookies, so NO password needed for a refresh (that's only for a full re-login).
+      const refreshToken = () => rawPost('https://gsp.target.com/gsp/oauth_validations/v3/token_validations', {});
+      // POST with auto-recovery. Real-drop capture 2026-07-24: Target's FAST_SELLING throttle 429s
+      // the REAL SITE too — it hammers and ~1 in 5 requests returns 200. So on 429 we KEEP PUSHING
+      // until a request lands. Bounded only by a wall-clock cap (o.maxPushMs, default 4 min) so it
+      // can't hang forever if the item sells out and 429s never clear. 401 → refresh token.
+      const pushDeadline = Date.now() + (o.maxPushMs || 240000);
+      // Whether the LAST token refresh returned 200. Capture 2026-07-24: an identical manual BUYNOW
+      // add succeeded while the bot's add for a GATED (pre-drop) item 401'd _ERR_AUTH_DENIED with
+      // the refresh still 200ing — so 401+refreshOk = ITEM gated, not signed out. Returned to the
+      // content script so it can keep watching quietly instead of raising a false sign-in alarm.
+      let refreshOk = null;
+      const post = async (url, body) => {
+        let r = await rawPost(url, body), authTries = 0;
+        for (;;) {
+          const code = (r.body && (r.body.code || r.body.errorKey)) || '';
+          const authDenied = r.status === 401 || /AUTH_DENIED|UNAUTH/i.test(code);
+          const limited = r.status === 429 || /RATE_LIMIT|THROTTL|FAST_SELLING/i.test(code);
+          // 2 tries only — if the refresh doesn't fix it, more loops just spam (gated item or dead session).
+          if (authDenied && authTries < 2) { authTries++; const rr = await refreshToken(); refreshOk = rr.status === 200; await sleep(120); r = await rawPost(url, body); continue; }
+          if (limited && Date.now() < pushDeadline) { await sleep(250 + Math.random() * 300); r = await rawPost(url, body); continue; } // push through the throttle
+          break;
+        }
+        return r;
       };
       try {
         // 1) ADD TO CART. Shippable items (the drop case) send NO fulfillment field — Target
@@ -968,8 +1004,31 @@ async function targetApiBuy(tabId, opts) {
           cart_type: 'REGULAR', channel_id: '10', shopping_context: 'DIGITAL', cart_subchannel: 'BUYNOW'
         };
         if (o.fulfillment) addBody.fulfillment = o.fulfillment;
-        const add = await post(CART + 'cart_items?field_groups=CART,CART_ITEMS,SUMMARY&key=' + KADD, addBody);
-        if (add.status < 200 || add.status >= 300) return { ok: false, step: 'add', status: add.status, body: add.body };
+        let add = await post(CART + 'cart_items?field_groups=CART,CART_ITEMS,SUMMARY&key=' + KADD, addBody);
+        // AUTO-CAP: if qty>1 was rejected for a limit/quantity reason, drop to the item's cap (from
+        // the error's orderLimit if present, else 1) and retry — so "x2" on a 1-per-guest item still
+        // buys 1 instead of failing. Only retries limit errors, not OOS (424/404).
+        if ((add.status < 200 || add.status >= 300) && (o.quantity || 1) > 1) {
+          const b = add.body || {}, blob = JSON.stringify(b);
+          if (/LIMIT|quantity|ORDER_LIMIT|MAX/i.test((b.code || '') + ' ' + (b.message || '') + ' ' + blob) && !/OUT_OF_STOCK|NOT_SELLABLE|DEPENDENT_SERVICE/i.test(b.code || '')) {
+            const cap = (blob.match(/"orderLimit"\s*:\s*(\d+)/) || [])[1];
+            const retryQty = Math.max(1, cap ? Math.min(Number(cap), o.quantity) : 1);
+            if (retryQty < (o.quantity || 1)) {
+              addBody.cart_item.quantity = retryQty;
+              add = await post(CART + 'cart_items?field_groups=CART,CART_ITEMS,SUMMARY&key=' + KADD, addBody);
+            }
+          }
+        }
+        if (add.status < 200 || add.status >= 300) return { ok: false, step: 'add', status: add.status, body: add.body, refreshOk };
+        // MAX-PRICE GUARD (best-effort): pull the unit price from the add response and abort BEFORE
+        // checkout if it's over the item's max. Only blocks when a price is actually found, so it
+        // can never wrongly stop a good buy. o.maxPrice<=0 or missing → no check.
+        if (o.maxPrice && o.maxPrice > 0) {
+          const blob = JSON.stringify(add.body || {});
+          const pm = blob.match(/"(?:current_retail|unit_price|list_price|price|reg_retail)"\s*:\s*([0-9]+(?:\.[0-9]+)?)/i);
+          const price = pm ? parseFloat(pm[1]) : null;
+          if (price != null && price > o.maxPrice) return { ok: false, step: 'price', price, max: o.maxPrice, body: add.body };
+        }
         // 2) PRE-CHECKOUT — acts on the session cart. Body MUST include cart_type (capture
         // 2026-07-23: {} → 400 "cart_type must not be null"). RACE: the add returns 201 but the
         // cart backend can lag a few ms, so pre_checkout sometimes sees ZERO_CART_ITEM_QUANTITY
@@ -997,8 +1056,54 @@ async function targetApiBuy(tabId, opts) {
                  state: order && order.cart_state, body: done ? null : co.body };
       } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
     }
-  }), 22000, 'target-api').catch(e => null);
+  }), 255000, 'target-api').catch(e => null); // long: the in-page push can hammer the 429 throttle up to ~4 min
   return (res && res[0] && res[0].result) || { ok: false, error: 'no result (page busy?)' };
+}
+
+// ── TARGET RAW-API RE-LOGIN ──────────────────────────────────────────────────────────────────────
+// Runs in the PAGE (MAIN world) so Akamai's fetch-wrapper attaches its sensor headers + cookies.
+// Sequence (from the known Target web login flow): validate credentials → exchange for a session
+// token. The credential body/params below are the STARTING shape — a 🔑 login capture confirms the
+// exact fields (Target's login carries a behavioral 'x-application-mouse-tool-key'; if the replay
+// gets blocked the capture shows what's missing). Returns {ok, step, status, body} for the caller.
+async function targetApiLogin(tabId, opts) {
+  if (!tabId) return { ok: false, error: 'no tab' };
+  const o = opts || {};
+  if (!o.email || !o.password) return { ok: false, error: 'no-creds' };
+  const res = await withTimeout(chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN', args: [o],
+    func: async (o) => {
+      // Base headers. The Akamai sensor headers (x-gyjwza5z-*) auto-attach from the page fetch
+      // wrapper. x-application-mouse-tool-key is a BEHAVIORAL anti-bot key generated from real form
+      // interaction — we can't forge it; try to reuse one the page may have stashed, else omit and
+      // let Target decide (a raw replay without it will likely be rejected — hence type-into-form
+      // is the reliable fallback). Confirmed flow (capture 2026-07-24): username → credential → token.
+      let mouseKey = null;
+      try { mouseKey = window.__tgtMouseKey || (window.sessionStorage && sessionStorage.getItem('x-application-mouse-tool-key')) || null; } catch (_) {}
+      const H = { 'Accept': 'application/json', 'Content-Type': 'application/json', 'x-application-name': 'web' };
+      if (mouseKey) H['x-application-mouse-tool-key'] = mouseKey;
+      const post = async (url, body) => {
+        const r = await fetch(url, { method: 'POST', credentials: 'include', headers: H, body: body != null ? JSON.stringify(body) : undefined });
+        let j = null; try { j = await r.json(); } catch (_) {}
+        return { status: r.status, body: j };
+      };
+      try {
+        // 1) USERNAME — submit the email; Target returns the allowed auth methods (202).
+        const usr = await post('https://gsp.target.com/gsp/authentications/v1/username_validations?client_id=ecom-web-1.0.0&signin_amr=true',
+          { username: o.email });
+        if (usr.status < 200 || usr.status >= 300) return { ok: false, step: 'username', status: usr.status, body: usr.body, mouseKey: !!mouseKey };
+        // 2) CREDENTIAL — submit email + password; success returns {targetGuid, firstName} (202).
+        const cred = await post('https://gsp.target.com/gsp/authentications/v1/credential_validations?client_id=ecom-web-1.0.0',
+          { username: o.email, password: o.password });
+        if (cred.status < 200 || cred.status >= 300) return { ok: false, step: 'credential', status: cred.status, body: cred.body, mouseKey: !!mouseKey };
+        // 3) TOKEN — exchange the validated session for an access token (empty body — cookies carry it).
+        const tok = await post('https://gsp.target.com/gsp/oauth_validations/v3/token_validations', {});
+        if (tok.status !== 200) return { ok: false, step: 'token', status: tok.status, body: tok.body };
+        return { ok: true, guid: cred.body && cred.body.targetGuid, name: cred.body && cred.body.firstName, token: !!(tok.body && tok.body.access_token) };
+      } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+    }
+  }), 20000, 'target-login').catch(() => null);
+  return (res && res[0] && res[0].result) || { ok: false, error: 'login-failed' };
 }
 
 async function htmlStockPoll(tabId, url, mode) {
