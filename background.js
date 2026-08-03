@@ -273,8 +273,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Raw-API re-login for Target (used when the bot detects a real signed-out state). Fires the
   // credential-validation + token endpoints from the PAGE context so the Akamai fetch-wrapper
   // attaches its sensor headers + cookies. Body shape is CONFIRMED/tuned from a 🔑 login capture.
+  // tabId may be passed explicitly (the side panel has no sender.tab).
   if (msg.type === 'TARGET_LOGIN') {
-    targetApiLogin(sender.tab?.id, msg).then(r => sendResponse(r), e => sendResponse({ ok: false, error: String(e && e.message || e) }));
+    targetApiLogin(msg.tabId || sender.tab?.id, msg).then(r => sendResponse(r), e => sendResponse({ ok: false, error: String(e && e.message || e) }));
+    return true;
+  }
+
+  // UI login — types the saved credentials into Target's real sign-in form (works when the raw-API
+  // login is refused by the behavioral-fingerprint guard).
+  if (msg.type === 'TARGET_UI_LOGIN') {
+    targetUiLogin(msg.tabId || sender.tab?.id, msg).then(r => sendResponse(r), e => sendResponse({ ok: false, error: String(e && e.message || e) }));
     return true;
   }
 
@@ -927,16 +935,78 @@ async function targetStockPoll(tabId, tcin) {
     const [out] = await chrome.scripting.executeScript({
       target: { tabId }, world: 'MAIN', args: [tcin],
       func: async (tcin) => {
+        // Walks a modules response for the product's fulfillment block (capture 2026-07-24: it sits at
+        // modules[].module_data.data.product.fulfillment, same shipping_options shape as redsky's).
+        // Reads OUR item's fulfillment out of a modules response. MUST be tcin-scoped: the payload also
+        // carries a GlobalRecommendedProducts carousel whose OTHER products have their own
+        // shipping_options — an unscoped search read a recommended item's "IN_STOCK, qty 20" and
+        // falsely fired ITEM LIVE on an out-of-stock product (real false positive 2026-07-24).
+        const readModules = (j) => {
+          const want = String(tcin);
+          const mods = (j && j.modules) || [];
+          for (const m of mods) {
+            const prod = m && m.module_data && m.module_data.data && m.module_data.data.product;
+            const f = prod && prod.fulfillment;
+            // Accept only when this fulfillment belongs to OUR tcin (product_id is inside the block).
+            if (f && (String(f.product_id || prod.tcin || '') === want)) {
+              const so = f.shipping_options || {};
+              return { status: 200, avail: so.availability_status || null, qty: so.available_to_promise_quantity,
+                       soldOut: !!f.sold_out, src: 'cdui' };
+            }
+          }
+          // Fallback for a nesting change: anchor on OUR tcin's fulfillment block, never a loose match.
+          try {
+            const blob = JSON.stringify(j);
+            const i = blob.indexOf('"fulfillment":{"product_id":"' + want + '"');
+            if (i >= 0) {
+              const seg = blob.slice(i, i + 1200);
+              const k = seg.indexOf('"shipping_options"');
+              if (k >= 0) {
+                const sub = seg.slice(k, k + 500);
+                const a = (sub.match(/"availability_status"\s*:\s*"([A-Z_]+)"/) || [])[1] || null;
+                const q = parseFloat((sub.match(/"available_to_promise_quantity"\s*:\s*([0-9.]+)/) || [])[1]);
+                if (a) return { status: 200, avail: a, qty: isNaN(q) ? undefined : q, src: 'cdui*' };
+              }
+            }
+          } catch (_) {}
+          return null;
+        };
+        // PRIMARY: replay the PAGE's OWN stock request (captured by targetstock.js in this MAIN world).
+        // This is the endpoint target.com actually uses now; redsky 403s after a burst. Only used when
+        // the captured request is for the SAME tcin — otherwise it would report another item's stock.
+        // In-page capture, else the sessionStorage copy (survives reloads / bot started after load).
+        let req = window.__botTgtStockReq;
+        if (!req) { try { req = JSON.parse(sessionStorage.getItem('__botTgtStockReq') || 'null'); } catch (_) { req = null; } }
+        // Diagnostics so a missing capture is visible in the log instead of silently falling back:
+        // hook = targetstock.js installed?  req = a fulfillment request captured yet?
+        const diag = (window.__botTgtStockHook ? 'hook' : 'nohook') + ':' + (req ? ('req' + (req.tcin || '?')) : 'noreq');
+        if (req && req.body && (!req.tcin || String(req.tcin) === String(tcin))) {
+          try {
+            const res = await fetch(req.url, { method: 'POST', credentials: 'include',
+              headers: { 'accept': 'application/json', 'content-type': 'application/json' }, body: req.body });
+            if (res.ok) {
+              const j = await res.json();
+              const hit = readModules(j);
+              if (hit) return hit;
+              // No stock fields in the reply — surface WHAT came back (deferred-enrichment calls can
+              // return an empty modules[] when replayed) so the log shows the real reason.
+              let sample = ''; try { sample = JSON.stringify(j).slice(0, 220); } catch (_) {}
+              return { status: 200, avail: null, src: 'cdui-nofulfill', diag, sample };
+            }
+            return { status: res.status, src: 'cdui', diag };
+          } catch (_) {} // fall through to redsky
+        }
+        // FALLBACK: legacy redsky endpoint (works until it rate-limits us to 403).
         const key = '9f36aeafbe60771e321a7cc95a78140772ab3e96';
         const url = 'https://redsky.target.com/redsky_aggregations/v1/web/product_fulfillment_v1?key=' + key +
                     '&tcin=' + tcin + '&is_bot=false&channel=WEB&page=%2Fp%2FA-' + tcin;
         try {
           const res = await fetch(url, { credentials: 'include' });
-          if (!res.ok) return { status: res.status };
+          if (!res.ok) return { status: res.status, diag };
           const j = await res.json();
           const so = (j && j.data && j.data.product && j.data.product.fulfillment && j.data.product.fulfillment.shipping_options) || {};
-          return { status: 200, avail: so.availability_status || null, qty: so.available_to_promise_quantity };
-        } catch (e) { return { status: 'ERR', error: e.message }; }
+          return { status: 200, avail: so.availability_status || null, qty: so.available_to_promise_quantity, src: 'redsky', diag };
+        } catch (e) { return { status: 'ERR', error: e.message, diag }; }
       }
     });
     return { ok: true, ...(out && out.result || {}) };
@@ -1079,9 +1149,52 @@ async function targetApiLogin(tabId, opts) {
       // let Target decide (a raw replay without it will likely be rejected — hence type-into-form
       // is the reliable fallback). Confirmed flow (capture 2026-07-24): username → credential → token.
       let mouseKey = null;
-      try { mouseKey = window.__tgtMouseKey || (window.sessionStorage && sessionStorage.getItem('x-application-mouse-tool-key')) || null; } catch (_) {}
+      try { mouseKey = sessionStorage.getItem('__botTgtMouseKey') || window.__tgtMouseKey || null; } catch (_) {}
       const H = { 'Accept': 'application/json', 'Content-Type': 'application/json', 'x-application-name': 'web' };
       if (mouseKey) H['x-application-mouse-tool-key'] = mouseKey;
+
+      // credential_validations needs a full browser fingerprint. Prefer the EXACT device_info the
+      // page itself last sent (captured by targetstock.js) — anything we synthesize is a guess and a
+      // mismatch is what a fingerprint check is designed to catch.
+      const cookie = (n) => { try { return (document.cookie.match(new RegExp('(?:^|; )' + n + '=([^;]*)')) || [])[1] || ''; } catch (_) { return ''; } };
+      let deviceInfo = null;
+      try { deviceInfo = JSON.parse(sessionStorage.getItem('__botTgtDeviceInfo') || 'null'); } catch (_) {}
+      if (!deviceInfo) {
+        // Best-effort reconstruction from the real browser (same field names as the capture).
+        const S = (v) => (v == null ? 'unknown' : String(v));
+        let canvas = 'unknown';
+        try {
+          const c = document.createElement('canvas'); const g = c.getContext('2d');
+          g.textBaseline = 'top'; g.font = "14px 'Arial'"; g.fillText('target', 2, 2);
+          const d = c.toDataURL(); let h = 0;
+          for (let i = 0; i < d.length; i++) { h = ((h << 5) - h + d.charCodeAt(i)) | 0; }
+          canvas = (h >>> 0).toString(16);
+        } catch (_) {}
+        deviceInfo = {
+          user_agent: navigator.userAgent, language: navigator.language, canvas,
+          color_depth: S(screen.colorDepth), device_memory: S(navigator.deviceMemory), pixel_ratio: 'unknown',
+          hardware_concurrency: S(navigator.hardwareConcurrency),
+          resolution: JSON.stringify([screen.width, screen.height]),
+          available_resolution: JSON.stringify([screen.availWidth, screen.availHeight]),
+          timezone_offset: S(new Date().getTimezoneOffset()),
+          session_storage: '1', local_storage: '1', indexed_db: '1',
+          add_behavior: 'unknown', open_database: 'unknown', cpu_class: 'unknown',
+          navigator_platform: S(navigator.platform), do_not_track: 'unknown',
+          regular_plugins: JSON.stringify(Array.from(navigator.plugins || []).map(p => p.name + '::' + p.description + '::')),
+          adblock: 'false', has_lied_languages: 'false', has_lied_resolution: 'false',
+          has_lied_os: 'false', has_lied_browser: 'false',
+          touch_support: JSON.stringify([navigator.maxTouchPoints || 0, false, false]),
+          js_fonts: '[]', navigator_vendor: S(navigator.vendor), navigator_webdriver: S(!!navigator.webdriver),
+          navigator_app_name: S(navigator.appName), navigator_app_code_name: S(navigator.appCodeName),
+          navigator_app_version: S(navigator.appVersion), navigator_languages: JSON.stringify(navigator.languages || []),
+          navigator_cookies_enabled: S(navigator.cookieEnabled), navigator_java_enabled: 'false',
+          visitor_id: cookie('visitorId') || cookie('visitor_id') || '', tealeaf_id: cookie('TLTSID') || '',
+          webgl: 'unknown', webgl_vendor: 'unknown', browser_name: 'Unknown', browser_version: 'Unknown',
+          cpu_architecture: 'Unknown', device_vendor: 'Unknown', device_model: 'Unknown',
+          device_type: 'Unknown', engine_name: 'Unknown', engine_version: 'Unknown',
+          os_name: 'Unknown', os_version: 'Unknown',
+        };
+      }
       const post = async (url, body) => {
         const r = await fetch(url, { method: 'POST', credentials: 'include', headers: H, body: body != null ? JSON.stringify(body) : undefined });
         let j = null; try { j = await r.json(); } catch (_) {}
@@ -1090,12 +1203,19 @@ async function targetApiLogin(tabId, opts) {
       try {
         // 1) USERNAME — submit the email; Target returns the allowed auth methods (202).
         const usr = await post('https://gsp.target.com/gsp/authentications/v1/username_validations?client_id=ecom-web-1.0.0&signin_amr=true',
-          { username: o.email });
-        if (usr.status < 200 || usr.status >= 300) return { ok: false, step: 'username', status: usr.status, body: usr.body, mouseKey: !!mouseKey };
-        // 2) CREDENTIAL — submit email + password; success returns {targetGuid, firstName} (202).
+          { username: o.email, device_info: deviceInfo });
+        if (usr.status < 200 || usr.status >= 300) {
+          return { ok: false, step: 'username', status: usr.status, body: usr.body,
+                   mouseKey: !!mouseKey, deviceInfoReal: !!(deviceInfo && deviceInfo.tealeaf_id) };
+        }
+        // 2) CREDENTIAL — email + password + the device fingerprint. Body shape confirmed from a real
+        // capture (2026-07-25); success returns {targetGuid, firstName} with 202.
         const cred = await post('https://gsp.target.com/gsp/authentications/v1/credential_validations?client_id=ecom-web-1.0.0',
-          { username: o.email, password: o.password });
-        if (cred.status < 200 || cred.status >= 300) return { ok: false, step: 'credential', status: cred.status, body: cred.body, mouseKey: !!mouseKey };
+          { username: o.email, password: o.password, device_info: deviceInfo, keep_me_signed_in: false });
+        if (cred.status < 200 || cred.status >= 300) {
+          return { ok: false, step: 'credential', status: cred.status, body: cred.body,
+                   mouseKey: !!mouseKey, deviceInfoReal: !!(deviceInfo && deviceInfo.tealeaf_id) };
+        }
         // 3) TOKEN — exchange the validated session for an access token (empty body — cookies carry it).
         const tok = await post('https://gsp.target.com/gsp/oauth_validations/v3/token_validations', {});
         if (tok.status !== 200) return { ok: false, step: 'token', status: tok.status, body: tok.body };
@@ -1104,6 +1224,360 @@ async function targetApiLogin(tabId, opts) {
     }
   }), 20000, 'target-login').catch(() => null);
   return (res && res[0] && res[0].result) || { ok: false, error: 'login-failed' };
+}
+
+// ── TARGET UI LOGIN (types the Account-tab credentials into Target's real sign-in form) ─────────
+// The raw-API login is gated by x-application-mouse-tool-key, a BEHAVIORAL fingerprint generated
+// from real interaction with the login form — it can't be forged, so a scripted POST gets refused.
+// Driving the actual form with trusted CDP input makes the page generate a valid key itself, so this
+// is the reliable path. ~2-3s. Navigates to the sign-in page, types, submits, then returns to
+// `backTo` (the item page) so the run continues where it left off.
+async function targetUiLogin(tabId, opts) {
+  if (!tabId) return { ok: false, error: 'no tab' };
+  const o = opts || {};
+  if (!o.email || !o.password) return { ok: false, error: 'no-creds' };
+  const wid = await widForTab(tabId);
+  const log = (lvl, txt) => logWin(wid, lvl, txt);
+  const dbg = { tabId };
+  const backTo = o.backTo || null;
+  let probeErr = '';
+  // Probes EVERY FRAME — Target renders the sign-in form inside an iframe, so a top-document-only
+  // search reported "username field not found" (2026-07-25). Returns which frame holds each field so
+  // we can focus it there; typing then goes to the focused element via CDP regardless of frame.
+  const probe = async () => {
+    try {
+      // TOP FRAME FIRST. The same tab injects fine for the bot (content.js runs on /login), and the
+      // only difference here was allFrames:true — which was coming back with ZERO frames and no error
+      // (2026-07-25). The sign-in form is top-level anyway; allFrames is just a fallback below.
+      const probeFn = () => {
+          const vis = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); return (r.width > 1 && r.height > 1) ? el : null; };
+          const q = (sels) => { for (const s of sels) { const el = vis(document.querySelector(s)); if (el) return s; } return null; };
+          // Confirmed from real markup (Track capture 2026-07-25):
+          //   <input id="password" data-test="login-password" name="password" type="password" maxlength="20">
+          //   <button type="submit">Sign in with password</button>
+          // STRICT: login-form fields only. A generic input[type="email"] matched the "Get top deals"
+          // NEWSLETTER box in the page footer and the bot typed the address there (2026-07-25).
+          const user = q(['#username', '[data-test="login-username"]', 'input[name="username"]',
+                          'input[autocomplete="username"]']);
+          // Current value of the username box (if any) so the caller can skip re-typing it, plus any
+          // masked account text Target shows once it already knows who's signing in ("tru***").
+          const userVal = user ? ((document.querySelector(user) || {}).value || '') : '';
+          const known = /\b[a-z0-9._%+-]{1,4}\*{2,}/i.test(document.body ? document.body.innerText : '');
+          // MUST be an <input>: Target's method chooser is a <div role="button" id="password">
+          // ("Enter your password") that appears BEFORE the real field and also matches #password —
+          // a bare #password focused that div, so typing went nowhere and submit sent an empty
+          // password (2026-07-25). Every selector here is input-scoped.
+          const pass = q(['input#password', 'input[data-test="login-password"]', 'input[name="password"]',
+                          'input[autocomplete="current-password"]', 'input[type="password"]']);
+          // Target offers passkey / emailed-code FIRST (amr: passkey_create, password, email). The
+          // password method is picked from a CELL — <div role="button">Enter your password</div> —
+          // so plain <button> queries missed it entirely. Include [role="button"].
+          let signIn = null, chooser = null;
+          for (const b of document.querySelectorAll('button, input[type="submit"], [role="button"], a')) {
+            if (!vis(b)) continue;
+            const t = ((b.innerText || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase().trim();
+            if (!t || t.length > 60) continue;
+            const isSubmit = (b.tagName === 'BUTTON' && b.type === 'submit') || b.tagName === 'INPUT';
+            // "Enter your password" / "Use password" = choose-this-method (NOT the submit button).
+            if (!chooser && !isSubmit && /password/.test(t) && /(enter|use|with)/.test(t)) chooser = t;
+            // Plain advance/submit control. "Sign in with password" is the FINAL submit — kept out of
+            // the advance path so it can't be clicked before the field is filled.
+            if (!signIn && /(sign in|log in|continue)/.test(t) && !/create|another way|forgot/.test(t)) signIn = t;
+          }
+          const acct = (document.querySelector('header') || document.body || {}).innerText || '';
+          const inputs = Array.from(document.querySelectorAll('input')).filter(vis)
+            .map(i => (i.type || '') + '#' + (i.id || '') + '@' + (i.name || '')).slice(0, 8);
+          // Any visible error the form shows (wrong password / captcha) — surfaced so a failed login
+          // says WHY instead of the generic "account never appeared".
+          let err = '';
+          for (const e of document.querySelectorAll('[role="alert"], [class*="error" i], [id*="error" i]')) {
+            if (!vis(e)) continue; const t = (e.innerText || '').trim();
+            if (t && t.length < 200) { err = t; break; }
+          }
+          // Visible clickable labels — dumped on failure so the real flow can be matched exactly.
+          // Include [role="button"] — Target's auth-method cells are DIVs, so a button-only list
+          // showed nothing on the very page whose controls we needed to see.
+          const btns = Array.from(document.querySelectorAll('button, a[role="button"], [role="button"]')).filter(vis)
+            .map(b => (b.innerText || '').replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 10);
+          // What the page actually SAYS — with no inputs and no buttons found, the visible text is the
+          // only thing that identifies the screen (form, captcha, error, "check your email", …).
+          const text = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+          return { user, userVal, known, pass, signIn, chooser, signedIn: /hi,\s*(?!sign in)[a-z]/i.test(acct), url: location.href, inputs, btns, err, text };
+        };
+      let outs = await chrome.scripting.executeScript({ target: { tabId }, world: 'ISOLATED', func: probeFn });
+      // Nothing from the top frame → the form may genuinely be in an iframe; try every frame.
+      if (!outs || !outs.length) {
+        try { outs = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, world: 'ISOLATED', func: probeFn }); }
+        catch (e) { probeErr = 'allFrames: ' + String(e && e.message || e); }
+      }
+      // Merge: take the first frame that actually has each thing, remembering its frameId.
+      const merged = { signedIn: false, url: '', inputs: [], err: '' };
+      for (const o of (outs || [])) {
+        const r = o && o.result; if (!r) continue;
+        if (r.signedIn) merged.signedIn = true;
+        if (r.err && !merged.err) merged.err = r.err;
+        if (!merged.url && /login|signin|sign-in/i.test(r.url || '')) merged.url = r.url;
+        if (r.inputs && r.inputs.length) merged.inputs = merged.inputs.concat(r.inputs);
+        if (r.user && !merged.user) { merged.user = r.user; merged.userFrame = o.frameId; merged.userVal = r.userVal || ''; }
+        if (r.known) merged.known = true;
+        if (r.pass && !merged.pass) { merged.pass = r.pass; merged.passFrame = o.frameId; }
+        if (r.signIn && !merged.signIn) { merged.signIn = r.signIn; merged.signInFrame = o.frameId; }
+        if (r.chooser && !merged.chooser) { merged.chooser = r.chooser; merged.chooserFrame = o.frameId; }
+        if (r.btns && r.btns.length && !(merged.btns && merged.btns.length)) merged.btns = r.btns;
+        if (r.text && !merged.text) merged.text = r.text;
+      }
+      if (!merged.url && outs && outs[0] && outs[0].result) merged.url = outs[0].result.url;
+      merged.frames = (outs || []).length;
+      return merged;
+    } catch (e) { probeErr = String(e && e.message || e); return { probeErr }; }
+  };
+  // Returns the matching probe, or on timeout the LAST one seen — returning null threw away the only
+  // evidence of what the page contained, so failures reported empty defaults instead of reality.
+  const waitFor = async (pick, ms) => {
+    const end = Date.now() + ms;
+    let last = {};
+    for (;;) {
+      const p = await probe();
+      if (p && Object.keys(p).length) last = p;
+      if (pick(p)) return p;
+      if (Date.now() > end) return last;
+      await sleep(250);
+    }
+  };
+  // Focuses a selector inside a specific frame. CDP keyboard input then lands on it wherever it is,
+  // which avoids translating iframe-relative coordinates into top-level viewport coordinates.
+  const focusIn = async (frameId, selector) => {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [frameId] }, world: 'ISOLATED', args: [selector],
+        func: (sel) => { const el = document.querySelector(sel); if (el) { el.focus(); try { el.click(); } catch (_) {} } }
+      });
+      return true;
+    } catch (_) { return false; }
+  };
+  const clickIn = async (frameId, text) => {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [frameId] }, world: 'ISOLATED', args: [text],
+        func: (t) => {
+          // MUST include [role="button"]: Target's auth-method cells ("Enter your password") are DIVs,
+          // so a button-only query found the control in the probe but could never click it
+          // (2026-07-25: "password field never appeared" while that very button was listed).
+          const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };
+          for (const b of document.querySelectorAll('button, input[type="submit"], [role="button"], a[role="button"]')) {
+            if (!vis(b)) continue;
+            const s = ((b.innerText || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase().trim();
+            if (s.includes(t)) { b.click(); return true; }
+          }
+          return false;
+        }
+      });
+      return true;
+    } catch (_) { return false; }
+  };
+  let attached = false;
+  // Chrome DETACHES the debugger on navigation, so a single attach at the start dies the moment we
+  // open the sign-in page ("Debugger is not attached", 2026-07-25). Attach lazily and re-attach on
+  // demand instead: every CDP call goes through here.
+  const attach = async () => {
+    try { await chrome.debugger.attach(dbg, '1.3'); attached = true; }
+    catch (e) {
+      if (/already attached/i.test(String(e && e.message || e))) { attached = true; return; }
+      throw e;
+    }
+  };
+  const cdp = async (cmd, params) => {
+    if (!attached) await attach();
+    try { return await chrome.debugger.sendCommand(dbg, cmd, params); }
+    catch (e) {
+      if (!/not attached/i.test(String(e && e.message || e))) throw e;
+      attached = false; await attach();                   // navigation dropped it — reattach and retry
+      return await chrome.debugger.sendCommand(dbg, cmd, params);
+    }
+  };
+  try {
+    await attach();
+    // 1) Go to the sign-in PAGE. Confirmed by the user's own click capture: Target's sign-in is a
+    // full page at /login (id="username" → "Sign in with password" → id="password"), not a drawer.
+    // Clicking header controls to find an in-page drawer only wandered into the footer newsletter box.
+    // Wait until the tab actually finishes loading — probing mid-navigation makes executeScript
+    // return ZERO frames with no error, which looked exactly like "the page has no fields".
+    const waitLoaded = async (ms) => {
+      const end = Date.now() + ms;
+      for (;;) {
+        try { const t = await chrome.tabs.get(tabId); if (t && t.status === 'complete') return t; } catch (_) {}
+        if (Date.now() > end) return null;
+        await sleep(300);
+      }
+    };
+    // Reach the sign-in page the way a PERSON does: header Account → "Sign in or create account".
+    // Hand-built /login URLs hang on "Loading content" forever because the real one carries extra
+    // client params (2026-07-25 capture: …&ui_namespace=ui-default&ba…). Selectors below are the
+    // exact ones from the user's click capture, so this is a replay of the real path.
+    let st = await probe();
+    if (!st.signedIn && !/\/login|signin|sign-in/i.test(st.url || '')) {
+      const clickSel = async (sels) => {
+        try {
+          const [r] = await chrome.scripting.executeScript({
+            target: { tabId }, args: [sels],
+            func: (list) => {
+              for (const s of list) {
+                const el = document.querySelector(s);
+                if (el) { const b = el.getBoundingClientRect(); if (b.width > 1 && b.height > 1) { el.click(); return s; } }
+              }
+              return null;
+            }
+          });
+          return r && r.result;
+        } catch (_) { return null; }
+      };
+      const opened = await clickSel(['#account-sign-in', '[data-test="@web/AccountLink"]', '[data-test="accountNav-button"]']);
+      if (opened) {
+        await sleep(900);
+        await clickSel(['[data-test="accountNav-signIn"]', 'button[data-test*="signIn" i]']);
+        await sleep(1200);
+        await waitLoaded(15000);
+        await sleep(800);
+      }
+      // Still not on a sign-in page → last resort, the direct URL.
+      const now = await probe();
+      if (!now.signedIn && !now.user && !now.pass && !now.chooser && !/\/login|signin/i.test(now.url || '')) {
+        log('info', '🔐 Account menu did not open the sign-in page — trying the direct URL.');
+        await chrome.tabs.update(tabId, { url: 'https://www.target.com/login' });
+        await sleep(800); await waitLoaded(15000); await sleep(800);
+      }
+    }
+    // Wait for ANY usable control: username box, password box, or the auth-method chooser.
+    st = await waitFor(p => p.user || p.pass || p.chooser || p.signedIn, 15000);
+    if (st && st.signedIn) { log('success', '🔐 Already signed in.'); return { ok: true, already: true }; }
+    if (!st || (!st.user && !st.pass && !st.chooser)) {
+      // Log from HERE, not the caller: the content script that requested this login was destroyed by
+      // the navigation, so its failure branch can never run (2026-07-25 — login failed silently).
+      // Dump the visible inputs we DID find so the selectors can be fixed from real markup.
+      const seen = (st && st.url) || 'the sign-in page';
+      const ins = (st && st.inputs && st.inputs.length) ? ' — inputs seen: ' + st.inputs.join(', ') : ' — no visible inputs in any frame';
+      const bts = (st && st.btns && st.btns.length) ? ' | buttons: ' + st.btns.join(' / ') : '';
+      // If the page script never ran at all, say so — that's a very different problem from "the page
+      // loaded but the fields moved", and the two were indistinguishable before.
+      let tabUrl = '', tabStatus = '';
+      try { const t = await chrome.tabs.get(tabId); tabUrl = (t && t.url) || ''; tabStatus = (t && t.status) || ''; } catch (_) {}
+      // Decisive check: can we inject into this tab AT ALL? A trivial script separates "my probe is
+      // wrong" from "scripting doesn't work on this tab", which the empty result couldn't distinguish.
+      let canInject = 'n/a';
+      try {
+        const t0 = await chrome.scripting.executeScript({ target: { tabId }, func: () => document.readyState + '|' + document.querySelectorAll('input').length + '|' + location.pathname });
+        canInject = (t0 && t0.length) ? String(t0[0] && t0[0].result) : 'EMPTY(0 frames)';
+      } catch (e) { canInject = 'THREW: ' + String(e && e.message || e); }
+      const diag = ' [frames:' + ((st && st.frames) || 0) + (probeErr ? ' inject-error: ' + probeErr : '') +
+                   ' tab: ' + (tabUrl || '?') + ' status:' + tabStatus + ' inject-test: ' + canInject + ']';
+      const txt = (st && st.text) ? '\n    page says: "' + st.text + '"' : ' — page text empty';
+      log('error', '🔐 Auto-login: no sign-in controls found on ' + seen + ins + bts + diag + txt);
+      return { ok: false, step: 'no-signin-controls', probeErr, tabUrl };
+    }
+    const enter = async () => {
+      await cdp('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+      await cdp('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    };
+    // 2) Type the email — ONLY when a username box is actually shown. When Target already knows the
+    // account it goes straight to the method chooser ("Enter your password") with NO username input,
+    // and treating that as fatal killed the login (2026-07-25: "no visible inputs in any frame").
+    const emailAlreadyThere = (st.userVal || '').trim().toLowerCase() === String(o.email).trim().toLowerCase();
+    if (st.pass || st.chooser || st.known || (st.user && emailAlreadyThere)) {
+      // Username already established (remembered account, masked "tru***", or the box is already
+      // filled with our address) → go straight to the password. Nothing to type here.
+      log('info', '🔐 Account already recognised — entering the password only.');
+    } else if (st.user) {
+      await focusIn(st.userFrame, st.user);
+      await sleep(80);
+      await cdp('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+      await cdp('Input.dispatchKeyEvent', { type: 'keyUp',   modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+      await cdp('Input.insertText', { text: String(o.email) });
+      await sleep(200);
+    }
+    // 3) Advance to the password step. NEVER click a button whose label contains "password" here —
+    // "Sign in with password" is the FINAL SUBMIT, and clicking it early submitted an empty field
+    // ("Please fill out this field.", 2026-07-25). Only a plain Continue/Sign in advances.
+    let cur = await probe();
+    // The "Enter your password" method cell comes first when it's offered — pick it BEFORE trying
+    // any continue/submit, otherwise we advance past the password option entirely.
+    if (!cur.pass && cur.chooser) { await clickIn(cur.chooserFrame, cur.chooser); await sleep(1000); cur = await probe(); }
+    if (!cur.pass) {
+      if (cur.signIn) await clickIn(cur.signInFrame, cur.signIn); else await enter();
+      await sleep(1000);
+      const opt = await probe();
+      if (!opt.pass && opt.chooser) { await clickIn(opt.chooserFrame, opt.chooser); await sleep(1000); }
+    }
+    cur = await waitFor(p => p.pass, 12000);
+    if (!cur || !cur.pass) {
+      const seen = (cur && cur.btns && cur.btns.length) ? ' — buttons seen: ' + cur.btns.join(' | ') : '';
+      log('error', '🔐 Auto-login: password field never appeared' + seen);
+      return { ok: false, step: 'no-password-field' };
+    }
+    // 4) Type the password, then VERIFY it actually landed. Submitting an empty field is what
+    // produced the "Please fill out this field." dead end, so this is checked before submitting.
+    const pwLen = async () => {
+      try {
+        const [{ result }] = await chrome.scripting.executeScript({
+          target: { tabId, frameIds: [cur.passFrame] }, world: 'ISOLATED', args: [cur.pass],
+          func: (sel) => { const el = document.querySelector(sel); return el ? (el.value || '').length : -1; }
+        });
+        return result;
+      } catch (_) { return -1; }
+    };
+    await focusIn(cur.passFrame, cur.pass);
+    await sleep(120);
+    await cdp('Input.insertText', { text: String(o.password) });
+    await sleep(250);
+    let len = await pwLen();
+    if (len <= 0) {
+      // insertText didn't reach the field — fall back to real per-character key events.
+      await focusIn(cur.passFrame, cur.pass);
+      await sleep(120);
+      for (const ch of String(o.password)) {
+        await cdp('Input.dispatchKeyEvent', { type: 'keyDown', text: ch, unmodifiedText: ch, key: ch });
+        await cdp('Input.dispatchKeyEvent', { type: 'keyUp', key: ch });
+        await sleep(25);
+      }
+      await sleep(250);
+      len = await pwLen();
+    }
+    if (len <= 0) {
+      log('error', '🔐 Auto-login: could not type into the password field — sign in manually.');
+      return { ok: false, step: 'password-not-typed' };
+    }
+    // 5) Submit — now that the field is confirmed filled.
+    cur = await probe();
+    if (cur.signIn) await clickIn(cur.signInFrame, cur.signIn);    // "Sign in with password" (submit)
+    else await enter();
+    // 5) Wait for the header to show the account (that's the real confirmation).
+    // 5) Confirm. Off the sign-in page counts as success too — after a good login Target redirects
+    // away, and the login page itself has no account header to read (which is why a real successful
+    // login could still report "never appeared", 2026-07-25).
+    const done = await waitFor(p => p.signedIn || (p.url && !/\/login|signin|sign-in/i.test(p.url)) || p.err, 25000);
+    if (!done || done.err || (!done.signedIn && /\/login|signin|sign-in/i.test(done.url || ''))) {
+      const why = (done && done.err) ? ' — page says: "' + done.err + '"'
+                : ' — no error shown; check the password saved in the 🔐 Account tab, or a captcha/2-step code is blocking it';
+      log('error', '🔐 Auto-login did not complete' + why);
+      return { ok: false, step: 'not-confirmed', err: done && done.err };
+    }
+    log('success', '🔐 Signed in to Target.');
+    return { ok: true };
+  } catch (e) {
+    log('error', '🔐 Auto-login error: ' + String(e && e.message || e));
+    return { ok: false, error: String(e && e.message || e) };
+  } finally {
+    if (attached) { try { await chrome.debugger.detach(dbg); } catch (_) {} }
+    // Only navigate back if we actually LEFT the item page (drawer login stays put — reloading it
+    // would throw away the very page position we're trying to keep during a drop).
+    if (backTo) {
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (t && t.url && t.url.split('#')[0] !== backTo && /\/login|signin|sign-in/i.test(t.url)) {
+          await chrome.tabs.update(tabId, { url: backTo });
+        }
+      } catch (_) {}
+    }
+  }
 }
 
 async function htmlStockPoll(tabId, url, mode) {

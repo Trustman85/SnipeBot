@@ -24,7 +24,8 @@
   },
   "content_scripts": [
     { "matches": ["http://localhost:3000/*"], "js": ["stores.js", "sams.js", "content.js"], "run_at": "document_end" },
-    { "matches": ["https://www.walmart.com/*"], "js": ["stores.js", "sams.js", "walmart.js", "content.js"], "run_at": "document_start" }
+    { "matches": ["https://www.walmart.com/*"], "js": ["stores.js", "sams.js", "walmart.js", "content.js"], "run_at": "document_start" },
+    { "matches": ["https://www.target.com/*"], "js": ["targetstock.js"], "run_at": "document_start", "world": "MAIN" }
   ],
   "background": { "service_worker": "background.js" }
 }

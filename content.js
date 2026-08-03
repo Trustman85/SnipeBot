@@ -102,6 +102,15 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
     if (window.__botLastUrl === location.href && window.__botRunToken === botRunToken) return;
     window.__botLastUrl  = location.href;
     window.__botRunToken = botRunToken;
+    // A new Start clears any login-in-progress marker left behind by a previous run (the login
+    // navigation can kill the script before it clears its own flag).
+    try {
+      if (sessionStorage.getItem('__botLoginTok') !== String(botRunToken)) {
+        sessionStorage.removeItem('__botLoginAt');
+        sessionStorage.removeItem('__botLoginTries');
+        sessionStorage.setItem('__botLoginTok', String(botRunToken));
+      }
+    } catch (_) {}
     const isSams = activeProfile === 'sams';
     const store  = (window.__STORES && window.__STORES[activeProfile]) || null; // non-Sam's store adapter
     const isStore = isSams || !!store;
@@ -127,7 +136,9 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
     // The panel prepends (newest on top), so log the detail line FIRST and the headline LAST,
     // which renders as: "Bot N live" on top with the profile/store/wid detail directly under it.
     log('info', 'profile=' + activeProfile + ' store=' + (isStore ? 'yes' : 'NO-adapter') + ' [wid=' + myWid + ']');
-    log('info', '⚙️ Bot ' + botNum + ' live #' + itemId);
+    // "live" here = the BOT is now running (NOT the item being in stock — that's logItemLive's
+    // "IN STOCK" line). Worded as "running on" so it can't be misread as an item-live signal.
+    log('info', '⚙️ Bot ' + botNum + ' running on #' + itemId);
     // Burst mode (around a drop): reload as fast as possible to catch the item going live
     const burst = burstUntil && Date.now() < burstUntil;
 
@@ -846,30 +857,126 @@ function detectTargetFulfillment() {
 // signed in and "Hi, sign in" when not (capture 2026-07-24: firstName "xue" when logged in). Zero
 // network/anti-bot cost. Defaults to TRUE when the header can't be read, so an unreadable page
 // never triggers a needless login (the checkout attempt's own auth-detection is the backstop).
-function targetLoggedIn() {
+function targetLoginState() {
   try {
-    const el = document.querySelector('[data-test="@web/AccountLink"], [data-test="accountNav-button"], [aria-label*="Account" i]') ||
-               document.querySelector('header') || document.body;
-    const txt = (el.innerText || el.getAttribute('aria-label') || '').toLowerCase();
-    if (/hi,\s*[a-z]/.test(txt) && !/hi,\s*sign in/.test(txt)) return true;   // "Hi, Xue" → signed in
-    if (/\bsign in\b/.test(txt)) return false;                                 // "sign in" affordance → signed out
+    // Prefer the account control; fall back to the whole header. Read BOTH text and aria-label —
+    // Target renders the name in an aria-label on some layouts and as visible text on others.
+    const nodes = Array.from(document.querySelectorAll(
+      '[data-test="@web/AccountLink"], [data-test="accountNav-button"], [aria-label*="Account" i], header a[href*="/account"], header a[href*="/login"], header'));
+    let txt = '';
+    for (const el of nodes) txt += ' ' + ((el.innerText || '') + ' ' + (el.getAttribute && el.getAttribute('aria-label') || ''));
+    txt = txt.toLowerCase().replace(/\s+/g, ' ');
+    // SIGNED OUT is checked FIRST and wins: the header keeps an /account link even when signed out
+    // (it just redirects to login), so an "account link ⇒ signed in" rule gave a false "signed in ✓"
+    // on a logged-out session (real 2026-07-25). Only an explicit sign-in affordance is trusted here.
+    if (/hi,\s*sign\s*in/.test(txt) || /\bsign in\b/.test(txt)) return 'out';
+    if (document.querySelector('header a[href*="/login"], header a[href*="/signin"]')) return 'out';
+    // SIGNED IN: a greeting carrying a real name ("Hi, xue" — firstName from credential_validations).
+    if (/hi,\s*(?!sign\s*in)[a-z]/.test(txt)) return 'in';
   } catch (_) {}
-  return true; // unknown → assume signed in (don't force a login on a guess)
+  return 'unknown'; // header not readable (page still hydrating, or markup changed)
 }
+// Waits briefly for the header to hydrate before deciding — the check runs right after page load,
+// where an immediate read is almost always 'unknown' (real log 2026-07-25).
+async function targetLoginStateWait(ms = 6000) {
+  const end = Date.now() + ms;
+  for (;;) {
+    const s = targetLoginState();
+    if (s === 'in') return 'in';
+    if (s === 'out') {
+      // CONFIRM before acting: mid-hydration the header can show "sign in" for a moment even when
+      // signed in, and acting on that would navigate off the item page to log in for no reason.
+      await sleep(1500);
+      return targetLoginState() === 'in' ? 'in' : 'out';
+    }
+    if (Date.now() > end) return 'unknown';
+    await sleep(300);
+  }
+}
+function targetLoggedIn() { return targetLoginState() !== 'out'; } // unknown → don't force a login on a guess
 
 // Raw-API re-login for Target. Only runs when auto-login is enabled AND creds are saved. Returns
 // true if a login was performed successfully (caller should retry the buy), false otherwise (no
 // creds / disabled / login failed → caller alerts the human). Throttled so repeated 'auth' cycles
 // don't spam the login endpoint (which itself can rate-limit / trip the behavioral guard).
 let __lastLoginAt = 0;
+// ⚠️ ACCOUNT-LOCKOUT SAFETY. Repeated failed sign-ins LOCK a Target account (real: 2026-07-25, the
+// bot retried a rejected password and the account was locked). Rules enforced below:
+//   • A credential rejection (401/invalid) is TERMINAL — never retried, not even via the form.
+//   • The rejection is remembered until the user saves a DIFFERENT password.
+//   • At most ONE login attempt per run.
+function __credKey(cfg) { return 'bot:badCred:target:' + String((cfg && cfg.accountEmail) || '') + ':' + String((cfg && cfg.accountPass) || '').length; }
+async function credentialsKnownBad(cfg) {
+  try { const k = __credKey(cfg); return !!(await chrome.storage.local.get(k))[k]; } catch (_) { return false; }
+}
+async function markCredentialsBad(cfg, why) {
+  try { await chrome.storage.local.set({ [__credKey(cfg)]: { at: Date.now(), why: why || '' } }); } catch (_) {}
+}
+
 async function ensureTargetLogin(cfg) {
-  if (!cfg || cfg.autoLogin === false || !cfg.accountEmail || !cfg.accountPass) return false;
+  if (!cfg || cfg.autoLogin === false || !cfg.accountEmail || !cfg.accountPass) {
+    if (cfg && cfg.autoLogin !== false && !(cfg.accountEmail && cfg.accountPass)) {
+      log('warning', '🔐 No saved Target credentials — fill the 🔐 Account tab (email + password) and Save to enable auto-login.');
+    }
+    return false;
+  }
+  // ⚠️ HARD STOP: these exact credentials were already rejected by Target. Trying again risks
+  // LOCKING THE ACCOUNT (it happened). Only a changed password clears this.
+  if (await credentialsKnownBad(cfg)) {
+    log('error', '🔐 Auto-login disabled — Target rejected this password before. Sign in manually, then update the 🔐 Account tab and Save. (Not retrying: repeated failures lock the account.)');
+    return false;
+  }
   if (Date.now() - __lastLoginAt < 8000) return false; // don't relogin more than ~every 8s
   __lastLoginAt = Date.now();
-  log('info', '🔐 Signed out — attempting API auto-login…');
+  // NOTE: deliberately NOT gated on the __botLoginAt flag. The login navigates the tab, which kills
+  // this content script before it can clear the flag — so a stale flag from a failed attempt
+  // permanently blocked every later login ("already in progress — waiting for it", 2026-07-25).
+  // Concurrent debugger attaches are handled in background.js instead (detach-and-retry).
+  // 1) RAW API first — instant when it works (no navigation).
+  log('info', '🔐 Signed out — logging in as ' + String(cfg.accountEmail).replace(/(.{2}).*(@.*)/, '$1***$2') + '…');
   const r = await bgSend({ type: 'TARGET_LOGIN', email: cfg.accountEmail, password: cfg.accountPass }, 25000, { ok: false, error: 'timeout' });
-  if (r && r.ok) { log('success', '🔐 API auto-login OK — resuming checkout.'); return true; }
-  log('warning', '🔐 API auto-login failed (' + (r ? (r.step ? r.step + ' ' + r.status : r.error) : 'no reply') + ').');
+  if (r && r.ok) { log('success', '🔐 Auto-login OK (API) — continuing.'); return true; }
+  // Quote Target's OWN message: a 401 here is normally "wrong password", which looks identical to a
+  // blocked request unless we print what the server actually said.
+  let why = r ? (r.step ? r.step + ' ' + r.status : r.error) : 'no reply';
+  try {
+    const b = r && r.body;
+    const m = b && (b.message || b.errorMessage || b.error_description || b.code || b.errorKey);
+    if (m) why += ' — ' + String(m).slice(0, 160);
+  } catch (_) {}
+  // ⚠️ CREDENTIAL REJECTION IS TERMINAL. A 401/invalid-credential answer means the password is wrong
+  // (or the account is already locked). Trying the FORM next would burn another failed attempt and
+  // push the account toward/deeper into a lockout — so stop here and tell the human.
+  const credRejected = r && (r.status === 401 || r.step === 'credential' ||
+    /invalid|incorrect|locked|password/i.test(JSON.stringify((r && r.body) || '')));
+  if (credRejected) {
+    await markCredentialsBad(cfg, why);
+    const bn = window.__botNum || '?';
+    log('error', '🔐 Target REJECTED the saved password (' + why + '). STOPPING — no retry, because repeated failures lock the account. Sign in manually, then update the 🔐 Account tab and Save.');
+    chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'error', text: 'Bot ' + bn + ' — Target password rejected. Auto-login stopped.', speak: 'Bot ' + bn + ' Target password rejected' }).catch(() => {});
+    return false;
+  }
+  log('info', '🔐 API login refused (' + why + ') — typing it into the sign-in form instead…');
+  // 2) UI LOGIN — only for NON-credential failures (blocked key, network, form quirk).
+  // ONE attempt per run: each failed sign-in counts toward Target's lockout.
+  let tries = 0;
+  try { tries = Number(sessionStorage.getItem('__botLoginTries') || 0) || 0; } catch (_) {}
+  if (tries >= 1) { log('warning', '🔐 Auto-login already attempted this run — not retrying (repeated failures lock the account). Sign in manually.'); return false; }
+  try { sessionStorage.setItem('__botLoginTries', String(tries + 1)); } catch (_) {}
+  // Mark the login as in-flight BEFORE navigating: the /login page load re-runs content.js, and the
+  // off-course recovery must see this flag or it will navigate straight back to the item.
+  try { sessionStorage.setItem('__botLoginAt', String(Date.now())); } catch (_) {}
+  const u = await bgSend({ type: 'TARGET_UI_LOGIN', email: cfg.accountEmail, password: cfg.accountPass,
+                           backTo: location.href.split('#')[0] }, 70000, { ok: false, error: 'timeout' });
+  try { sessionStorage.removeItem('__botLoginAt'); } catch (_) {}
+  if (u && u.ok) { log('success', '🔐 Auto-login OK (form) — continuing.'); return true; }
+  // If the FORM reported a credential/lockout error, remember it so nothing tries again.
+  if (u && /invalid|incorrect|password|locked|too many/i.test(String(u.err || ''))) {
+    await markCredentialsBad(cfg, u.err);
+    log('error', '🔐 Target says: "' + u.err + '" — auto-login disabled until you update the password in the 🔐 Account tab.');
+    return false;
+  }
+  log('warning', '🔐 Auto-login failed (' + (u ? (u.step || u.error) : 'no reply') + ') — sign in manually.');
   return false;
 }
 
@@ -923,59 +1030,68 @@ async function markOrderDone() {
 async function watchTargetStock(tcin, interval, burst, cfg) {
   cfg = cfg || (await wget('botConfig')).botConfig || {};
   const pollMs = Math.max(500, (burst ? 0.5 : (parseFloat(interval) || 2)) * 1000);
-  const apiOn = !cfg.apiCheckoutOff;
-  const iq = (cfg.watchQty && cfg.watchQty[tcin]) || cfg.skuQty || parseInt(cfg.quantity || '1');
-  const im = (cfg.watchMax && cfg.watchMax[tcin] != null) ? cfg.watchMax[tcin] : (cfg.skuMax != null ? cfg.skuMax : parseFloat(cfg.maxPrice || '999'));
-  // STOCK-GATED WATCH. Poll the stock API and ONLY attempt checkout once it actually reads live.
-  // Why: Target returns _ERR_AUTH_DENIED for an OUT-OF-STOCK item too (not just gated/signed-out),
-  // so "probe by trying to add" can't tell OOS from live and just hammers 401s on a sold-out item
-  // (real capture 2026-07-24: 570+ adds on a Sold-out TCIN). The stock poll is the correct gate.
-  // When live: API on → fire the API checkout (internal 429/401 push); API off → reload for the UI
-  // flow. Every attempt is re-gated by a fresh stock read, so we never hammer an OOS item.
-  const RUN_MS = 15 * 60 * 1000;                 // overall watch cap
-  const deadline = Date.now() + RUN_MS;
-  log('info', '⚡ Watching ' + tcin + ' via stock API' + (apiOn ? ' → API checkout fires only when it reads IN STOCK.' : '.') + ' (up to 15 min)');
-  let fails = 0, attempts = 0, authAlerted = false;
+  log('info', '⚡ Watching stock via API (' + tcin + ', every ' + Math.round(pollMs) + 'ms) — no reloads until it drops.');
+  // Consecutive reload count (survives the reload) so a dead stock API backs OFF instead of a tight
+  // reload→403→reload loop. Cleared as soon as any poll reads successfully.
+  let reloadN = 0;
+  try { reloadN = Number(sessionStorage.getItem('__botTgtReloadN') || 0) || 0; } catch (_) {}
+  let fails = 0, lastBeat = 0;
   for (let i = 0; ; i++) {
     const st = await wget('botRunning');
-    if (!st.botRunning) return;                  // stopped by the user
-    if (Date.now() >= deadline) { log('info', '⚡ 15-min watch finished — item never went live' + (attempts ? ' (' + attempts + ' checkout attempts while live)' : '') + '.'); return; }
-
-    const r = await bgSend({ type: 'STOCK_POLL', tcin }, 9000, {});
+    if (!st.botRunning) return; // stopped by the user
+    const r = await bgSend({ type: 'STOCK_POLL', tcin }, 9000, {}); // timeout-guarded: a lost reply must NOT freeze the watcher
     const inStock = r.ok && (r.avail === 'IN_STOCK' || r.avail === 'LIMITED_STOCK' || (typeof r.qty === 'number' && r.qty > 0));
-
     if (inStock) {
-      if (!attempts) logItemLive('IN STOCK (' + r.avail + (r.qty != null ? ', qty ' + r.qty : '') + ') — grabbing it!');
-      if (!apiOn) { try { sessionStorage.setItem('__botTgtLiveAt', String(Date.now())); } catch (_) {} location.reload(); return; }
-      // Live + API on → run the checkout (targetApiAttempt already pushes through 429/401 internally).
-      const outcome = await targetApiAttempt(cfg, tcin, iq, im, attempts > 0); // first one loud, rest quiet
-      attempts++;
-      if (outcome === 'placed' || outcome === 'test-stopped') { log('success', '⚡ API checkout succeeded on attempt #' + attempts + '.'); return; }
-      // Signed out mid-buy → auto-login (saved creds) then retry; else alert the human and keep going.
-      if (outcome === 'auth') {
-        if (await ensureTargetLogin(cfg)) { authAlerted = false; await sleep(300); continue; }
-        if (!authAlerted) {
-          authAlerted = true;
-          const bn = window.__botNum || '?';
-          const why = (cfg.autoLogin !== false && cfg.accountEmail && cfg.accountPass) ? 'auto-login failed — ' : '';
-          log('error', '🔐 Target AUTH DENIED — ' + why + 'SIGN IN on target.com in this window; the bot keeps retrying.');
-          chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'error', text: 'Bot ' + bn + ' — SIGN IN to Target!', speak: 'Bot ' + bn + ' sign in to Target' }).catch(() => {});
-        }
-        await sleep(5000); continue;
+      logItemLive('IN STOCK (' + r.avail + (r.qty != null ? ', qty ' + r.qty : '') + ') — grabbing it!');
+      // ⚡ Try the direct-API checkout FIRST (fastest path — no page load needed). Only reached when
+      // stock says LIVE, so we never hammer an OOS item. If it doesn't complete, fall through to the
+      // original reload → on-page buy flow exactly as before.
+      if (!cfg.apiCheckoutOff) {
+        const iq = (cfg.watchQty && cfg.watchQty[tcin]) || cfg.skuQty || parseInt(cfg.quantity || '1');
+        const im = (cfg.watchMax && cfg.watchMax[tcin] != null) ? cfg.watchMax[tcin] : (cfg.skuMax != null ? cfg.skuMax : parseFloat(cfg.maxPrice || '999'));
+        const outcome = await targetApiAttempt(cfg, tcin, iq, im);
+        if (outcome === 'placed' || outcome === 'test-stopped') return;
+        if (outcome === 'auth') await ensureTargetLogin(cfg); // signed out → re-login, then reload below
       }
-      if (authAlerted) { authAlerted = false; log('success', '🔐 Target session back — resuming.'); }
-      if (attempts % 10 === 0) log('info', '⚡ API checkout — ' + attempts + ' attempts (item live, last: ' + outcome + '), still trying…');
-      await sleep(Math.max(300, pollMs)); continue; // brief pause, then re-check stock + attempt again
+      // Stamp the reason for this reload — the fresh page HOLDS for the button to enable instead
+      // of seeing "disabled" and bouncing right back into this watcher (the reload-without-buying loop).
+      try { sessionStorage.setItem('__botTgtLiveAt', String(Date.now())); } catch (_) {}
+      location.reload(); return;
     }
-
-    // OUT OF STOCK → just watch; do NOT attempt checkout (AUTH_DENIED spam avoided).
     if (!r.ok || r.status === 'ERR' || (r.status && r.status !== 200)) {
+      // Transient 403s (rate-limit — e.g. right after rapid store switching) recover on their own:
+      // back off and retry instead of instantly reloading, which just LOOPED reload→403→reload.
       fails++;
-      if (fails >= 5) { log('warning', '⚡ stock API ' + (r.status || 'unavailable') + ' ×' + fails + ' — backing off.'); await sleep(5000); fails = 0; continue; }
+      if (fails >= 5) {
+        // RELOAD instead of giving up: the reload both (a) reads the real button state on a fresh DOM
+        // and (b) makes the page fire its OWN stock request, which targetstock.js captures — so after
+        // one reload the fast cdui poll usually becomes available. Back off as reloads pile up so a
+        // permanently dead API can't turn into a tight reload loop.
+        reloadN++;
+        const waitMs = Math.min(3000 * reloadN, 15000);
+        try { sessionStorage.setItem('__botTgtReloadN', String(reloadN)); } catch (_) {}
+        log('warning', '⚡ stock API ' + (r.status || 'unavailable') + ' ×' + fails + (r.diag ? ' [' + r.diag + ']' : '') +
+                       ' — reloading in ' + (Math.round(waitMs / 100) / 10) + 's (reload #' + reloadN + '; the reload also re-captures the page\'s stock request).');
+        await sleep(waitMs); location.reload(); return;
+      }
+      log('warning', '⚡ stock API ' + (r.status || 'unavailable') + ' — retrying in 3s (' + fails + '/5)' + (r.diag ? ' [' + r.diag + ']' : ''));
       await sleep(3000); continue;
     }
+    // A good read — the API is working again; forget the reload backoff.
+    if (reloadN) { reloadN = 0; try { sessionStorage.removeItem('__botTgtReloadN'); } catch (_) {} }
     fails = 0;
-    if (i % 12 === 0) log('info', '⚡ ' + tcin + ' — watching (stock API: ' + (r.avail || 'OOS') + ')…');
+    // Heartbeat on a TIME basis (~10s), not every Nth poll — with a 2s interval an every-15-cycles
+    // line only appeared every 30s, which read like the watcher had stalled.
+    if (Date.now() - lastBeat >= 10000) {
+      lastBeat = Date.now();
+      log('info', '⚡ ' + tcin + ' still ' + (r.avail || 'OOS') + ' — watching…' + (r.src ? ' [' + r.src + ']' : ''));
+    }
+    // A poll that returns NO availability field is not a real "OOS" read — it means we can't see stock
+    // at all (and would never fire). Say so loudly once, and reload to re-capture a usable request.
+    if (r.avail == null && r.src && /nofulfill/.test(r.src)) {
+      log('warning', '⚡ Stock reply had no availability field' + (r.sample ? ' — reply was: ' + r.sample : '') + ' — reloading to re-capture the page\'s stock request.');
+      await sleep(Math.max(3000, pollMs)); location.reload(); return;
+    }
     await sleep(pollMs);
   }
 }
@@ -990,24 +1106,33 @@ async function watchTargetList(list, interval, burst, cfg) {
   try {
     cfg = cfg || (await wget('botConfig')).botConfig || {};
     const apiOn = !cfg.apiCheckoutOff;
-    const pollMs = Math.max(500, (burst ? 0.5 : (parseFloat(interval) || 2)) * 1000);
     const ids = list.map(String);
+    // PARALLEL: every item is polled at the SAME time, once per auto-refresh interval. So the
+    // interval is exactly how often each item is checked (not divided across the list) — set it in
+    // the Auto-refresh box. 500ms floor so it can't be driven to zero.
+    const cycleMs = Math.max(500, (burst ? 0.5 : (parseFloat(interval) || 2)) * 1000);
     const qtyOf = (id) => (cfg.watchQty && cfg.watchQty[id]) || cfg.skuQty || parseInt(cfg.quantity || '1');
     const maxOf = (id) => (cfg.watchMax && cfg.watchMax[id] != null) ? cfg.watchMax[id] : (cfg.skuMax != null ? cfg.skuMax : parseFloat(cfg.maxPrice || '999'));
     const RUN_MS = 15 * 60 * 1000, deadline = Date.now() + RUN_MS;
-    log('info', '⚡ Watchlist: monitoring ' + ids.length + ' Target items via stock API' + (apiOn ? ' → API checkout fires on the first one live.' : '.') + ' (up to 15 min)');
-    let authAlerted = false;
-    for (let cycle = 0; ; cycle++) {
-      for (let j = 0; j < ids.length; j++) {
-        const st = await wget('botRunning'); if (!st.botRunning) return;
-        if (Date.now() >= deadline) { log('info', '⚡ 15-min watchlist watch finished — nothing went live.'); return; }
-        const id = ids[j];
-        const r = await bgSend({ type: 'STOCK_POLL', tcin: id }, 9000, {});
-        const inStock = r.ok && (r.avail === 'IN_STOCK' || r.avail === 'LIMITED_STOCK' || (typeof r.qty === 'number' && r.qty > 0));
-        if (!inStock) continue;                        // OOS → next item (never attempt an OOS buy)
+    log('info', '⚡ Watchlist: monitoring ' + ids.length + ' Target items in PARALLEL every ' + (Math.round(cycleMs / 100) / 10) + 's' + (apiOn ? ' → API checkout fires on the first one live.' : '.') + ' (up to 15 min)');
+    let authAlerted = false, lastBeat = 0;
+    for (;;) {
+      const st = await wget('botRunning'); if (!st.botRunning) return;
+      if (Date.now() >= deadline) { log('info', '⚡ 15-min watchlist watch finished — nothing went live.'); return; }
+      const t0 = Date.now();
+
+      // Fire every item's stock poll at once and wait for them all.
+      const results = await Promise.all(ids.map(id =>
+        bgSend({ type: 'STOCK_POLL', tcin: id }, 9000, {}).then(r => ({ id, r }), () => ({ id, r: {} }))));
+
+      const live = results.filter(({ r }) =>
+        r.ok && (r.avail === 'IN_STOCK' || r.avail === 'LIMITED_STOCK' || (typeof r.qty === 'number' && r.qty > 0)));
+
+      // Buy the live ones in list order (the list is the user's priority order).
+      for (const { id, r } of live) {
+        const st2 = await wget('botRunning'); if (!st2.botRunning) return;
         logItemLive('#' + id + ' IN STOCK (' + r.avail + ') — grabbing it!');
-        if (!apiOn) { await wset({ watchIndex: j }); location.href = 'https://www.target.com/p/-/A-' + id; return; }
-        // Live + API on → run the checkout for THIS item (internal 429/401 push).
+        if (!apiOn) { await wset({ watchIndex: ids.indexOf(id) }); location.href = 'https://www.target.com/p/-/A-' + id; return; }
         const outcome = await targetApiAttempt(cfg, id, qtyOf(id), maxOf(id), false);
         if (outcome === 'placed' || outcome === 'test-stopped') return;
         if (outcome === 'auth') {
@@ -1018,10 +1143,16 @@ async function watchTargetList(list, interval, burst, cfg) {
             chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'error', text: 'Bot ' + bn + ' — SIGN IN to Target!', speak: 'Bot ' + bn + ' sign in to Target' }).catch(() => {});
           }
         }
-        // outcome failed/gated → item not really buyable yet; keep cycling the list.
+        // failed/gated → not really buyable yet; keep watching the list.
       }
-      if (cycle % 6 === 0) log('info', '⚡ Watchlist — cycled ' + ids.length + ' items, still watching…');
-      await sleep(pollMs);
+
+      if (Date.now() - lastBeat >= 10000) {
+        lastBeat = Date.now();
+        const states = results.map(({ id, r }) => id + ':' + (r.avail || (r.status && r.status !== 200 ? r.status : 'OOS'))).join('  ');
+        log('info', '⚡ Watchlist (' + ids.length + ' in parallel) — ' + states);
+      }
+      const wait = cycleMs - (Date.now() - t0); // interval measured cycle-to-cycle, not on top of it
+      if (wait > 0) await sleep(wait);
     }
   } finally { window.__watchLoopRunning = false; }
 }
@@ -1686,6 +1817,36 @@ function walmartRetailReject(cfg) {
 async function runStore(store, cfg, burst) {
   const S = store.sel;
   const phase = store.detectPhase(location.href) || 'SEARCH';
+
+  // ── 🔐 LOGIN GATE (Target) — THE FIRST THING THIS RUN DOES ──────────────────────────────────────
+  // Nothing else happens until the account is signed in: a logged-out session can't check out (cart
+  // calls 401 _ERR_AUTH_DENIED and stock calls 403), so watching an item while signed out is wasted.
+  // Signed out → auto-login with the saved Account-tab credentials; if that fails, alert and WAIT for
+  // a manual sign-in. Skipped on the sign-in page itself (that IS the login) and after checkout has
+  // started, so we never interrupt a buy in progress.
+  if (store.key === 'target' && !/\/login|signin|sign-in/i.test(location.pathname) && phase !== 'CONFIRM') {
+    const tgtLogin = await targetLoginStateWait(); // header hydrates after load — wait, don't guess
+    if (tgtLogin === 'unknown') {
+      let seen = '';
+      try { seen = ((document.querySelector('header') || document.body).innerText || '').replace(/\s+/g, ' ').slice(0, 120); } catch (_) {}
+      log('warning', '🔐 Target account: could not read sign-in state — header said: "' + seen + '"');
+    } else {
+      log('info', '🔐 Target account: ' + (tgtLogin === 'in' ? 'signed in ✓' : 'SIGNED OUT'));
+    }
+    if (tgtLogin === 'out') {
+      if (!await ensureTargetLogin(cfg)) {
+        const bn = window.__botNum || '?';
+        log('error', '🔐 Please SIGN IN to Target in this window — the bot will continue once you are logged in.');
+        chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'error', text: 'Bot ' + bn + ' — SIGN IN to Target!', speak: 'Bot ' + bn + ' sign in to Target' }).catch(() => {});
+        // Wait (up to 5 min) for a manual sign-in; only 'in' counts, so an unreadable header can't
+        // fake success and let the run continue logged out.
+        for (let w = 0; w < 150 && targetLoginState() !== 'in'; w++) { const s = await wget('botRunning'); if (!s.botRunning) return; await sleep(2000); }
+        if (targetLoginState() !== 'in') { log('warning', '🔐 Still signed out — stopping this pass.'); return; }
+        log('success', '🔐 Signed in — continuing.');
+      }
+      return; // the login navigated the tab; the reloaded item page re-runs this with a live session
+    }
+  }
   // Named steps for the checkout side so the status bar reads clearly. SEARCH is left to its own
   // handler below (watchlist sets a "Watching" step; single-item just searches) to avoid log spam.
   var PHASE_STEP = { RESULTS: '🔍 Search results', CART: '🛒 In cart', CHECKOUT: '💳 Checkout', CONFIRM: '✅ Order placed' };
@@ -1712,6 +1873,18 @@ async function runStore(store, cfg, burst) {
   // checkout/confirm/queue are all recognized phases; queues are handled before we get here),
   // NAVIGATE BACK to the item instead of blindly running SEARCH logic on a homepage/error page.
   if (phase === 'SEARCH') {
+    // A LOGIN IN PROGRESS is not "off-course": the auto-login deliberately navigates to /login, and
+    // yanking the tab back to the item mid-login made the two fight each other in a loop until the
+    // debugger collided (real 2026-07-25). Stand down while the login flag is fresh.
+    // Short window (40s): a form login takes a few seconds, and the flag can orphan because the
+    // navigation kills the script that would clear it — so it must expire on its own quickly.
+    const loginBusy = (() => {
+      try { return Date.now() - Number(sessionStorage.getItem('__botLoginAt') || 0) < 40000; } catch (_) { return false; }
+    })();
+    if (loginBusy && /\/login|signin|sign-in|\/gsp\//i.test(location.pathname)) {
+      log('info', '🔐 On the sign-in page — auto-login in progress, holding here.');
+      return;
+    }
     const wkKey = 'w' + _wid() + ':workingItem';
     const itemRe = {
       target: /\/A-\d+/, walmart: /\/ip\//, sams: /\/ip\//,
@@ -1775,33 +1948,6 @@ async function runStore(store, cfg, burst) {
       await buyNowDrawerCheckout(store, cfg); return;
     }
 
-    // ⚡ DIRECT-API CHECKOUT (Target) — API-ONLY: fire immediately (needs only the TCIN from the
-    // URL), and on failure go STRAIGHT into the API-only retry loop in watchTargetStock — no UI
-    // fallback, no Buy-now clicking. That loop runs 15 min, logs every 10 attempts.
-    const tcinEarly = (location.pathname.match(/\/A-(\d+)/) || [])[1];
-    if (store.key === 'target' && tcinEarly && !cfg.apiCheckoutOff) {
-      // LOGIN CHECK — FIRST THING: verify we're signed in before doing anything else. Signed out →
-      // auto-login now (so we're ready before the drop), else alert to sign in. Only when creds set.
-      if (!targetLoggedIn()) {
-        log('warning', '🔐 Not signed in to Target — handling before watching…');
-        if (!await ensureTargetLogin(cfg)) {
-          const bn = window.__botNum || '?';
-          log('error', '🔐 Please SIGN IN to Target in this window — the bot will continue once you are logged in.');
-          chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'error', text: 'Bot ' + bn + ' — SIGN IN to Target!', speak: 'Bot ' + bn + ' sign in to Target' }).catch(() => {});
-          // Wait for a manual sign-in (up to 5 min) so the run doesn't proceed logged-out.
-          for (let w = 0; w < 150 && !targetLoggedIn(); w++) { const s = await wget('botRunning'); if (!s.botRunning) return; await sleep(2000); }
-          if (targetLoggedIn()) log('success', '🔐 Signed in — starting the watch.');
-        }
-      }
-      // WATCHLIST (multiple items): watch them ALL via the stock API, grab the first live one.
-      const wl = Array.isArray(cfg.watchlist) ? cfg.watchlist : null;
-      if (wl && wl.length > 1) { await watchTargetList(wl, interval, burst, cfg); return; }
-      let outcome = await targetApiAttempt(cfg, tcinEarly, wantQty, wantMax);
-      // Backstop: if the buy attempt itself reports signed-out, try auto-login + one retry.
-      if (outcome === 'auth' && await ensureTargetLogin(cfg)) outcome = await targetApiAttempt(cfg, tcinEarly, wantQty, wantMax);
-      if (outcome === 'placed' || outcome === 'test-stopped') return;
-      await watchTargetStock(tcinEarly, interval, burst, cfg); return;
-    }
     // TARGET: Buy now sometimes NAVIGATES to /checkout/buy-now/checkout instead of opening the
     // drawer. During a drop an "Ok" error popup can block that page (capture: Ok → bounced back to
     // the item → Buy now again). So here: Place-order appears → finish checkout; "Ok"/"Close" popup
@@ -1882,6 +2028,17 @@ async function runStore(store, cfg, burst) {
     };
     let { usingBuyNow, addBtn, clickSel } = resolveAction();
     const isDisabled = (el) => !el || el.disabled || el.getAttribute('aria-disabled') === 'true';
+
+    // ⚡ TARGET DIRECT-API CHECKOUT — the item is BUYABLE right now (enabled button = live), so take
+    // the fast path: fire the API checkout instead of driving the slow Buy-now drawer. Gated on an
+    // enabled button so we never POST at an out-of-stock item (that 401s _ERR_AUTH_DENIED). Any
+    // failure falls through to the normal UI buy flow below, unchanged.
+    if (store.key === 'target' && !cfg.apiCheckoutOff && tcinHere && addBtn && !isDisabled(addBtn)) {
+      let outcome = await targetApiAttempt(cfg, tcinHere, wantQty, wantMax);
+      if (outcome === 'auth' && await ensureTargetLogin(cfg)) outcome = await targetApiAttempt(cfg, tcinHere, wantQty, wantMax);
+      if (outcome === 'placed' || outcome === 'test-stopped') return;
+      log('warning', '⚡ API checkout didn\'t complete — using the on-page buy flow.');
+    }
 
     // TARGET LIVE-RELOAD HOLD: when the stock watcher reloads because the API flipped IN_STOCK,
     // the fresh page often hydrates with the button DISABLED for a few seconds — the old flow saw

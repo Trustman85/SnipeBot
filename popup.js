@@ -596,6 +596,47 @@ document.getElementById('speedTestBtn').addEventListener('click', testLoadSpeed)
 document.getElementById('stockTestBtn').addEventListener('click', findStockApi);
 document.getElementById('trackBtn').addEventListener('click', toggleClickTracker);
 document.getElementById('capCheckoutBtn').addEventListener('click', toggleCheckoutCapture);
+// 🔓 Test login — ONE deliberate attempt with the saved credentials, triggered by the human. This
+// exists so credentials are never validated inside a bot run loop: repeated failed sign-ins LOCK a
+// Target account (it happened 2026-07-25). Exactly one API try, then one form try, then it stops.
+{
+  const tb = document.getElementById('testLoginBtn');
+  if (tb) tb.addEventListener('click', async () => {
+    const email = (document.getElementById('accountEmail').value || '').trim();
+    const pass  = document.getElementById('accountPass').value || '';
+    if (!email || !pass) { addLog('error', '🔓 Enter the account email and password first.'); return; }
+    const [tab] = await chrome.tabs.query({ active: true, windowId: MY_WID });
+    if (!tab || !/^https?:\/\/(www\.)?target\.com/i.test(tab.url || '')) {
+      addLog('error', '🔓 Open a target.com tab first (the login runs in that tab).'); return;
+    }
+    tb.disabled = true; tb.textContent = '🔓 Signing in…';
+    try {
+      addLog('info', '🔓 Testing login (one attempt) as ' + email.replace(/(.{2}).*(@.*)/, '$1***$2') + '…');
+      let r = await chrome.runtime.sendMessage({ type: 'TARGET_LOGIN', tabId: tab.id, email, password: pass }).catch(() => null);
+      if (!(r && r.ok)) {
+        let why = r ? (r.step ? r.step + ' ' + r.status : r.error) : 'no reply';
+        // Say whether we actually had Target's own fingerprint + behavioral key: without them the
+        // API login is expected to fail, and that's a setup issue, not a code issue.
+        if (r && r.step) why += ' [key:' + (r.mouseKey ? 'yes' : 'NO') + ' fingerprint:' + (r.deviceInfoReal ? 'real' : 'SYNTHETIC') + ']';
+        try {
+          const m = r && r.body && (r.body.message || r.body.errorMessage || r.body.code || r.body.errorKey);
+          if (m) why += ' — ' + String(m).slice(0, 140);
+        } catch (_) {}
+        addLog('info', '🔓 API login refused (' + why + ') — trying the sign-in form…');
+        r = await chrome.runtime.sendMessage({ type: 'TARGET_UI_LOGIN', tabId: tab.id, email, password: pass }).catch(() => null);
+      }
+      if (r && r.ok) {
+        addLog('success', '🔓 LOGIN WORKS ✓ — auto-login is good to use.');
+        // Clear any "these credentials are bad" block recorded by a previous failure.
+        try { await chrome.storage.local.remove('bot:badCred:target:' + email + ':' + pass.length); } catch (_) {}
+      } else {
+        addLog('error', '🔓 Login failed: ' + (r ? (r.err || r.step || r.error) : 'no reply') +
+                        ' — fix the password (or unlock the account) before enabling auto-login. NOT retrying.');
+      }
+    } finally { tb.disabled = false; tb.textContent = '🔓 Test login now (one attempt)'; }
+  });
+}
+
 // 🔑 Capture-login reuses the SAME sniffer (it already records credential/sign-in POSTs). ON →
 // sign out then sign in → OFF dumps the login request so raw-API auto-login can be built.
 {
@@ -777,7 +818,12 @@ async function toggleCheckoutCapture() {
         const hkeys = Object.keys(hd).filter(k => !/^cookie$/i.test(k));
         if (hkeys.length) addLog('info', '   headers: ' + hkeys.map(k => k + '=' + String(hd[k]).slice(0, 60)).join(' | '));
         if (h.reqBody) addLog('info', '   body: ' + String(h.reqBody).replace(/\s+/g, ' '));
-        if (h.respSample) addLog('info', '   resp: ' + String(h.respSample).replace(/\s+/g, ' ').slice(0, 200));
+        // Stock/fulfillment responses need the real fields visible (Target's availability lives deep
+        // in the module JSON), so print a long slice for those and stay terse for everything else.
+        if (h.respSample) {
+          const isStockish = /fulfillment|availability|cdui_orchestrations/i.test(h.url + h.respSample);
+          addLog('info', '   resp: ' + String(h.respSample).replace(/\s+/g, ' ').slice(0, isStockish ? 2500 : 200));
+        }
       }
       addLog('info', '🛒 Hit Copy and paste it to me — I’ll wire direct-API checkout for this store.');
     }

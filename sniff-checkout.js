@@ -49,7 +49,7 @@
           if (init && init.body != null) bodyP = Promise.resolve(clip(init.body, 4000));
           else if (isReq) { try { bodyP = input.clone().text().then((t) => clip(t, 4000)).catch(() => ''); } catch (_) { bodyP = Promise.resolve(''); } }
           else bodyP = Promise.resolve('');
-          const respP = p.then((res) => res.clone().text().then((t) => ({ status: res.status, resp: clip(t, 1500) })).catch(() => ({ status: res.status, resp: '' }))).catch(() => ({ status: 0, resp: '' }));
+          const respP = p.then((res) => res.clone().text().then((t) => ({ status: res.status, resp: clip(t, 6000) })).catch(() => ({ status: res.status, resp: '' }))).catch(() => ({ status: 0, resp: '' }));
           Promise.all([bodyP, respP]).then(([reqBody, r]) => {
             record({ via: 'fetch', method, url: clip(url, 400), reqHeaders, reqBody, status: r.status, respSample: r.resp, at: Date.now() });
           }).catch(() => {});
