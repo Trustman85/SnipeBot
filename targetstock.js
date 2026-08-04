@@ -62,7 +62,11 @@
         // Only keep the request that actually RETURNED fulfillment data — the PDP fires several of
         // these, one per module group, and only one carries shipping_options/availability_status.
         p.then((res) => res.clone().text().then((t) => {
-          if (!/FulfillmentAndVariations|shipping_options/.test(t)) return;
+          // ONLY the fulfillment module. "shipping_options" also appears inside the
+          // GlobalRecommendedProducts carousel (other products), so accepting it captured a
+          // RECOMMENDATIONS request and replaying it never returned our item's stock — which drove an
+          // endless "no availability field → reload" loop (2026-07-26).
+          if (!/ProductDetailWebDatasourceFulfillmentAndVariations/.test(t)) return;
           bodyP.then((b) => {
             if (!b) return;
             const tcin = (url.match(/[?&]tcin=(\d+)/) || [])[1] || null;

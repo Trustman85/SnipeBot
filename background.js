@@ -83,6 +83,18 @@ let botInterval = null;
 // windows — even two on the same URL — are deduped independently. Maps tabId -> { url, at }.
 const lastInjected = {};
 
+// ONE-TIME PURGE of "bad credentials" marks. They used to be set from an API 401, which is NOT proof
+// of a wrong password (a stale mouse-tool-key 401s the same working password). A stale mark disabled
+// auto-login permanently and blocked the form login too — including the very success that would have
+// cleared it (2026-07-26). Only the sign-in form's own error message may set this now.
+(async () => {
+  try {
+    const all = await chrome.storage.local.get(null);
+    const stale = Object.keys(all).filter(k => k.indexOf('bot:badCred:') === 0);
+    if (stale.length) await chrome.storage.local.remove(stale);
+  } catch (_) {}
+})();
+
 // ── Per-window state namespacing (mirror of popup.js / content.js) ──────────────
 // Per-window keys are stored as "w<windowId>:<key>". NS_ON is the shared kill-switch — popup.js,
 // content.js and background.js must ALL agree. false = old global single-window behavior (Step 4a);
@@ -985,15 +997,13 @@ async function targetStockPoll(tabId, tcin) {
             const res = await fetch(req.url, { method: 'POST', credentials: 'include',
               headers: { 'accept': 'application/json', 'content-type': 'application/json' }, body: req.body });
             if (res.ok) {
-              const j = await res.json();
-              const hit = readModules(j);
+              const hit = readModules(await res.json());
               if (hit) return hit;
-              // No stock fields in the reply — surface WHAT came back (deferred-enrichment calls can
-              // return an empty modules[] when replayed) so the log shows the real reason.
-              let sample = ''; try { sample = JSON.stringify(j).slice(0, 220); } catch (_) {}
-              return { status: 200, avail: null, src: 'cdui-nofulfill', diag, sample };
+              // Replay didn't carry our item's fulfillment (stale/wrong captured request). Drop the
+              // capture so it can be re-taken, and FALL THROUGH to redsky — returning "no data" made
+              // the watcher reload the page over and over (2026-07-26).
+              try { sessionStorage.removeItem('__botTgtStockReq'); window.__botTgtStockReq = null; } catch (_) {}
             }
-            return { status: res.status, src: 'cdui', diag };
           } catch (_) {} // fall through to redsky
         }
         // FALLBACK: legacy redsky endpoint (works until it rate-limits us to 403).

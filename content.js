@@ -99,7 +99,11 @@ function wremove(keys){ const arr = Array.isArray(keys) ? keys : [keys]; return 
     //  • A real navigation/reload makes a fresh document (window reset) → runs again.
     //  • An SPA route change (same document, new URL) → URL differs → runs again.
     //  • Stopping and pressing Start again gets a NEW token → runs again on the same page.
-    if (window.__botLastUrl === location.href && window.__botRunToken === botRunToken) return;
+    if (window.__botLastUrl === location.href && window.__botRunToken === botRunToken) {
+      // Say so — a silent skip looked exactly like "the bot did nothing on Start" (2026-07-26).
+      log('info', '🔁 Already running on this page for this run — nothing to restart.');
+      return;
+    }
     window.__botLastUrl  = location.href;
     window.__botRunToken = botRunToken;
     // A new Start clears any login-in-progress marker left behind by a previous run (the login
@@ -935,7 +939,11 @@ async function ensureTargetLogin(cfg) {
   // 1) RAW API first — instant when it works (no navigation).
   log('info', '🔐 Signed out — logging in as ' + String(cfg.accountEmail).replace(/(.{2}).*(@.*)/, '$1***$2') + '…');
   const r = await bgSend({ type: 'TARGET_LOGIN', email: cfg.accountEmail, password: cfg.accountPass }, 25000, { ok: false, error: 'timeout' });
-  if (r && r.ok) { log('success', '🔐 Auto-login OK (API) — continuing.'); return true; }
+  if (r && r.ok) {
+    log('success', '🔐 Auto-login OK (API) — continuing.');
+    try { await chrome.storage.local.remove(__credKey(cfg)); } catch (_) {} // creds proven good
+    return true;
+  }
   // Quote Target's OWN message: a 401 here is normally "wrong password", which looks identical to a
   // blocked request unless we print what the server actually said.
   let why = r ? (r.step ? r.step + ' ' + r.status : r.error) : 'no reply';
@@ -944,18 +952,10 @@ async function ensureTargetLogin(cfg) {
     const m = b && (b.message || b.errorMessage || b.error_description || b.code || b.errorKey);
     if (m) why += ' — ' + String(m).slice(0, 160);
   } catch (_) {}
-  // ⚠️ CREDENTIAL REJECTION IS TERMINAL. A 401/invalid-credential answer means the password is wrong
-  // (or the account is already locked). Trying the FORM next would burn another failed attempt and
-  // push the account toward/deeper into a lockout — so stop here and tell the human.
-  const credRejected = r && (r.status === 401 || r.step === 'credential' ||
-    /invalid|incorrect|locked|password/i.test(JSON.stringify((r && r.body) || '')));
-  if (credRejected) {
-    await markCredentialsBad(cfg, why);
-    const bn = window.__botNum || '?';
-    log('error', '🔐 Target REJECTED the saved password (' + why + '). STOPPING — no retry, because repeated failures lock the account. Sign in manually, then update the 🔐 Account tab and Save.');
-    chrome.runtime.sendMessage({ type: 'BOT_ALERT', kind: 'error', text: 'Bot ' + bn + ' — Target password rejected. Auto-login stopped.', speak: 'Bot ' + bn + ' Target password rejected' }).catch(() => {});
-    return false;
-  }
+  // A 401 from the API path is NOT proof of a bad password: it also happens when the reused
+  // x-application-mouse-tool-key has gone stale — the SAME password logged in fine via API minutes
+  // earlier and then 401'd (2026-07-26). Treating it as terminal wrongly disabled auto-login AND
+  // blocked the form login, which works. Let the FORM be the judge of the credentials instead.
   log('info', '🔐 API login refused (' + why + ') — typing it into the sign-in form instead…');
   // 2) UI LOGIN — only for NON-credential failures (blocked key, network, form quirk).
   // ONE attempt per run: each failed sign-in counts toward Target's lockout.
@@ -969,7 +969,11 @@ async function ensureTargetLogin(cfg) {
   const u = await bgSend({ type: 'TARGET_UI_LOGIN', email: cfg.accountEmail, password: cfg.accountPass,
                            backTo: location.href.split('#')[0] }, 70000, { ok: false, error: 'timeout' });
   try { sessionStorage.removeItem('__botLoginAt'); } catch (_) {}
-  if (u && u.ok) { log('success', '🔐 Auto-login OK (form) — continuing.'); return true; }
+  if (u && u.ok) {
+    log('success', '🔐 Auto-login OK (form) — continuing.');
+    try { await chrome.storage.local.remove(__credKey(cfg)); } catch (_) {} // creds proven good
+    return true;
+  }
   // If the FORM reported a credential/lockout error, remember it so nothing tries again.
   if (u && /invalid|incorrect|password|locked|too many/i.test(String(u.err || ''))) {
     await markCredentialsBad(cfg, u.err);
@@ -1086,12 +1090,9 @@ async function watchTargetStock(tcin, interval, burst, cfg) {
       lastBeat = Date.now();
       log('info', '⚡ ' + tcin + ' still ' + (r.avail || 'OOS') + ' — watching…' + (r.src ? ' [' + r.src + ']' : ''));
     }
-    // A poll that returns NO availability field is not a real "OOS" read — it means we can't see stock
-    // at all (and would never fire). Say so loudly once, and reload to re-capture a usable request.
-    if (r.avail == null && r.src && /nofulfill/.test(r.src)) {
-      log('warning', '⚡ Stock reply had no availability field' + (r.sample ? ' — reply was: ' + r.sample : '') + ' — reloading to re-capture the page\'s stock request.');
-      await sleep(Math.max(3000, pollMs)); location.reload(); return;
-    }
+    // NOTE: deliberately no reload here. A missing availability field used to trigger a page reload,
+    // which turned a bad capture into an endless reload loop (2026-07-26). The poll itself now drops
+    // the bad capture and falls back to redsky, so the next cycle recovers on its own.
     await sleep(pollMs);
   }
 }
@@ -1131,7 +1132,7 @@ async function watchTargetList(list, interval, burst, cfg) {
       // Buy the live ones in list order (the list is the user's priority order).
       for (const { id, r } of live) {
         const st2 = await wget('botRunning'); if (!st2.botRunning) return;
-        logItemLive('#' + id + ' IN STOCK (' + r.avail + ') — grabbing it!');
+        logItemLive('#' + id + ' IN STOCK (' + r.avail + (r.qty != null ? ', qty ' + r.qty : '') + ') — grabbing it!');
         if (!apiOn) { await wset({ watchIndex: ids.indexOf(id) }); location.href = 'https://www.target.com/p/-/A-' + id; return; }
         const outcome = await targetApiAttempt(cfg, id, qtyOf(id), maxOf(id), false);
         if (outcome === 'placed' || outcome === 'test-stopped') return;
@@ -1148,7 +1149,9 @@ async function watchTargetList(list, interval, burst, cfg) {
 
       if (Date.now() - lastBeat >= 10000) {
         lastBeat = Date.now();
-        const states = results.map(({ id, r }) => id + ':' + (r.avail || (r.status && r.status !== 200 ? r.status : 'OOS'))).join('  ');
+        // Show the quantity too — on a drop it tells you how deep the stock is at a glance.
+        const states = results.map(({ id, r }) =>
+          id + ':' + (r.avail || (r.status && r.status !== 200 ? r.status : 'OOS')) + (r.qty ? '(' + r.qty + ')' : '')).join('  ');
         log('info', '⚡ Watchlist (' + ids.length + ' in parallel) — ' + states);
       }
       const wait = cycleMs - (Date.now() - t0); // interval measured cycle-to-cycle, not on top of it
@@ -1844,7 +1847,11 @@ async function runStore(store, cfg, burst) {
         if (targetLoginState() !== 'in') { log('warning', '🔐 Still signed out — stopping this pass.'); return; }
         log('success', '🔐 Signed in — continuing.');
       }
-      return; // the login navigated the tab; the reloaded item page re-runs this with a live session
+      // DON'T stop here. The API login does NOT navigate, so returning left the bot logged in and
+      // then idle — it looked like it "didn't know what to do" (2026-07-26). Only the FORM login
+      // navigates, and in that case this document is torn down anyway and the reloaded page re-runs
+      // the flow, so falling through is safe for both paths.
+      log('info', '🔐 Signed in — continuing the run.');
     }
   }
   // Named steps for the checkout side so the status bar reads clearly. SEARCH is left to its own

@@ -433,6 +433,12 @@ const PROFILE_FIELDS = FIELDS.filter(f => !SHARED_FIELDS.includes(f));
 async function saveProfileConfig(profile) {
   if (!cryptoKey) return; // locked / no PIN yet
   const all = readForm();
+  // Saving credentials always re-enables auto-login: a previous "rejected" mark must never outlive
+  // the password it was about, or the user can't recover by fixing the password (2026-07-26).
+  try {
+    const keys = Object.keys(await chrome.storage.local.get(null)).filter(k => k.indexOf('bot:badCred:') === 0);
+    if (keys.length) await chrome.storage.local.remove(keys);
+  } catch (_) {}
   const profileCfg = {}; PROFILE_FIELDS.forEach(k => profileCfg[k] = all[k]);
   const sharedCfg  = {}; SHARED_FIELDS.forEach(k  => sharedCfg[k]  = all[k]);
   await chrome.storage.local.set({
