@@ -1,9 +1,8 @@
 // All config field IDs — used to save/restore form values
 const FIELDS = ['siteUrl','useCurrentTab','itemSku','searchType','quantity','maxPrice','refreshInterval',
                 'watchlist',
-                'accountEmail','accountPass','autoLogin',
                 'firstName','lastName','email','address','city','state','zip',
-                'cardNumber','cardName','expiry','cvv','stopOnSuccess'];
+                'cardNumber','cardName','expiry','cvv','stopOnSuccess','uiFallback'];
 
 let activeProfile = 'sams';
 let cryptoKey = null;     // AES-GCM key derived from the PIN (in memory only, never stored)
@@ -173,11 +172,12 @@ async function deriveKey(pin, saltBytes) {
     base, { name: 'AES-GCM', length: 256 }, true /* extractable, to cache in session */, ['encrypt', 'decrypt']);
 }
 
-// ── 12-hour unlock window ──────────────────────────────────────────────────────
+// ── 24-hour unlock window ──────────────────────────────────────────────────────
 // Cache the key with an expiry so reopening the panel (or reloading the extension)
-// within 12 hours skips the PIN. Stored in local so it survives a reset; auto-deleted
-// when it expires. (Tradeoff: the key sits cached for up to 12h — bounded exposure.)
-const UNLOCK_HOURS = 12;
+// within the window skips the PIN. Stored in local so it survives a reset; auto-deleted
+// when it expires. (Tradeoff: the key sits cached for up to 24h — bounded exposure. It
+// unlocks the saved address/card config, so a longer window is a real, if bounded, risk.)
+const UNLOCK_HOURS = 24;
 async function cacheKey() {
   try {
     const raw = await crypto.subtle.exportKey('raw', cryptoKey);
@@ -217,7 +217,7 @@ function writeForm(cfg) {
   FIELDS.forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
-    if (el.type === 'checkbox') el.checked = cfg[id] ?? (id === 'stopOnSuccess' || id === 'autoLogin');
+    if (el.type === 'checkbox') el.checked = cfg[id] ?? (id === 'stopOnSuccess');
     else el.value = cfg[id] ?? '';
   });
   // All stores are SKU/Link-only now — older saved configs may still carry searchType 'name'.
@@ -236,9 +236,10 @@ const extractItemId = (line, profile) => {
   const fn = ID_EXTRACT[profile];
   return fn ? fn(String(line).trim()) : null;
 };
+// Parse the watchlist textarea into de-duped item IDs for the active store (links or bare IDs).
 // Parse one watchlist/SKU line: "<link or id> /<qty> /<maxprice>". The /qty and /maxprice are
-// OPTIONAL and order-independent-ish (first /N = qty, second /N = max price). Defaults: qty 1,
-// max price 100. Returns { id, qty, max } or null. e.g. "1011483406 /2 /150" → qty 2, max 150.
+// OPTIONAL (first /N = qty, second /N = max price). Defaults: qty 1, max price 100.
+// Returns { id, qty, max } or null. e.g. "1011483406 /2 /150" → qty 2, max 150.
 function parseItemLine(line, profile) {
   const nums = [];
   const core = String(line).replace(/\/\s*(\d+(?:\.\d+)?)/g, (_, n) => { nums.push(parseFloat(n)); return ' '; }).trim();
@@ -246,6 +247,7 @@ function parseItemLine(line, profile) {
   if (!id) return null;
   return { id, qty: nums.length >= 1 ? Math.max(1, Math.round(nums[0])) : 1, max: nums.length >= 2 ? nums[1] : 100 };
 }
+
 // Rewrite each recognizable watchlist line to "<what you typed> /qty /maxprice", auto-filling the
 // defaults (qty 1, max 100) so the numbers are always visible next to the item. Lines without a
 // detectable id (mid-typing) are left alone. Called on blur.
@@ -433,12 +435,6 @@ const PROFILE_FIELDS = FIELDS.filter(f => !SHARED_FIELDS.includes(f));
 async function saveProfileConfig(profile) {
   if (!cryptoKey) return; // locked / no PIN yet
   const all = readForm();
-  // Saving credentials always re-enables auto-login: a previous "rejected" mark must never outlive
-  // the password it was about, or the user can't recover by fixing the password (2026-07-26).
-  try {
-    const keys = Object.keys(await chrome.storage.local.get(null)).filter(k => k.indexOf('bot:badCred:') === 0);
-    if (keys.length) await chrome.storage.local.remove(keys);
-  } catch (_) {}
   const profileCfg = {}; PROFILE_FIELDS.forEach(k => profileCfg[k] = all[k]);
   const sharedCfg  = {}; SHARED_FIELDS.forEach(k  => sharedCfg[k]  = all[k]);
   await chrome.storage.local.set({
@@ -466,52 +462,73 @@ async function loadProfileConfig(profile) {
     await chrome.storage.local.set({ botConfigShared: await encryptObj(cryptoKey, sharedCfg) });
   }
   writeForm(cfg);
-  const acctName = document.getElementById('acctStoreName');
-  if (acctName) acctName.textContent = profileLabel(profile).replace(/ Bot$/, '');
   await applyPerWindowUI(); // Quantity & Max Price are per-window — override the shared values
   applyWatchlistVisibility();
-  updateActiveIndicators();
+  updateActiveIndicators();  // form just changed — re-light the active source
 }
 
 // Every store now has the SAME item section: "By SKU / Link" + the drop watchlist
 // (name search was removed everywhere). This just fills in per-store examples so the
 // placeholders/hints show the right link format for the active profile.
-// ex = short format hint; ph / ph2 = two example item IDs for that store (used in placeholders).
 const STORE_LINK_EX = {
-  sams:          { ex: 'samsclub.com/ip/…',        ph: '990466313',    ph2: '990466314' },
-  target:        { ex: 'target.com/p/…/A-…',       ph: '1011483406',   ph2: '1011483413' },
-  walmart:       { ex: 'walmart.com/ip/…',         ph: '20278470684',  ph2: '19965460207' },
-  bestbuy:       { ex: 'bestbuy.com/site/…',       ph: '6614325',      ph2: '6614326' },
-  pokemoncenter: { ex: 'pokemoncenter.com/product/…', ph: '100-10086', ph2: '100-10087' },
+  sams:          { ex: 'samsclub.com/ip/…',       ph: 'https://www.samsclub.com/ip/prismatic/990466313\n990466314' },
+  target:        { ex: 'target.com/p/…/A-…',      ph: 'https://www.target.com/p/-/A-94721312\n94300072' },
+  walmart:       { ex: 'walmart.com/ip/…',        ph: 'https://www.walmart.com/ip/20278470684\n19965460207' },
+  bestbuy:       { ex: 'bestbuy.com/site/…',      ph: 'https://www.bestbuy.com/site/x/6614325.p\n6614326' },
+  pokemoncenter: { ex: 'pokemoncenter.com/product/…', ph: 'https://www.pokemoncenter.com/product/100-10086\n100-10087' },
 };
-// Green "active this run" dots: light the settings that apply in the CURRENT mode so it's obvious
-// at a glance what the bot will use. Use current tab (checked) → current-tab source; unchecked →
-// watchlist if it has items, else the SKU/Link field. Quantity / Max price / Auto-seconds always
-// apply, so they're always lit.
+function applyWatchlistVisibility() {
+  const s = STORE_LINK_EX[activeProfile] || { ex: 'product link', ph: 'one link or ID per line' };
+  const wl = document.getElementById('watchLabel');
+  if (wl) {
+    // Keep the station light — setting textContent alone would wipe the dot span out of the label.
+    const dot = wl.querySelector('.active-dot');
+    wl.textContent = ' 👁 Drop watchlist — one ' + s.ex + ' link or item ID per line';
+    if (dot) wl.insertBefore(dot, wl.firstChild);
+  }
+  const wt = document.getElementById('watchlist');
+  if (wt) wt.placeholder = s.ph.split('\n').map(l => l + ' /1 /100').join('\n');
+  const skuIn = document.getElementById('itemSku');
+  if (skuIn) skuIn.placeholder = s.ex + ' link or item ID  (e.g. ' + s.ph.split('\n')[0] + ' /1 /100)';
+  const wh = document.getElementById('watchHint');
+  if (wh) wh.textContent = (activeProfile === 'walmart')
+    ? 'One per line: link or ID /qty /max price. Use the stable /ip/<id> links (NOT buff.ly). Bot watches all and jumps into the first queue that opens.'
+    : 'One per line: link or ID /qty /max price (e.g. 1011483406 /1 /100). Bot watches all items and buys the first that goes live.';
+}
+
+// ── Station lights ─────────────────────────────────────────────────────────────
+// The green dots next to the labels say, at a glance, WHICH source the bot will actually use this
+// run — the #1 source of "why is it only watching one item" confusion. Rule:
+//   Use current tab CHECKED  → current tab fills SKU / Link → By SKU / Link lights, watchlist dark.
+//   UNCHECKED + list has rows → the WATCHLIST is the source → watchlist lights, SKU / Link dark.
+// Quantity / Max Price / Auto-refresh always apply, so they stay lit.
 function updateActiveIndicators() {
   const useCur = document.getElementById('useCurrentTab');
   const on = (id, v) => { const e = document.getElementById(id); if (e) e.classList.toggle('on', !!v); };
   const checked = !!(useCur && useCur.checked);
   const hasWatch = ((document.getElementById('watchlist') || {}).value || '').trim().length > 0;
   const watchMode = !checked && hasWatch;
-  // WATCHLIST mode = unchecked + list has items → the watchlist is the source, and qty/max are
-  // per-item. Otherwise (Use current tab OR a single SKU/Link) the By SKU/Link field is the source
-  // and the global Quantity / Max Price boxes apply. "Use current tab" fills the SKU field, so it
-  // lights By SKU/Link too.
   on('dotWatch', watchMode);
   on('dotSku', !watchMode);
+  // In WATCHLIST mode each line carries its OWN "/qty /max price", so the global Quantity and
+  // Max Price boxes are ignored — dark them, or the panel claims settings that aren't being used.
   on('dotQty', !watchMode);
   on('dotMax', !watchMode);
-  on('dotRefresh', true);
+  on('dotRefresh', true);  // the poll interval always applies
+  // Tint the "Use current tab" label when it's the thing overriding the watchlist.
+  const lbl = document.querySelector('label[for="useCurrentTab"]');
+  if (lbl) lbl.classList.toggle('lbl-on', checked && hasWatch);
 }
-
-function applyWatchlistVisibility() {
-  const s = STORE_LINK_EX[activeProfile] || { ex: 'product link', ph: 'one link or ID per line' };
-  const skuInput = document.getElementById('itemSku');
-  if (skuInput) skuInput.placeholder = s.ex + ' link or item ID  (e.g. ' + s.ph + ' /1 /100)';
-  // Empty-box helper: the textarea placeholder shows a per-store example (only visible when blank).
-  const wt = document.getElementById('watchlist');
-  if (wt) wt.placeholder = 'Example  ' + s.ph + ' /1 /100\n' + s.ph2 + ' /1 /100';
+// Re-evaluate whenever anything that feeds the decision changes.
+['useCurrentTab', 'watchlist', 'itemSku'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) { el.addEventListener('change', updateActiveIndicators); el.addEventListener('input', updateActiveIndicators); }
+});
+// On blur, rewrite each line to "<item> /qty /maxprice" so the numbers in effect are always
+// visible — you never have to remember whether a line carried its own qty/max.
+{
+  const wta = document.getElementById('watchlist');
+  if (wta) wta.addEventListener('blur', normalizeWatchlist);
 }
 
 // ── Profile switcher ───────────────────────────────────────────────────────────
@@ -602,56 +619,7 @@ document.getElementById('speedTestBtn').addEventListener('click', testLoadSpeed)
 document.getElementById('stockTestBtn').addEventListener('click', findStockApi);
 document.getElementById('trackBtn').addEventListener('click', toggleClickTracker);
 document.getElementById('capCheckoutBtn').addEventListener('click', toggleCheckoutCapture);
-// 🔓 Test login — ONE deliberate attempt with the saved credentials, triggered by the human. This
-// exists so credentials are never validated inside a bot run loop: repeated failed sign-ins LOCK a
-// Target account (it happened 2026-07-25). Exactly one API try, then one form try, then it stops.
-{
-  const tb = document.getElementById('testLoginBtn');
-  if (tb) tb.addEventListener('click', async () => {
-    const email = (document.getElementById('accountEmail').value || '').trim();
-    const pass  = document.getElementById('accountPass').value || '';
-    if (!email || !pass) { addLog('error', '🔓 Enter the account email and password first.'); return; }
-    const [tab] = await chrome.tabs.query({ active: true, windowId: MY_WID });
-    if (!tab || !/^https?:\/\/(www\.)?target\.com/i.test(tab.url || '')) {
-      addLog('error', '🔓 Open a target.com tab first (the login runs in that tab).'); return;
-    }
-    tb.disabled = true; tb.textContent = '🔓 Signing in…';
-    try {
-      addLog('info', '🔓 Testing login (one attempt) as ' + email.replace(/(.{2}).*(@.*)/, '$1***$2') + '…');
-      let r = await chrome.runtime.sendMessage({ type: 'TARGET_LOGIN', tabId: tab.id, email, password: pass }).catch(() => null);
-      if (!(r && r.ok)) {
-        let why = r ? (r.step ? r.step + ' ' + r.status : r.error) : 'no reply';
-        // Say whether we actually had Target's own fingerprint + behavioral key: without them the
-        // API login is expected to fail, and that's a setup issue, not a code issue.
-        if (r && r.step) why += ' [key:' + (r.mouseKey ? 'yes' : 'NO') + ' fingerprint:' + (r.deviceInfoReal ? 'real' : 'SYNTHETIC') + ']';
-        try {
-          const m = r && r.body && (r.body.message || r.body.errorMessage || r.body.code || r.body.errorKey);
-          if (m) why += ' — ' + String(m).slice(0, 140);
-        } catch (_) {}
-        addLog('info', '🔓 API login refused (' + why + ') — trying the sign-in form…');
-        r = await chrome.runtime.sendMessage({ type: 'TARGET_UI_LOGIN', tabId: tab.id, email, password: pass }).catch(() => null);
-      }
-      if (r && r.ok) {
-        addLog('success', '🔓 LOGIN WORKS ✓ — auto-login is good to use.');
-        // Clear any "these credentials are bad" block recorded by a previous failure.
-        try { await chrome.storage.local.remove('bot:badCred:target:' + email + ':' + pass.length); } catch (_) {}
-      } else {
-        addLog('error', '🔓 Login failed: ' + (r ? (r.err || r.step || r.error) : 'no reply') +
-                        ' — fix the password (or unlock the account) before enabling auto-login. NOT retrying.');
-      }
-    } finally { tb.disabled = false; tb.textContent = '🔓 Test login now (one attempt)'; }
-  });
-}
-
-// 🔑 Capture-login reuses the SAME sniffer (it already records credential/sign-in POSTs). ON →
-// sign out then sign in → OFF dumps the login request so raw-API auto-login can be built.
-{
-  const cb = document.getElementById('capLoginBtn');
-  if (cb) cb.addEventListener('click', async () => {
-    if (!capCheckoutOn) addLog('info', '🔑 Login capture ON — now SIGN OUT, then SIGN IN normally. Turn OFF (click again) to dump your login request.');
-    await toggleCheckoutCapture();
-  });
-}
+if (document.getElementById('qPollBtn')) document.getElementById('qPollBtn').addEventListener('click', walmartQueueProbe);
 
 // Click-tracker toggle: registers track.js on the current store's DOMAIN (so it follows you across
 // the checkout pages) and logs the CODE of every button/link you click. Turn ON, do a manual
@@ -795,6 +763,12 @@ async function toggleCheckoutCapture() {
         id: 'checkout-sniff', js: ['sniff-checkout.js'], matches: ['<all_urls>'], allFrames: true, runAt: 'document_start', world: 'MAIN'
       }]);
       await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, world: 'MAIN', files: ['sniff-checkout.js'] });
+      // WIPE prior captures on every ON. They used to persist so you could re-dump without redoing a
+      // checkout, but in practice that meant every dump replayed the same stale entries (2026-08-19:
+      // 27 old adds re-printed on a 4-second capture) and the walls of JSON pushed the NEW calls past
+      // any paste limit. A clean slate per capture is far more useful than a re-dump.
+      await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, world: 'MAIN',
+        func: () => { try { sessionStorage.removeItem('__botCheckoutSniff'); } catch (_) {} } }).catch(() => {});
       capCheckoutOn = true;
       btn.textContent = '🛒 ●'; btn.classList.add('tracking');
       addLog('success', '🛒 Checkout capture ON — now do a FULL manual checkout (add to cart → place order). Turn OFF when done to dump the API calls.');
@@ -815,7 +789,19 @@ async function toggleCheckoutCapture() {
     if (!hits.length) {
       addLog('warning', '🛒 No cart/checkout POSTs captured. Did the checkout happen in THIS tab? (Capture stays per-origin — start it on the product page and stay on the store.)');
     } else {
-      addLog('success', '🛒 Captured ' + hits.length + ' checkout request(s) — newest last:');
+      // SUMMARY FIRST. Each captured body is ~4KB of GraphQL feature flags, so a full dump blows
+      // past any paste limit and the TAIL — the checkout/place-order calls we actually want — is
+      // what gets cut. This compact list is copy-pasteable on its own and names every operation.
+      const opOf = (h) => {
+        const m = String(h.url || '').match(/graphql\/([A-Za-z0-9_]+)/);          // /graphql/<op>/<hash>
+        return h.op || (m && m[1]) || String(h.url || '').split('?')[0].split('/').pop();
+      };
+      const counts = {};
+      for (const h of hits) { const o = opOf(h); counts[o] = (counts[o] || 0) + 1; }
+      addLog('success', '🛒 Captured ' + hits.length + ' request(s). OPERATIONS (paste THIS line first):');
+      addLog('info', '   ' + Object.entries(counts).map(([o, n]) => o + (n > 1 ? ' x' + n : '')).join('  |  '));
+      addLog('info', '   order: ' + hits.map(opOf).join(' → '));
+      addLog('success', '🛒 Full detail — newest last:');
       for (const h of hits) {
         addLog('info', '— ' + h.method + ' ' + (h.url || '').replace(/^https?:\/\//, '') + '  →  ' + h.status);
         // Headers matter for replication (Target needs x-api-key / visitor / content-type). Skip the
@@ -824,12 +810,7 @@ async function toggleCheckoutCapture() {
         const hkeys = Object.keys(hd).filter(k => !/^cookie$/i.test(k));
         if (hkeys.length) addLog('info', '   headers: ' + hkeys.map(k => k + '=' + String(hd[k]).slice(0, 60)).join(' | '));
         if (h.reqBody) addLog('info', '   body: ' + String(h.reqBody).replace(/\s+/g, ' '));
-        // Stock/fulfillment responses need the real fields visible (Target's availability lives deep
-        // in the module JSON), so print a long slice for those and stay terse for everything else.
-        if (h.respSample) {
-          const isStockish = /fulfillment|availability|cdui_orchestrations/i.test(h.url + h.respSample);
-          addLog('info', '   resp: ' + String(h.respSample).replace(/\s+/g, ' ').slice(0, isStockish ? 2500 : 200));
-        }
+        if (h.respSample) addLog('info', '   resp: ' + String(h.respSample).replace(/\s+/g, ' ').slice(0, 200));
       }
       addLog('info', '🛒 Hit Copy and paste it to me — I’ll wire direct-API checkout for this store.');
     }
@@ -839,6 +820,31 @@ async function toggleCheckoutCapture() {
     capCheckoutOn = false;
     btn.textContent = '🛒 Cap'; btn.classList.remove('tracking');
   }
+}
+
+
+// ── 🎟 Q — Walmart queue probe (read-only) ─────────────────────────────────────
+// Answers ONE question: can we read our queue position/turn OURSELVES, instead of waiting for
+// Walmart's /qp page to refresh itself every 26-33s? Fetches each watchlist item's product URL
+// with the guest's cookies and reads the qpdata off the redirect. No cart, no order, no navigation.
+async function walmartQueueProbe() {
+  const cfg = readForm();
+  const ids = parseWatchlist((cfg.watchlist || '').trim(), 'walmart') || [];
+  const one = (cfg.itemSku || '').trim();
+  const list = ids.length ? ids : (one ? [one] : []);
+  if (!list.length) { addLog('error', '🎟 Put the Walmart item link/ID in the watchlist (or SKU box) first.'); return; }
+  const [tab] = await chrome.tabs.query({ active: true, windowId: MY_WID });
+  if (!tab || !/walmart\.com/.test(tab.url || '')) { addLog('error', '🎟 Open a walmart.com tab first (the fetch runs in that page).'); return; }
+  addLog('info', '🎟 Probing queue state for ' + list.length + ' item(s) in parallel…');
+  const rs = await Promise.all(list.map(id =>
+    new Promise(res => chrome.runtime.sendMessage({ type: 'WM_QUEUE_POLL', itemId: id, tabId: tab.id }, r => res({ id, r: r || {} })))));
+  for (const { id, r } of rs) {
+    if (!r.ok) { addLog('warning', '🎟 ' + id + ' — probe failed: ' + (r.error || '?')); continue; }
+    if (!r.found) { addLog('warning', '🎟 ' + id + ' — no qpdata (not queued, or the ticket is not on the redirect) · ' + r.ms + 'ms · ' + r.finalUrl); continue; }
+    addLog('success', '🎟 ' + id + ' — state=' + r.state + (r.yourTurn ? ' ★ YOUR TURN' : '') +
+      ' · ticket ' + r.ticket + ' · refresh ' + Math.round((r.nextRefresh || 0) / 1000) + 's · probe took ' + r.ms + 'ms');
+  }
+  addLog('info', '🎟 If state/ticket came back above, we can poll your turn ourselves instead of waiting 26-33s.');
 }
 
 // ── Keyboard shortcuts (GLOBAL) ────────────────────────────────────────────────
@@ -1000,11 +1006,17 @@ setInterval(() => {
   else connectKeepAlive(); // reconnect if the worker had cycled
 }, 20000);
 
-// Auto-refresh the panel when a NEW TAB is opened (keeps the panel snappy during drops; OK to lose
-// the log). Flagged so the unload handler below does NOT stop the running bot on our own reload.
-// The armed drop + running state are persisted in storage, so they survive this reload.
+// Auto-refresh the panel when a NEW TAB is opened IN THIS WINDOW (keeps the panel snappy during
+// drops; OK to lose the log). Flagged so the unload handler below does NOT stop the running bot on
+// our own reload. The armed drop + running state are persisted in storage, so they survive it.
+// WINDOW GUARD: onCreated fires for EVERY window, so without this check opening a tab in one
+// window wiped the log of every OTHER window's panel — each panel must only react to its own.
 let isReloading = false;
-chrome.tabs.onCreated.addListener(() => { if (clickTrackOn) return; isReloading = true; location.reload(); }); // don't wipe the log while tracking
+chrome.tabs.onCreated.addListener((tab) => {
+  if (clickTrackOn) return;                                  // don't wipe the log while tracking
+  if (MY_WID == null || !tab || tab.windowId !== MY_WID) return; // another window's tab — not ours
+  isReloading = true; location.reload();
+});
 
 // On genuine panel close: stop the bot + wipe the temporary plaintext config. On our own reload
 // (new-tab refresh), do NEITHER — the bot keeps running, its config stays, and the arm persists.
@@ -1182,7 +1194,6 @@ document.getElementById('armTest').addEventListener('change', () => { if (dropIn
 
 // ── Auto-detect item ID from the current tab's URL (fills the SKU / Link field) ──
 document.getElementById('useCurrentTab').addEventListener('change', async function () {
-  updateActiveIndicators();
   if (!this.checked) return;
   try {
     const [tab] = await chrome.tabs.query({ active: true, windowId: MY_WID });
@@ -1194,11 +1205,6 @@ document.getElementById('useCurrentTab').addEventListener('change', async functi
     addLog('warning', 'Could not auto-detect item');
   }
 });
-
-// Watchlist typing flips the active source (watchlist vs SKU/Link) — keep the dots in sync.
-document.getElementById('watchlist').addEventListener('input', updateActiveIndicators);
-// On blur, auto-fill each item's "/qty /maxprice" defaults so the numbers show next to it.
-document.getElementById('watchlist').addEventListener('blur', normalizeWatchlist);
 
 // ── On popup open: restore last store, then unlock (cached key, or PIN) ─────────
 (async () => {
@@ -1240,6 +1246,7 @@ document.getElementById('watchlist').addEventListener('blur', normalizeWatchlist
     }
   } catch (_) {}
   applyWatchlistVisibility();
+  updateActiveIndicators();  // panel just opened — light the source the saved config will use
 
   const { pinSalt, botRunning, pinLockUntil = 0 } = await wget(['pinSalt', 'botRunning', 'pinLockUntil']);
   if (pinSalt) {
@@ -1416,7 +1423,7 @@ async function toggleBot(testMode = false) {
     // "Use current tab" WINS over the watchlist: checked = run on the page you're on;
     // unchecked = cycle the drop watchlist.
     const rawWatch = !cfg.useCurrentTab ? (cfg.watchlist || '').trim() : '';
-    const watchQty = {}, watchMax = {}; // per-item qty + max price from "/2 /150" suffixes
+    const watchQty = {}, watchMax = {}; // per-item qty + max price from the "/2 /150" suffixes
     const watchIds = rawWatch ? parseWatchlist(rawWatch, activeProfile, watchQty, watchMax) : [];
     let watchMode = watchIds.length > 0;
     // Sam's still runs the legacy (non-adapter) flow which can't rotate a watchlist — fall back to
@@ -1436,9 +1443,9 @@ async function toggleBot(testMode = false) {
     if (watchMode) { cfg.watchlist = watchIds; cfg.watchQty = watchQty; cfg.watchMax = watchMax; }
     else { delete cfg.watchlist; delete cfg.watchQty; delete cfg.watchMax; }
 
-    // SKU/Link single item also accepts the "/qty /maxprice" suffix (default /1 /100). Parse it so
-    // the item id is clean and per-item qty/max are captured just like a watchlist line.
-    if (!watchMode && !cfg.useCurrentTab) {
+    // The SKU / Link box takes the SAME "/qty /maxprice" suffix as a watchlist line, so a single
+    // item can carry its own numbers too (falls back to the global Quantity / Max Price boxes).
+    {
       const p = parseItemLine(cfg.itemSku || '', activeProfile);
       if (p) { cfg.itemSku = p.id; cfg.skuQty = p.qty; cfg.skuMax = p.max; }
     }

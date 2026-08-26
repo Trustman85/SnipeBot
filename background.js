@@ -83,18 +83,6 @@ let botInterval = null;
 // windows — even two on the same URL — are deduped independently. Maps tabId -> { url, at }.
 const lastInjected = {};
 
-// ONE-TIME PURGE of "bad credentials" marks. They used to be set from an API 401, which is NOT proof
-// of a wrong password (a stale mouse-tool-key 401s the same working password). A stale mark disabled
-// auto-login permanently and blocked the form login too — including the very success that would have
-// cleared it (2026-07-26). Only the sign-in form's own error message may set this now.
-(async () => {
-  try {
-    const all = await chrome.storage.local.get(null);
-    const stale = Object.keys(all).filter(k => k.indexOf('bot:badCred:') === 0);
-    if (stale.length) await chrome.storage.local.remove(stale);
-  } catch (_) {}
-})();
-
 // ── Per-window state namespacing (mirror of popup.js / content.js) ──────────────
 // Per-window keys are stored as "w<windowId>:<key>". NS_ON is the shared kill-switch — popup.js,
 // content.js and background.js must ALL agree. false = old global single-window behavior (Step 4a);
@@ -282,22 +270,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Raw-API re-login for Target (used when the bot detects a real signed-out state). Fires the
-  // credential-validation + token endpoints from the PAGE context so the Akamai fetch-wrapper
-  // attaches its sensor headers + cookies. Body shape is CONFIRMED/tuned from a 🔑 login capture.
-  // tabId may be passed explicitly (the side panel has no sender.tab).
-  if (msg.type === 'TARGET_LOGIN') {
-    targetApiLogin(msg.tabId || sender.tab?.id, msg).then(r => sendResponse(r), e => sendResponse({ ok: false, error: String(e && e.message || e) }));
-    return true;
-  }
-
-  // UI login — types the saved credentials into Target's real sign-in form (works when the raw-API
-  // login is refused by the behavioral-fingerprint guard).
-  if (msg.type === 'TARGET_UI_LOGIN') {
-    targetUiLogin(msg.tabId || sender.tab?.id, msg).then(r => sendResponse(r), e => sendResponse({ ok: false, error: String(e && e.message || e) }));
-    return true;
-  }
-
   // Alert the human (desktop notification + relay a sound to the popup + optional spoken line)
   if (msg.type === 'BOT_ALERT') handleAlert(msg.kind, msg.text, msg.speak);
 
@@ -337,6 +309,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Fast stock check: fetch Target's product_fulfillment_v1 (in the page context, since Target blocks
   // the background's own fetch) and return the shipping availability. Used by the restock watcher.
+  // msg.tabId: the SIDE PANEL has no sender.tab (that only exists for content-script senders), so
+  // the panel passes the target tab explicitly. Fall back to sender.tab for content-script callers.
+  if (msg.type === 'WM_QUEUE_POLL') { wmQueuePoll(msg.tabId || sender.tab?.id, msg.itemId).then(r => sendResponse(r), (e) => sendResponse({ ok: false, error: String(e) })); return true; }
   if (msg.type === 'STOCK_POLL') { targetStockPoll(sender.tab?.id, msg.tcin).then(r => sendResponse(r), () => sendResponse({ ok: false, status: 'ERR' })); return true; }
 
   // Fast stock check for stores that SSR availability into the page HTML (Sam's/Walmart GLASS):
@@ -992,13 +967,32 @@ async function targetStockPoll(tabId, tcin) {
         // Diagnostics so a missing capture is visible in the log instead of silently falling back:
         // hook = targetstock.js installed?  req = a fulfillment request captured yet?
         const diag = (window.__botTgtStockHook ? 'hook' : 'nohook') + ':' + (req ? ('req' + (req.tcin || '?')) : 'noreq');
-        if (req && req.body && (!req.tcin || String(req.tcin) === String(tcin))) {
+        // Build the replay attempts. EXACT = a capture taken on this item's own page. BORROWED =
+        // another item's capture with the tcin swapped in the URL (and anywhere it appears in the
+        // body as plain text). A watchlist watches N items but the tab sits on ONE product page, so
+        // without borrowing only that single item gets the fast cdui endpoint and every other item
+        // silently falls back to the LAGGY redsky one — which is the whole thing cdui exists to fix
+        // (observed 2026-08-11: an 8-item watchlist reported [cdui/redsky], 7 of 8 on redsky).
+        // Borrowing is SAFE because readModules only accepts a fulfillment block whose product_id
+        // matches the tcin we asked for: if Target honours the base64 page_context over the tcin
+        // param, the reply simply won't match and we fall through to redsky as before.
+        const attempts = [];
+        if (req && req.body) {
+          if (!req.tcin || String(req.tcin) === String(tcin)) attempts.push({ url: req.url, body: req.body, src: 'cdui', exact: true });
+          else {
+            const u2 = String(req.url).replace(/([?&]tcin=)\d+/, '$1' + tcin);
+            const b2 = String(req.body).split(String(req.tcin)).join(String(tcin));
+            if (u2 !== req.url || b2 !== req.body) attempts.push({ url: u2, body: b2, src: 'cdui~', exact: false });
+          }
+        }
+        for (const at of attempts) {
           try {
-            const res = await fetch(req.url, { method: 'POST', credentials: 'include',
-              headers: { 'accept': 'application/json', 'content-type': 'application/json' }, body: req.body });
+            const res = await fetch(at.url, { method: 'POST', credentials: 'include',
+              headers: { 'accept': 'application/json', 'content-type': 'application/json' }, body: at.body });
             if (res.ok) {
               const hit = readModules(await res.json());
-              if (hit) return hit;
+              if (hit) return Object.assign(hit, { src: at.src });
+              if (!at.exact) continue;   // borrowed miss: keep the capture, it's still good for ITS item
               // Replay didn't carry our item's fulfillment (stale/wrong captured request). Drop the
               // capture so it can be re-taken, and FALL THROUGH to redsky — returning "no data" made
               // the watcher reload the page over and over (2026-07-26).
@@ -1031,48 +1025,75 @@ async function targetStockPoll(tabId, tcin) {
 // ride along via credentials:include. The calls are session-cart based (no ids passed between them).
 //   opts: { tcin, quantity, fulfillment, placeOrder }
 //   placeOrder=false → add+pre_checkout ONLY (never completes an order — safe for Test).
+// ── WALMART QUEUE POLL (read-only probe) ────────────────────────────────────────────────────────
+// Walmart's /qp page appears to REFRESH ITSELF every 26-33s (nextRefreshUnixTimestamp + a fresh
+// server signature each time) rather than calling a status API — four capture attempts on 2026-08-19
+// caught nothing but display-ad GraphQL. If that's right there is no hidden endpoint to replay, but
+// we don't need one: the queue state IS the qpdata blob, and requesting the item URL with the
+// guest's own cookies makes Walmart mint a fresh, currently-signed one. So we fetch the item URL
+// in the PAGE (MAIN world, same origin + Akamai's fetch wrapper) and read qpdata off the redirect.
+// That turns a 26-33s wait for "is it my turn" into a poll WE control.
+// Purely READ-ONLY: a GET of a product page, no cart, no order, nothing mutated.
+async function wmQueuePoll(tabId, itemId) {
+  if (!tabId || !itemId) return { ok: false, error: 'no tab/itemId' };
+  const [out] = await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN', args: [String(itemId)],
+    func: async (id) => {
+      const parse = (u) => {
+        const m = String(u || '').match(/[?&]qpdata=([^&#]+)/);
+        if (!m) return null;
+        let raw = m[1];
+        for (let i = 0; i < 3; i++) {
+          try { return JSON.parse(decodeURIComponent(raw)); }
+          catch (_) { try { const d = decodeURIComponent(raw); if (d === raw) break; raw = d; } catch (_) { break; } }
+        }
+        return null;
+      };
+      try {
+        const t0 = Date.now();
+        const res = await fetch('https://www.walmart.com/ip/' + encodeURIComponent(id), { credentials: 'include' });
+        const ms = Date.now() - t0;
+        // The ticket usually rides on the REDIRECTED url; fall back to scanning the HTML for a qpdata blob.
+        let qp = parse(res.url);
+        if (!qp) { const t = await res.text(); const m = t.match(/qpdata=([A-Za-z0-9%._-]+)/); if (m) qp = parse('?qpdata=' + m[1]); }
+        if (!qp) return { ok: true, found: false, status: res.status, finalUrl: String(res.url || '').slice(0, 120), ms };
+        return { ok: true, found: true, status: res.status, ms,
+                 state: qp.state, ticket: qp.ticket, queue: qp.queue,
+                 turnAt: qp.expectedTurnTimeUnixTimestamp,
+                 nextRefresh: qp.nextRefreshRelativeTime,
+                 yourTurn: qp.state === 'valid' };
+      } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+    }
+  });
+  return (out && out.result) || { ok: false, error: 'no result' };
+}
+
 async function targetApiBuy(tabId, opts) {
   if (!tabId) return { ok: false, error: 'no tab' };
+  // Whether THIS account's saved card actually demands a CVV. Learned from a real order and kept in
+  // storage, because the only place that answer exists (pre_checkout's is_cvv_required) is the very
+  // call the fast path skips. Unknown = try the fast path; we find out once and never re-pay for it.
+  let cvvRequired;
+  try { ({ tgtCvvRequired: cvvRequired } = await chrome.storage.local.get('tgtCvvRequired')); } catch (_) {}
+  const o0 = Object.assign({}, opts || {}, { cvvRequired });
   const res = await withTimeout(chrome.scripting.executeScript({
-    target: { tabId }, world: 'MAIN', args: [opts || {}],
+    target: { tabId }, world: 'MAIN', args: [o0],
     func: async (o) => {
       const H = { 'Accept': 'application/json', 'Content-Type': 'application/json', 'x-application-name': 'web' };
       const KADD = '9f36aeafbe60771e321a7cc95a78140772ab3e96'; // target.com web cart key (read live later if it rotates)
       const KCO  = 'e59ce3b531b2c39afb2e2b8a71ff10113aac2a14'; // target.com web checkout key
       const CART = 'https://carts.target.com/web_checkouts/v1/';
-      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-      const rawPost = async (url, body) => {
+      const post = async (url, body) => {
         const r = await fetch(url, { method: 'POST', credentials: 'include', headers: H, body: body ? JSON.stringify(body) : undefined });
         let j = null; try { j = await r.json(); } catch (_) {}
         return { status: r.status, body: j };
       };
-      // Refresh the logged-in session token (body {}). During a drop Target's token expires and cart
-      // calls 401 "_ERR_AUTH_DENIED" — the page silently re-validates; we must too. Uses the existing
-      // session cookies, so NO password needed for a refresh (that's only for a full re-login).
-      const refreshToken = () => rawPost('https://gsp.target.com/gsp/oauth_validations/v3/token_validations', {});
-      // POST with auto-recovery. Real-drop capture 2026-07-24: Target's FAST_SELLING throttle 429s
-      // the REAL SITE too — it hammers and ~1 in 5 requests returns 200. So on 429 we KEEP PUSHING
-      // until a request lands. Bounded only by a wall-clock cap (o.maxPushMs, default 4 min) so it
-      // can't hang forever if the item sells out and 429s never clear. 401 → refresh token.
-      const pushDeadline = Date.now() + (o.maxPushMs || 240000);
-      // Whether the LAST token refresh returned 200. Capture 2026-07-24: an identical manual BUYNOW
-      // add succeeded while the bot's add for a GATED (pre-drop) item 401'd _ERR_AUTH_DENIED with
-      // the refresh still 200ing — so 401+refreshOk = ITEM gated, not signed out. Returned to the
-      // content script so it can keep watching quietly instead of raising a false sign-in alarm.
-      let refreshOk = null;
-      const post = async (url, body) => {
-        let r = await rawPost(url, body), authTries = 0;
-        for (;;) {
-          const code = (r.body && (r.body.code || r.body.errorKey)) || '';
-          const authDenied = r.status === 401 || /AUTH_DENIED|UNAUTH/i.test(code);
-          const limited = r.status === 429 || /RATE_LIMIT|THROTTL|FAST_SELLING/i.test(code);
-          // 2 tries only — if the refresh doesn't fix it, more loops just spam (gated item or dead session).
-          if (authDenied && authTries < 2) { authTries++; const rr = await refreshToken(); refreshOk = rr.status === 200; await sleep(120); r = await rawPost(url, body); continue; }
-          if (limited && Date.now() < pushDeadline) { await sleep(250 + Math.random() * 300); r = await rawPost(url, body); continue; } // push through the throttle
-          break;
-        }
-        return r;
-      };
+      // Per-step wall-clock, so "the API takes ~3s" can be attributed to a specific call instead of
+      // guessed at. All three POSTs are strictly sequential (each needs the previous one's server
+      // state), so these add up to the total. Reported on every result, success or failure.
+      const T = { add: 0, pre: 0, checkout: 0 };
+      const t0 = Date.now(); let mark = t0;
+      const lap = (k) => { const now = Date.now(); T[k] = now - mark; mark = now; };
       try {
         // 1) ADD TO CART. Shippable items (the drop case) send NO fulfillment field — Target
         // defaults to ship (capture 2026-07-23: tcin 79517000 → REGULARITEM, no fulfillment).
@@ -1084,22 +1105,9 @@ async function targetApiBuy(tabId, opts) {
           cart_type: 'REGULAR', channel_id: '10', shopping_context: 'DIGITAL', cart_subchannel: 'BUYNOW'
         };
         if (o.fulfillment) addBody.fulfillment = o.fulfillment;
-        let add = await post(CART + 'cart_items?field_groups=CART,CART_ITEMS,SUMMARY&key=' + KADD, addBody);
-        // AUTO-CAP: if qty>1 was rejected for a limit/quantity reason, drop to the item's cap (from
-        // the error's orderLimit if present, else 1) and retry — so "x2" on a 1-per-guest item still
-        // buys 1 instead of failing. Only retries limit errors, not OOS (424/404).
-        if ((add.status < 200 || add.status >= 300) && (o.quantity || 1) > 1) {
-          const b = add.body || {}, blob = JSON.stringify(b);
-          if (/LIMIT|quantity|ORDER_LIMIT|MAX/i.test((b.code || '') + ' ' + (b.message || '') + ' ' + blob) && !/OUT_OF_STOCK|NOT_SELLABLE|DEPENDENT_SERVICE/i.test(b.code || '')) {
-            const cap = (blob.match(/"orderLimit"\s*:\s*(\d+)/) || [])[1];
-            const retryQty = Math.max(1, cap ? Math.min(Number(cap), o.quantity) : 1);
-            if (retryQty < (o.quantity || 1)) {
-              addBody.cart_item.quantity = retryQty;
-              add = await post(CART + 'cart_items?field_groups=CART,CART_ITEMS,SUMMARY&key=' + KADD, addBody);
-            }
-          }
-        }
-        if (add.status < 200 || add.status >= 300) return { ok: false, step: 'add', status: add.status, body: add.body, refreshOk };
+        const add = await post(CART + 'cart_items?field_groups=CART,CART_ITEMS,SUMMARY&key=' + KADD, addBody);
+        lap('add');
+        if (add.status < 200 || add.status >= 300) return { ok: false, step: 'add', status: add.status, body: add.body, T };
         // MAX-PRICE GUARD (best-effort): pull the unit price from the add response and abort BEFORE
         // checkout if it's over the item's max. Only blocks when a price is actually found, so it
         // can never wrongly stop a good buy. o.maxPrice<=0 or missing → no check.
@@ -1116,478 +1124,167 @@ async function targetApiBuy(tabId, opts) {
         // cart_subchannel:BUYNOW is REQUIRED so pre_checkout/checkout act on the ISOLATED express
         // cart the add created — without it they look at the empty MAIN cart → "Cart is empty"
         // (ZERO_CART_ITEM_QUANTITY). Still retry that error a few times for the propagation race.
-        const preUrl = CART + 'pre_checkout?cart_type=REGULAR&field_groups=ADDRESSES,CART,CART_ITEMS,DELIVERY_WINDOWS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY&key=' + KCO;
+        // FIELD_GROUPS TRIMMED (measured 2026-08-11, Test-mode benchmark on tcin 95028728):
+        //   full 9 groups 732ms · CART,PAYMENT_INSTRUCTIONS 415ms · PAYMENT_INSTRUCTIONS 393ms
+        //   (omitted entirely) 429ms but UNUSABLE — loses reference_id/payment_instructions.
+        // We read exactly three things from this reply: reference_id, payment_instructions (for the
+        // CVV attach) and cart_state — so CART,PAYMENT_INSTRUCTIONS is the smallest SAFE set. The
+        // dropped groups (addresses, delivery windows, finance providers, pickup, promos, summary)
+        // were assembled by Target on every call and never read. ~45% off the slowest step.
+        // Re-measure with the Test-mode benchmark before trimming further.
+        const preUrl = CART + 'pre_checkout?cart_type=REGULAR&field_groups=CART,PAYMENT_INSTRUCTIONS&key=' + KCO;
         const preBody = { cart_type: 'REGULAR', cart_subchannel: 'BUYNOW' };
-        let pre = await post(preUrl, preBody);
-        for (let a = 0; a < 4 && (pre.status < 200 || pre.status >= 300) && pre.body && pre.body.code === 'ZERO_CART_ITEM_QUANTITY'; a++) {
-          await new Promise(r => setTimeout(r, 200));
-          pre = await post(preUrl, preBody);
+        const runPre = async () => {
+          let p2 = await post(preUrl, preBody);
+          for (let a = 0; a < 4 && (p2.status < 200 || p2.status >= 300) && p2.body && p2.body.code === 'ZERO_CART_ITEM_QUANTITY'; a++) {
+            await new Promise(r => setTimeout(r, 200));
+            p2 = await post(preUrl, preBody);
+          }
+          return p2;
+        };
+        // FAST PATH — SKIP pre_checkout. The checkout call does NOT consume anything pre_checkout
+        // returns: its body is just {cart_type, cart_subchannel}, and pre's reference_id is only
+        // ever logged. The one genuine dependency is payment_instructions, and that is needed ONLY
+        // to attach a CVV. So when no CVV is in play we go straight from add -> checkout and save a
+        // whole ~870ms round trip. If Target rejects that (the cart really did need preparing) the
+        // checkout step below runs pre_checkout and retries ONCE — so the order is never lost, it
+        // just costs one wasted call. Skipped entirely in Test mode, which needs pre's reply.
+        // Gate the fast path on whether Target ACTUALLY demands a CVV, not on whether one happens
+        // to be filled in. A verified card needs none (is_cvv_required=false), and keying off the
+        // mere presence of the field silently disabled the skip (real order 2026-08-11: pre still
+        // ran, 980ms wasted). If Target does want it, checkout 400s MISSING_CREDIT_CARD_CVV and the
+        // recovery below runs pre_checkout, attaches the CVV, and retries — correct either way.
+        // o.cvvRequired is what we LEARNED on a previous run (persisted by the caller):
+        //   true  -> this card really does need a CVV: run pre_checkout up front and attach it,
+        //            so we never pay for a checkout that is going to be refused.
+        //   false/undefined -> take the fast path and find out. A refusal is self-healing below,
+        //            and the answer is remembered so it only ever costs us once.
+        const skipPre = !!o.placeOrder && o.cvvRequired !== true;
+        let pre = skipPre ? null : await runPre();
+        if (!skipPre) {
+          lap('pre');
+          if (pre.status < 200 || pre.status >= 300) return { ok: false, step: 'pre', status: pre.status, body: pre.body, T };
         }
-        if (pre.status < 200 || pre.status >= 300) return { ok: false, step: 'pre', status: pre.status, body: pre.body };
-        const refId = pre.body && pre.body.reference_id, cartId = (add.body && add.body.cart_id);
-        if (!o.placeOrder) return { ok: true, placed: false, cartId, refId, state: pre.body && pre.body.cart_state };
+        const refId = pre && pre.body && pre.body.reference_id, cartId = (add.body && add.body.cart_id);
+        // The cart's payment instructions come back from pre_checkout (PAYMENT_INSTRUCTIONS field
+        // group). Target 400s the checkout with MISSING_CREDIT_CARD_CVV when a saved card needs its
+        // CVV re-entered, so we have to attach it here. Report the SHAPE (keys + ids, never the card
+        // number) so a Test run shows exactly which field names this account returns.
+        const pis = (pre && pre.body && (pre.body.payment_instructions || pre.body.paymentInstructions)) || [];
+        const piShape = (Array.isArray(pis) ? pis : []).map(p => ({
+          keys: Object.keys(p || {}),
+          id: (p && (p.payment_instruction_id || p.id)) || null,
+          type: (p && (p.payment_type || p.card_type || (p.card_details && p.card_details.card_type))) || null,
+        }));
+        if (!o.placeOrder) {
+          // ── FIELD_GROUPS BENCHMARK (Test mode only — never runs on a real buy) ────────────────
+          // pre_checkout is the fattest call: we ask for NINE field groups and read exactly two
+          // things from the reply (reference_id, payment_instructions). Re-run it on the SAME cart
+          // with progressively smaller field_groups and time each, so trimming is a measured
+          // decision instead of a guess. Safe to repeat: the ZERO_CART race already retries this
+          // call up to 4x, and it prepares a cart rather than mutating stock or placing anything.
+          // Each variant is timed twice and the FASTER run kept, so one slow packet can't decide it.
+          const bench = [];
+          if (o.bench) {
+            const VARIANTS = [
+              ['full (current)', 'ADDRESSES,CART,CART_ITEMS,DELIVERY_WINDOWS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY'],
+              ['payment+cart', 'CART,PAYMENT_INSTRUCTIONS'],
+              ['payment only', 'PAYMENT_INSTRUCTIONS'],
+              ['none', ''],
+            ];
+            for (const [label, fg] of VARIANTS) {
+              const u = CART + 'pre_checkout?cart_type=REGULAR' + (fg ? '&field_groups=' + fg : '') + '&key=' + KCO;
+              let best = null, okAll = true, hadPay = false, hadRef = false;
+              for (let run = 0; run < 2; run++) {
+                const s = Date.now();
+                const rr = await post(u, preBody);             // single call, no retry — times ONE round trip
+                const ms = Date.now() - s;
+                if (rr.status < 200 || rr.status >= 300) okAll = false;
+                const b = rr.body || {};
+                if (b.reference_id) hadRef = true;
+                if ((b.payment_instructions || b.paymentInstructions || []).length) hadPay = true;
+                best = best == null ? ms : Math.min(best, ms);
+              }
+              // usable = still returns BOTH things the real checkout depends on.
+              bench.push({ label, fg: fg || '(omitted)', ms: best, ok: okAll, usable: okAll && hadRef && hadPay });
+            }
+          }
+          return { ok: true, placed: false, cartId, refId, state: pre && pre.body && pre.body.cart_state, piShape, T, bench };
+        }
         // 3) CHECKOUT — PLACES THE ORDER (Akamai adds sensor headers to this in-page fetch). Same
         // BUYNOW subchannel so it completes the express cart, not the main cart.
-        const co = await post(CART + 'checkout?cart_type=REGULAR&field_groups=ADDRESSES,CART,CART_ITEMS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY&key=' + KCO, { cart_type: 'REGULAR', cart_subchannel: 'BUYNOW' });
+        // Built fresh each time: on the fast path there are no payment instructions yet (we skipped
+        // pre_checkout), so this is a bare body. If the recovery runs pre_checkout we rebuild it
+        // WITH the CVV attached to the card instruction.
+        const buildCoBody = (instr) => {
+          const b = { cart_type: 'REGULAR', cart_subchannel: 'BUYNOW' };
+          if (!o.cvv) return b;
+          const arr = Array.isArray(instr) ? instr : [];
+          // Prefer the CARD instruction (an account can also carry gift cards / EBT etc).
+          const card = arr.find(p => p && (p.card_details || /CARD|CREDIT|DEBIT/i.test(String(p.payment_type || p.card_type || '')))) || arr[0];
+          const pid = card && (card.payment_instruction_id || card.id);
+          if (pid) b.payment_instructions = [{ payment_instruction_id: pid, cvv: String(o.cvv) }];
+          return b;
+        };
+        let coBody = buildCoBody(pis);
+        // FIELD_GROUPS TRIMMED to match pre_checkout (2026-08-11). We read only orders[0].order_id /
+        // .reference_id / .cart_state, all top-level in the response — the six dropped groups
+        // (addresses, cart items, finance providers, pickup, promos, summary) were assembled every
+        // time and never read. field_groups shapes the RESPONSE only; it does not change what the
+        // call does. UNLIKE pre_checkout this could not be benchmarked — every measurement would
+        // place a real order — so it is validated on the next live buy via the ⏱ timing line.
+        // ROLLBACK, if an order ever fails at the checkout step right after this change: restore
+        //   field_groups=ADDRESSES,CART,CART_ITEMS,FINANCE_PROVIDERS,PAYMENT_INSTRUCTIONS,PICKUP_INSTRUCTIONS,PROMOTION_CODES,SUMMARY
+        const coUrl = CART + 'checkout?cart_type=REGULAR&field_groups=CART,PAYMENT_INSTRUCTIONS&key=' + KCO;
+        let co = await post(coUrl, coBody);
+        // RECOVERY for the skipped pre_checkout. If we skipped it and Target refused, the cart most
+        // likely needed preparing — so prepare it and retry ONCE.
+        // DOUBLE-ORDER GUARD: only retry when the reply carries NO order id. A response that
+        // already created an order must never be re-sent, whatever its status code says.
+        let preRecovered = false, learnedCvvRequired = null;
+        if (skipPre && (co.status < 200 || co.status >= 300)) {
+          // Remember WHY we had to recover, so the next run starts on the right path.
+          const code = String((co.body && (co.body.code || co.body.errorKey)) || '') + ' ' + String((co.body && co.body.message) || '');
+          if (/CVV|PIN on payment/i.test(code)) learnedCvvRequired = true;
+          const madeOrder = !!(co.body && co.body.orders && co.body.orders[0] && co.body.orders[0].order_id);
+          if (!madeOrder) {
+            pre = await runPre();
+            lap('pre');
+            preRecovered = true;
+            if (pre.status >= 200 && pre.status < 300) {
+              // Now we HAVE the payment instructions — re-attach the CVV before retrying, which is
+              // what makes a MISSING_CREDIT_CARD_CVV rejection self-healing.
+              coBody = buildCoBody(pre.body && (pre.body.payment_instructions || pre.body.paymentInstructions));
+              co = await post(coUrl, coBody);
+            }
+            else return { ok: false, step: 'pre', status: pre.status, body: pre.body, T, preRecovered };
+          }
+        }
+        lap('checkout');
         const order = co.body && co.body.orders && co.body.orders[0];
         const done = co.status >= 200 && co.status < 300 && order && /COMPLETED/i.test(order.cart_state || '');
+        // An order placed WITHOUT pre_checkout proves this card needs no CVV — record that so the
+        // fast path stays on. Only recorded on a real success, never inferred from a failure.
+        if (done && skipPre && !preRecovered) learnedCvvRequired = false;
         return { ok: !!done, placed: !!done, step: 'checkout', status: co.status,
                  orderId: order && order.order_id, refId: (order && order.reference_id) || refId,
-                 state: order && order.cart_state, body: done ? null : co.body };
+                 state: order && order.cart_state, body: done ? null : co.body,
+                 piShape, sentCvv: !!coBody.payment_instructions, T, total: Date.now() - t0,
+                 skippedPre: skipPre && !preRecovered, preRecovered, learnedCvvRequired };
       } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
     }
-  }), 255000, 'target-api').catch(e => null); // long: the in-page push can hammer the 429 throttle up to ~4 min
-  return (res && res[0] && res[0].result) || { ok: false, error: 'no result (page busy?)' };
-}
-
-// ── TARGET RAW-API RE-LOGIN ──────────────────────────────────────────────────────────────────────
-// Runs in the PAGE (MAIN world) so Akamai's fetch-wrapper attaches its sensor headers + cookies.
-// Sequence (from the known Target web login flow): validate credentials → exchange for a session
-// token. The credential body/params below are the STARTING shape — a 🔑 login capture confirms the
-// exact fields (Target's login carries a behavioral 'x-application-mouse-tool-key'; if the replay
-// gets blocked the capture shows what's missing). Returns {ok, step, status, body} for the caller.
-async function targetApiLogin(tabId, opts) {
-  if (!tabId) return { ok: false, error: 'no tab' };
-  const o = opts || {};
-  if (!o.email || !o.password) return { ok: false, error: 'no-creds' };
-  const res = await withTimeout(chrome.scripting.executeScript({
-    target: { tabId }, world: 'MAIN', args: [o],
-    func: async (o) => {
-      // Base headers. The Akamai sensor headers (x-gyjwza5z-*) auto-attach from the page fetch
-      // wrapper. x-application-mouse-tool-key is a BEHAVIORAL anti-bot key generated from real form
-      // interaction — we can't forge it; try to reuse one the page may have stashed, else omit and
-      // let Target decide (a raw replay without it will likely be rejected — hence type-into-form
-      // is the reliable fallback). Confirmed flow (capture 2026-07-24): username → credential → token.
-      let mouseKey = null;
-      try { mouseKey = sessionStorage.getItem('__botTgtMouseKey') || window.__tgtMouseKey || null; } catch (_) {}
-      const H = { 'Accept': 'application/json', 'Content-Type': 'application/json', 'x-application-name': 'web' };
-      if (mouseKey) H['x-application-mouse-tool-key'] = mouseKey;
-
-      // credential_validations needs a full browser fingerprint. Prefer the EXACT device_info the
-      // page itself last sent (captured by targetstock.js) — anything we synthesize is a guess and a
-      // mismatch is what a fingerprint check is designed to catch.
-      const cookie = (n) => { try { return (document.cookie.match(new RegExp('(?:^|; )' + n + '=([^;]*)')) || [])[1] || ''; } catch (_) { return ''; } };
-      let deviceInfo = null;
-      try { deviceInfo = JSON.parse(sessionStorage.getItem('__botTgtDeviceInfo') || 'null'); } catch (_) {}
-      if (!deviceInfo) {
-        // Best-effort reconstruction from the real browser (same field names as the capture).
-        const S = (v) => (v == null ? 'unknown' : String(v));
-        let canvas = 'unknown';
-        try {
-          const c = document.createElement('canvas'); const g = c.getContext('2d');
-          g.textBaseline = 'top'; g.font = "14px 'Arial'"; g.fillText('target', 2, 2);
-          const d = c.toDataURL(); let h = 0;
-          for (let i = 0; i < d.length; i++) { h = ((h << 5) - h + d.charCodeAt(i)) | 0; }
-          canvas = (h >>> 0).toString(16);
-        } catch (_) {}
-        deviceInfo = {
-          user_agent: navigator.userAgent, language: navigator.language, canvas,
-          color_depth: S(screen.colorDepth), device_memory: S(navigator.deviceMemory), pixel_ratio: 'unknown',
-          hardware_concurrency: S(navigator.hardwareConcurrency),
-          resolution: JSON.stringify([screen.width, screen.height]),
-          available_resolution: JSON.stringify([screen.availWidth, screen.availHeight]),
-          timezone_offset: S(new Date().getTimezoneOffset()),
-          session_storage: '1', local_storage: '1', indexed_db: '1',
-          add_behavior: 'unknown', open_database: 'unknown', cpu_class: 'unknown',
-          navigator_platform: S(navigator.platform), do_not_track: 'unknown',
-          regular_plugins: JSON.stringify(Array.from(navigator.plugins || []).map(p => p.name + '::' + p.description + '::')),
-          adblock: 'false', has_lied_languages: 'false', has_lied_resolution: 'false',
-          has_lied_os: 'false', has_lied_browser: 'false',
-          touch_support: JSON.stringify([navigator.maxTouchPoints || 0, false, false]),
-          js_fonts: '[]', navigator_vendor: S(navigator.vendor), navigator_webdriver: S(!!navigator.webdriver),
-          navigator_app_name: S(navigator.appName), navigator_app_code_name: S(navigator.appCodeName),
-          navigator_app_version: S(navigator.appVersion), navigator_languages: JSON.stringify(navigator.languages || []),
-          navigator_cookies_enabled: S(navigator.cookieEnabled), navigator_java_enabled: 'false',
-          visitor_id: cookie('visitorId') || cookie('visitor_id') || '', tealeaf_id: cookie('TLTSID') || '',
-          webgl: 'unknown', webgl_vendor: 'unknown', browser_name: 'Unknown', browser_version: 'Unknown',
-          cpu_architecture: 'Unknown', device_vendor: 'Unknown', device_model: 'Unknown',
-          device_type: 'Unknown', engine_name: 'Unknown', engine_version: 'Unknown',
-          os_name: 'Unknown', os_version: 'Unknown',
-        };
-      }
-      const post = async (url, body) => {
-        const r = await fetch(url, { method: 'POST', credentials: 'include', headers: H, body: body != null ? JSON.stringify(body) : undefined });
-        let j = null; try { j = await r.json(); } catch (_) {}
-        return { status: r.status, body: j };
-      };
-      try {
-        // 1) USERNAME — submit the email; Target returns the allowed auth methods (202).
-        const usr = await post('https://gsp.target.com/gsp/authentications/v1/username_validations?client_id=ecom-web-1.0.0&signin_amr=true',
-          { username: o.email, device_info: deviceInfo });
-        if (usr.status < 200 || usr.status >= 300) {
-          return { ok: false, step: 'username', status: usr.status, body: usr.body,
-                   mouseKey: !!mouseKey, deviceInfoReal: !!(deviceInfo && deviceInfo.tealeaf_id) };
-        }
-        // 2) CREDENTIAL — email + password + the device fingerprint. Body shape confirmed from a real
-        // capture (2026-07-25); success returns {targetGuid, firstName} with 202.
-        const cred = await post('https://gsp.target.com/gsp/authentications/v1/credential_validations?client_id=ecom-web-1.0.0',
-          { username: o.email, password: o.password, device_info: deviceInfo, keep_me_signed_in: false });
-        if (cred.status < 200 || cred.status >= 300) {
-          return { ok: false, step: 'credential', status: cred.status, body: cred.body,
-                   mouseKey: !!mouseKey, deviceInfoReal: !!(deviceInfo && deviceInfo.tealeaf_id) };
-        }
-        // 3) TOKEN — exchange the validated session for an access token (empty body — cookies carry it).
-        const tok = await post('https://gsp.target.com/gsp/oauth_validations/v3/token_validations', {});
-        if (tok.status !== 200) return { ok: false, step: 'token', status: tok.status, body: tok.body };
-        return { ok: true, guid: cred.body && cred.body.targetGuid, name: cred.body && cred.body.firstName, token: !!(tok.body && tok.body.access_token) };
-      } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
-    }
-  }), 20000, 'target-login').catch(() => null);
-  return (res && res[0] && res[0].result) || { ok: false, error: 'login-failed' };
-}
-
-// ── TARGET UI LOGIN (types the Account-tab credentials into Target's real sign-in form) ─────────
-// The raw-API login is gated by x-application-mouse-tool-key, a BEHAVIORAL fingerprint generated
-// from real interaction with the login form — it can't be forged, so a scripted POST gets refused.
-// Driving the actual form with trusted CDP input makes the page generate a valid key itself, so this
-// is the reliable path. ~2-3s. Navigates to the sign-in page, types, submits, then returns to
-// `backTo` (the item page) so the run continues where it left off.
-async function targetUiLogin(tabId, opts) {
-  if (!tabId) return { ok: false, error: 'no tab' };
-  const o = opts || {};
-  if (!o.email || !o.password) return { ok: false, error: 'no-creds' };
-  const wid = await widForTab(tabId);
-  const log = (lvl, txt) => logWin(wid, lvl, txt);
-  const dbg = { tabId };
-  const backTo = o.backTo || null;
-  let probeErr = '';
-  // Probes EVERY FRAME — Target renders the sign-in form inside an iframe, so a top-document-only
-  // search reported "username field not found" (2026-07-25). Returns which frame holds each field so
-  // we can focus it there; typing then goes to the focused element via CDP regardless of frame.
-  const probe = async () => {
+  }), 22000, 'target-api').catch(e => null);
+  const out = (res && res[0] && res[0].result) || { ok: false, error: 'no result (page busy?)' };
+  // Persist what the run learned, so the next grab starts on the correct path with no wasted call.
+  if (out && typeof out.learnedCvvRequired === 'boolean' && out.learnedCvvRequired !== cvvRequired) {
     try {
-      // TOP FRAME FIRST. The same tab injects fine for the bot (content.js runs on /login), and the
-      // only difference here was allFrames:true — which was coming back with ZERO frames and no error
-      // (2026-07-25). The sign-in form is top-level anyway; allFrames is just a fallback below.
-      const probeFn = () => {
-          const vis = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); return (r.width > 1 && r.height > 1) ? el : null; };
-          const q = (sels) => { for (const s of sels) { const el = vis(document.querySelector(s)); if (el) return s; } return null; };
-          // Confirmed from real markup (Track capture 2026-07-25):
-          //   <input id="password" data-test="login-password" name="password" type="password" maxlength="20">
-          //   <button type="submit">Sign in with password</button>
-          // STRICT: login-form fields only. A generic input[type="email"] matched the "Get top deals"
-          // NEWSLETTER box in the page footer and the bot typed the address there (2026-07-25).
-          const user = q(['#username', '[data-test="login-username"]', 'input[name="username"]',
-                          'input[autocomplete="username"]']);
-          // Current value of the username box (if any) so the caller can skip re-typing it, plus any
-          // masked account text Target shows once it already knows who's signing in ("tru***").
-          const userVal = user ? ((document.querySelector(user) || {}).value || '') : '';
-          const known = /\b[a-z0-9._%+-]{1,4}\*{2,}/i.test(document.body ? document.body.innerText : '');
-          // MUST be an <input>: Target's method chooser is a <div role="button" id="password">
-          // ("Enter your password") that appears BEFORE the real field and also matches #password —
-          // a bare #password focused that div, so typing went nowhere and submit sent an empty
-          // password (2026-07-25). Every selector here is input-scoped.
-          const pass = q(['input#password', 'input[data-test="login-password"]', 'input[name="password"]',
-                          'input[autocomplete="current-password"]', 'input[type="password"]']);
-          // Target offers passkey / emailed-code FIRST (amr: passkey_create, password, email). The
-          // password method is picked from a CELL — <div role="button">Enter your password</div> —
-          // so plain <button> queries missed it entirely. Include [role="button"].
-          let signIn = null, chooser = null;
-          for (const b of document.querySelectorAll('button, input[type="submit"], [role="button"], a')) {
-            if (!vis(b)) continue;
-            const t = ((b.innerText || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase().trim();
-            if (!t || t.length > 60) continue;
-            const isSubmit = (b.tagName === 'BUTTON' && b.type === 'submit') || b.tagName === 'INPUT';
-            // "Enter your password" / "Use password" = choose-this-method (NOT the submit button).
-            if (!chooser && !isSubmit && /password/.test(t) && /(enter|use|with)/.test(t)) chooser = t;
-            // Plain advance/submit control. "Sign in with password" is the FINAL submit — kept out of
-            // the advance path so it can't be clicked before the field is filled.
-            if (!signIn && /(sign in|log in|continue)/.test(t) && !/create|another way|forgot/.test(t)) signIn = t;
-          }
-          const acct = (document.querySelector('header') || document.body || {}).innerText || '';
-          const inputs = Array.from(document.querySelectorAll('input')).filter(vis)
-            .map(i => (i.type || '') + '#' + (i.id || '') + '@' + (i.name || '')).slice(0, 8);
-          // Any visible error the form shows (wrong password / captcha) — surfaced so a failed login
-          // says WHY instead of the generic "account never appeared".
-          let err = '';
-          for (const e of document.querySelectorAll('[role="alert"], [class*="error" i], [id*="error" i]')) {
-            if (!vis(e)) continue; const t = (e.innerText || '').trim();
-            if (t && t.length < 200) { err = t; break; }
-          }
-          // Visible clickable labels — dumped on failure so the real flow can be matched exactly.
-          // Include [role="button"] — Target's auth-method cells are DIVs, so a button-only list
-          // showed nothing on the very page whose controls we needed to see.
-          const btns = Array.from(document.querySelectorAll('button, a[role="button"], [role="button"]')).filter(vis)
-            .map(b => (b.innerText || '').replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 10);
-          // What the page actually SAYS — with no inputs and no buttons found, the visible text is the
-          // only thing that identifies the screen (form, captcha, error, "check your email", …).
-          const text = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 300);
-          return { user, userVal, known, pass, signIn, chooser, signedIn: /hi,\s*(?!sign in)[a-z]/i.test(acct), url: location.href, inputs, btns, err, text };
-        };
-      let outs = await chrome.scripting.executeScript({ target: { tabId }, world: 'ISOLATED', func: probeFn });
-      // Nothing from the top frame → the form may genuinely be in an iframe; try every frame.
-      if (!outs || !outs.length) {
-        try { outs = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, world: 'ISOLATED', func: probeFn }); }
-        catch (e) { probeErr = 'allFrames: ' + String(e && e.message || e); }
-      }
-      // Merge: take the first frame that actually has each thing, remembering its frameId.
-      const merged = { signedIn: false, url: '', inputs: [], err: '' };
-      for (const o of (outs || [])) {
-        const r = o && o.result; if (!r) continue;
-        if (r.signedIn) merged.signedIn = true;
-        if (r.err && !merged.err) merged.err = r.err;
-        if (!merged.url && /login|signin|sign-in/i.test(r.url || '')) merged.url = r.url;
-        if (r.inputs && r.inputs.length) merged.inputs = merged.inputs.concat(r.inputs);
-        if (r.user && !merged.user) { merged.user = r.user; merged.userFrame = o.frameId; merged.userVal = r.userVal || ''; }
-        if (r.known) merged.known = true;
-        if (r.pass && !merged.pass) { merged.pass = r.pass; merged.passFrame = o.frameId; }
-        if (r.signIn && !merged.signIn) { merged.signIn = r.signIn; merged.signInFrame = o.frameId; }
-        if (r.chooser && !merged.chooser) { merged.chooser = r.chooser; merged.chooserFrame = o.frameId; }
-        if (r.btns && r.btns.length && !(merged.btns && merged.btns.length)) merged.btns = r.btns;
-        if (r.text && !merged.text) merged.text = r.text;
-      }
-      if (!merged.url && outs && outs[0] && outs[0].result) merged.url = outs[0].result.url;
-      merged.frames = (outs || []).length;
-      return merged;
-    } catch (e) { probeErr = String(e && e.message || e); return { probeErr }; }
-  };
-  // Returns the matching probe, or on timeout the LAST one seen — returning null threw away the only
-  // evidence of what the page contained, so failures reported empty defaults instead of reality.
-  const waitFor = async (pick, ms) => {
-    const end = Date.now() + ms;
-    let last = {};
-    for (;;) {
-      const p = await probe();
-      if (p && Object.keys(p).length) last = p;
-      if (pick(p)) return p;
-      if (Date.now() > end) return last;
-      await sleep(250);
-    }
-  };
-  // Focuses a selector inside a specific frame. CDP keyboard input then lands on it wherever it is,
-  // which avoids translating iframe-relative coordinates into top-level viewport coordinates.
-  const focusIn = async (frameId, selector) => {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId, frameIds: [frameId] }, world: 'ISOLATED', args: [selector],
-        func: (sel) => { const el = document.querySelector(sel); if (el) { el.focus(); try { el.click(); } catch (_) {} } }
-      });
-      return true;
-    } catch (_) { return false; }
-  };
-  const clickIn = async (frameId, text) => {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId, frameIds: [frameId] }, world: 'ISOLATED', args: [text],
-        func: (t) => {
-          // MUST include [role="button"]: Target's auth-method cells ("Enter your password") are DIVs,
-          // so a button-only query found the control in the probe but could never click it
-          // (2026-07-25: "password field never appeared" while that very button was listed).
-          const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };
-          for (const b of document.querySelectorAll('button, input[type="submit"], [role="button"], a[role="button"]')) {
-            if (!vis(b)) continue;
-            const s = ((b.innerText || b.value || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase().trim();
-            if (s.includes(t)) { b.click(); return true; }
-          }
-          return false;
-        }
-      });
-      return true;
-    } catch (_) { return false; }
-  };
-  let attached = false;
-  // Chrome DETACHES the debugger on navigation, so a single attach at the start dies the moment we
-  // open the sign-in page ("Debugger is not attached", 2026-07-25). Attach lazily and re-attach on
-  // demand instead: every CDP call goes through here.
-  const attach = async () => {
-    try { await chrome.debugger.attach(dbg, '1.3'); attached = true; }
-    catch (e) {
-      if (/already attached/i.test(String(e && e.message || e))) { attached = true; return; }
-      throw e;
-    }
-  };
-  const cdp = async (cmd, params) => {
-    if (!attached) await attach();
-    try { return await chrome.debugger.sendCommand(dbg, cmd, params); }
-    catch (e) {
-      if (!/not attached/i.test(String(e && e.message || e))) throw e;
-      attached = false; await attach();                   // navigation dropped it — reattach and retry
-      return await chrome.debugger.sendCommand(dbg, cmd, params);
-    }
-  };
-  try {
-    await attach();
-    // 1) Go to the sign-in PAGE. Confirmed by the user's own click capture: Target's sign-in is a
-    // full page at /login (id="username" → "Sign in with password" → id="password"), not a drawer.
-    // Clicking header controls to find an in-page drawer only wandered into the footer newsletter box.
-    // Wait until the tab actually finishes loading — probing mid-navigation makes executeScript
-    // return ZERO frames with no error, which looked exactly like "the page has no fields".
-    const waitLoaded = async (ms) => {
-      const end = Date.now() + ms;
-      for (;;) {
-        try { const t = await chrome.tabs.get(tabId); if (t && t.status === 'complete') return t; } catch (_) {}
-        if (Date.now() > end) return null;
-        await sleep(300);
-      }
-    };
-    // Reach the sign-in page the way a PERSON does: header Account → "Sign in or create account".
-    // Hand-built /login URLs hang on "Loading content" forever because the real one carries extra
-    // client params (2026-07-25 capture: …&ui_namespace=ui-default&ba…). Selectors below are the
-    // exact ones from the user's click capture, so this is a replay of the real path.
-    let st = await probe();
-    if (!st.signedIn && !/\/login|signin|sign-in/i.test(st.url || '')) {
-      const clickSel = async (sels) => {
-        try {
-          const [r] = await chrome.scripting.executeScript({
-            target: { tabId }, args: [sels],
-            func: (list) => {
-              for (const s of list) {
-                const el = document.querySelector(s);
-                if (el) { const b = el.getBoundingClientRect(); if (b.width > 1 && b.height > 1) { el.click(); return s; } }
-              }
-              return null;
-            }
-          });
-          return r && r.result;
-        } catch (_) { return null; }
-      };
-      const opened = await clickSel(['#account-sign-in', '[data-test="@web/AccountLink"]', '[data-test="accountNav-button"]']);
-      if (opened) {
-        await sleep(900);
-        await clickSel(['[data-test="accountNav-signIn"]', 'button[data-test*="signIn" i]']);
-        await sleep(1200);
-        await waitLoaded(15000);
-        await sleep(800);
-      }
-      // Still not on a sign-in page → last resort, the direct URL.
-      const now = await probe();
-      if (!now.signedIn && !now.user && !now.pass && !now.chooser && !/\/login|signin/i.test(now.url || '')) {
-        log('info', '🔐 Account menu did not open the sign-in page — trying the direct URL.');
-        await chrome.tabs.update(tabId, { url: 'https://www.target.com/login' });
-        await sleep(800); await waitLoaded(15000); await sleep(800);
-      }
-    }
-    // Wait for ANY usable control: username box, password box, or the auth-method chooser.
-    st = await waitFor(p => p.user || p.pass || p.chooser || p.signedIn, 15000);
-    if (st && st.signedIn) { log('success', '🔐 Already signed in.'); return { ok: true, already: true }; }
-    if (!st || (!st.user && !st.pass && !st.chooser)) {
-      // Log from HERE, not the caller: the content script that requested this login was destroyed by
-      // the navigation, so its failure branch can never run (2026-07-25 — login failed silently).
-      // Dump the visible inputs we DID find so the selectors can be fixed from real markup.
-      const seen = (st && st.url) || 'the sign-in page';
-      const ins = (st && st.inputs && st.inputs.length) ? ' — inputs seen: ' + st.inputs.join(', ') : ' — no visible inputs in any frame';
-      const bts = (st && st.btns && st.btns.length) ? ' | buttons: ' + st.btns.join(' / ') : '';
-      // If the page script never ran at all, say so — that's a very different problem from "the page
-      // loaded but the fields moved", and the two were indistinguishable before.
-      let tabUrl = '', tabStatus = '';
-      try { const t = await chrome.tabs.get(tabId); tabUrl = (t && t.url) || ''; tabStatus = (t && t.status) || ''; } catch (_) {}
-      // Decisive check: can we inject into this tab AT ALL? A trivial script separates "my probe is
-      // wrong" from "scripting doesn't work on this tab", which the empty result couldn't distinguish.
-      let canInject = 'n/a';
-      try {
-        const t0 = await chrome.scripting.executeScript({ target: { tabId }, func: () => document.readyState + '|' + document.querySelectorAll('input').length + '|' + location.pathname });
-        canInject = (t0 && t0.length) ? String(t0[0] && t0[0].result) : 'EMPTY(0 frames)';
-      } catch (e) { canInject = 'THREW: ' + String(e && e.message || e); }
-      const diag = ' [frames:' + ((st && st.frames) || 0) + (probeErr ? ' inject-error: ' + probeErr : '') +
-                   ' tab: ' + (tabUrl || '?') + ' status:' + tabStatus + ' inject-test: ' + canInject + ']';
-      const txt = (st && st.text) ? '\n    page says: "' + st.text + '"' : ' — page text empty';
-      log('error', '🔐 Auto-login: no sign-in controls found on ' + seen + ins + bts + diag + txt);
-      return { ok: false, step: 'no-signin-controls', probeErr, tabUrl };
-    }
-    const enter = async () => {
-      await cdp('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-      await cdp('Input.dispatchKeyEvent', { type: 'keyUp',   key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    };
-    // 2) Type the email — ONLY when a username box is actually shown. When Target already knows the
-    // account it goes straight to the method chooser ("Enter your password") with NO username input,
-    // and treating that as fatal killed the login (2026-07-25: "no visible inputs in any frame").
-    const emailAlreadyThere = (st.userVal || '').trim().toLowerCase() === String(o.email).trim().toLowerCase();
-    if (st.pass || st.chooser || st.known || (st.user && emailAlreadyThere)) {
-      // Username already established (remembered account, masked "tru***", or the box is already
-      // filled with our address) → go straight to the password. Nothing to type here.
-      log('info', '🔐 Account already recognised — entering the password only.');
-    } else if (st.user) {
-      await focusIn(st.userFrame, st.user);
-      await sleep(80);
-      await cdp('Input.dispatchKeyEvent', { type: 'keyDown', modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
-      await cdp('Input.dispatchKeyEvent', { type: 'keyUp',   modifiers: 2, key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
-      await cdp('Input.insertText', { text: String(o.email) });
-      await sleep(200);
-    }
-    // 3) Advance to the password step. NEVER click a button whose label contains "password" here —
-    // "Sign in with password" is the FINAL SUBMIT, and clicking it early submitted an empty field
-    // ("Please fill out this field.", 2026-07-25). Only a plain Continue/Sign in advances.
-    let cur = await probe();
-    // The "Enter your password" method cell comes first when it's offered — pick it BEFORE trying
-    // any continue/submit, otherwise we advance past the password option entirely.
-    if (!cur.pass && cur.chooser) { await clickIn(cur.chooserFrame, cur.chooser); await sleep(1000); cur = await probe(); }
-    if (!cur.pass) {
-      if (cur.signIn) await clickIn(cur.signInFrame, cur.signIn); else await enter();
-      await sleep(1000);
-      const opt = await probe();
-      if (!opt.pass && opt.chooser) { await clickIn(opt.chooserFrame, opt.chooser); await sleep(1000); }
-    }
-    cur = await waitFor(p => p.pass, 12000);
-    if (!cur || !cur.pass) {
-      const seen = (cur && cur.btns && cur.btns.length) ? ' — buttons seen: ' + cur.btns.join(' | ') : '';
-      log('error', '🔐 Auto-login: password field never appeared' + seen);
-      return { ok: false, step: 'no-password-field' };
-    }
-    // 4) Type the password, then VERIFY it actually landed. Submitting an empty field is what
-    // produced the "Please fill out this field." dead end, so this is checked before submitting.
-    const pwLen = async () => {
-      try {
-        const [{ result }] = await chrome.scripting.executeScript({
-          target: { tabId, frameIds: [cur.passFrame] }, world: 'ISOLATED', args: [cur.pass],
-          func: (sel) => { const el = document.querySelector(sel); return el ? (el.value || '').length : -1; }
-        });
-        return result;
-      } catch (_) { return -1; }
-    };
-    await focusIn(cur.passFrame, cur.pass);
-    await sleep(120);
-    await cdp('Input.insertText', { text: String(o.password) });
-    await sleep(250);
-    let len = await pwLen();
-    if (len <= 0) {
-      // insertText didn't reach the field — fall back to real per-character key events.
-      await focusIn(cur.passFrame, cur.pass);
-      await sleep(120);
-      for (const ch of String(o.password)) {
-        await cdp('Input.dispatchKeyEvent', { type: 'keyDown', text: ch, unmodifiedText: ch, key: ch });
-        await cdp('Input.dispatchKeyEvent', { type: 'keyUp', key: ch });
-        await sleep(25);
-      }
-      await sleep(250);
-      len = await pwLen();
-    }
-    if (len <= 0) {
-      log('error', '🔐 Auto-login: could not type into the password field — sign in manually.');
-      return { ok: false, step: 'password-not-typed' };
-    }
-    // 5) Submit — now that the field is confirmed filled.
-    cur = await probe();
-    if (cur.signIn) await clickIn(cur.signInFrame, cur.signIn);    // "Sign in with password" (submit)
-    else await enter();
-    // 5) Wait for the header to show the account (that's the real confirmation).
-    // 5) Confirm. Off the sign-in page counts as success too — after a good login Target redirects
-    // away, and the login page itself has no account header to read (which is why a real successful
-    // login could still report "never appeared", 2026-07-25).
-    const done = await waitFor(p => p.signedIn || (p.url && !/\/login|signin|sign-in/i.test(p.url)) || p.err, 25000);
-    if (!done || done.err || (!done.signedIn && /\/login|signin|sign-in/i.test(done.url || ''))) {
-      const why = (done && done.err) ? ' — page says: "' + done.err + '"'
-                : ' — no error shown; check the password saved in the 🔐 Account tab, or a captcha/2-step code is blocking it';
-      log('error', '🔐 Auto-login did not complete' + why);
-      return { ok: false, step: 'not-confirmed', err: done && done.err };
-    }
-    log('success', '🔐 Signed in to Target.');
-    return { ok: true };
-  } catch (e) {
-    log('error', '🔐 Auto-login error: ' + String(e && e.message || e));
-    return { ok: false, error: String(e && e.message || e) };
-  } finally {
-    if (attached) { try { await chrome.debugger.detach(dbg); } catch (_) {} }
-    // Only navigate back if we actually LEFT the item page (drawer login stays put — reloading it
-    // would throw away the very page position we're trying to keep during a drop).
-    if (backTo) {
-      try {
-        const t = await chrome.tabs.get(tabId);
-        if (t && t.url && t.url.split('#')[0] !== backTo && /\/login|signin|sign-in/i.test(t.url)) {
-          await chrome.tabs.update(tabId, { url: backTo });
-        }
-      } catch (_) {}
-    }
+      await chrome.storage.local.set({ tgtCvvRequired: out.learnedCvvRequired });
+      log('info', out.learnedCvvRequired
+        ? '💳 Learned: this Target card REQUIRES a CVV — future grabs will send it up front (no wasted call).'
+        : '💳 Learned: this Target card needs no CVV — future grabs skip pre_checkout entirely.');
+    } catch (_) {}
   }
+  return out;
 }
 
 async function htmlStockPoll(tabId, url, mode) {

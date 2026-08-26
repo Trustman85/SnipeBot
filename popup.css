@@ -238,18 +238,6 @@ body {
 
 .field-hint { font-size: 10px; color: #999; margin-top: 2px; }
 
-/* Green "active this run" indicator next to a setting's label — shown for the settings that apply
-   in the current mode (Use current tab vs Drop watchlist). Toggled by updateActiveIndicators(). */
-/* Station light — ALWAYS visible; gray = off, green (glowing) = on. */
-.active-dot {
-  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-  background: #b8bcc4; vertical-align: middle; margin-right: 5px;
-  transition: background .15s, box-shadow .15s;
-}
-.active-dot.on { background: #2ecc40; box-shadow: 0 0 5px #2ecc40; }
-/* When a setting is active, tint its label green too for an at-a-glance read. */
-.checkbox-row label.lbl-on { color: #1e8e2a; font-weight: 700; }
-
 /* Auto-refresh interval + speed-test button row */
 .refresh-row { display: flex; gap: 8px; }
 .refresh-row input { flex: 1; min-width: 0; }
@@ -278,7 +266,10 @@ body {
   flex: 1; overflow-y: auto; padding: 8px 14px;
   display: flex; flex-direction: column; gap: 3px;
 }
-.log-entry { font-size: 11px; font-family: "Courier New", monospace; line-height: 1.5; word-break: normal; overflow-wrap: break-word; }
+/* pre-wrap keeps the column padding and the newlines in multi-line entries (the watchlist status
+   table). Without it HTML collapses runs of spaces and the columns collapse with them. Still wraps
+   long lines, so a narrow panel doesn't scroll sideways. */
+.log-entry { font-size: 11px; font-family: "Courier New", monospace; line-height: 1.5; word-break: normal; overflow-wrap: break-word; white-space: pre-wrap; }
 .log-entry.info    { color: #7ec8e3; }
 .log-entry.success { color: #6fcf97; }
 .log-entry.warning { color: #f5a623; }
@@ -374,3 +365,15 @@ body {
   .refresh-row { flex-wrap: wrap; }
   .drop-row    { flex-wrap: wrap; }
 }
+
+/* Station light — ALWAYS visible next to a setting's label; gray = off, green (glowing) = on.
+   Shows at a glance which fields the bot will actually use this run (Use current tab / SKU-Link
+   vs the Drop watchlist). Toggled by updateActiveIndicators() in popup.js. */
+.active-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: #b8bcc4; vertical-align: middle; margin-right: 5px;
+  transition: background .15s, box-shadow .15s;
+}
+.active-dot.on { background: #2ecc40; box-shadow: 0 0 5px #2ecc40; }
+/* When a setting is active, tint its label green too for an at-a-glance read. */
+.checkbox-row label.lbl-on { color: #1e8e2a; font-weight: 700; }
